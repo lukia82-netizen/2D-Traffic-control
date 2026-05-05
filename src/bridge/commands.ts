@@ -17,7 +17,6 @@ export interface NodeData {
 }
 
 export interface EdgeData {
-  id: number;
   from: number;
   to: number;
   lanes: number;
@@ -44,14 +43,8 @@ export interface MapData {
 export async function loadMap(
   bbox: [number, number, number, number],
 ): Promise<MapData> {
-  return invoke<MapData>('load_map', {
-    bbox: {
-      west: bbox[0],
-      south: bbox[1],
-      east: bbox[2],
-      north: bbox[3],
-    },
-  });
+  // Pass bbox as [west, south, east, north] array — Rust receives [f64; 4]
+  return invoke<MapData>('load_map', { bbox });
 }
 
 /**

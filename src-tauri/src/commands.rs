@@ -4,7 +4,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::state::{AppState, SimCommand, SimControl, LightControlMode};
 use crate::map::osm_loader::fetch_osm_data;
-use crate::map::road_network::{build_road_network, MapData};
+use crate::map::road_network::{build_road_network, build_demo_road_network, MapData};
+use crate::simulation::sim_loop::run_simulation;
+use crate::simulation::congestion::CongestionData;
+use crate::traffic::traffic_light::LightStateUpdate;
 
 #[derive(Debug, Deserialize)]
 pub struct BBox {
@@ -13,9 +16,6 @@ pub struct BBox {
     pub east: f64,
     pub north: f64,
 }
-use crate::simulation::sim_loop::run_simulation;
-use crate::simulation::congestion::CongestionData;
-use crate::traffic::traffic_light::LightStateUpdate;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -56,9 +56,16 @@ pub fn load_map(
 ) -> Result<MapDataResponse, String> {
     log::info!("load_map called with bbox: west={}, south={}, east={}, north={}", bbox.west, bbox.south, bbox.east, bbox.north);
 
-    let osm_data = fetch_osm_data([bbox.south, bbox.west, bbox.north, bbox.east])
-        .map_err(|e| format!("Failed to fetch OSM data: {}", e))?;
-    let map_data = build_road_network(osm_data);
+    let map_data = match fetch_osm_data([bbox.south, bbox.west, bbox.north, bbox.east]) {
+        Ok(osm_data) => {
+            log::info!("OSM data fetched successfully, building road network");
+            build_road_network(osm_data)
+        }
+        Err(e) => {
+            log::warn!("Overpass API unavailable ({}) , using demo road network", e);
+            build_demo_road_network()
+        }
+    };
 
     let response = build_map_response(&map_data);
 

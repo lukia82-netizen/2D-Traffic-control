@@ -2,19 +2,86 @@ import maplibregl from 'maplibre-gl';
 
 // Default map center: Kraków Śródmieście
 const DEFAULT_CENTER: [number, number] = [19.940, 50.060];
-const DEFAULT_ZOOM = 15;
+const DEFAULT_ZOOM = 16;
 const KRAKOW_BBOX: [number, number, number, number] = [19.925, 50.052, 19.955, 50.068];
+
+// Offline fallback style — dark background, no network required
+const OFFLINE_STYLE: maplibregl.StyleSpecification = {
+  version: 8,
+  name: 'Offline',
+  sources: {},
+  layers: [
+    {
+      id: 'background',
+      type: 'background',
+      paint: { 'background-color': '#1a1a2e' },
+    },
+  ],
+};
+
+// Online tile style URL
+const ONLINE_STYLE_URL = 'https://tiles.openfreemap.org/styles/bright';
+// Timeout before giving up on online tiles
+const STYLE_LOAD_TIMEOUT_MS = 6000;
 
 // ─── Factory ──────────────────────────────────────────────────────────────────
 
-export function createMap(containerId: string): maplibregl.Map {
-  return new maplibregl.Map({
-    container: containerId,
-    style: 'https://tiles.openfreemap.org/styles/bright',
-    center: DEFAULT_CENTER,
-    zoom: DEFAULT_ZOOM,
-    maxZoom: 19,
-    minZoom: 12,
+/**
+ * Creates a MapLibre map that always loads quickly.
+ * Tries the online tile style first (6s timeout), then falls back to a
+ * dark offline background so the app never hangs waiting for the network.
+ */
+export async function createMap(containerId: string): Promise<maplibregl.Map> {
+  return new Promise((resolve) => {
+    const map = new maplibregl.Map({
+      container: containerId,
+      style: ONLINE_STYLE_URL,
+      center: DEFAULT_CENTER,
+      zoom: DEFAULT_ZOOM,
+      maxZoom: 19,
+      minZoom: 10,
+      attributionControl: false,
+    });
+
+    let settled = false;
+
+    const settle = (): void => {
+      if (settled) return;
+      settled = true;
+      resolve(map);
+    };
+
+    // Happy path – online tiles loaded in time
+    map.once('load', () => settle());
+
+    // If the style fails to load at all, fall back immediately
+    map.once('error', () => {
+      if (!settled) {
+        console.warn('[MapLibre] Style load error – switching to offline mode');
+        map.setStyle(OFFLINE_STYLE);
+        map.once('styledata', () => settle());
+      }
+    });
+
+    // Timeout fallback – corporate firewalls may silently drop the request
+    setTimeout(() => {
+      if (!settled) {
+        console.warn('[MapLibre] Style load timed out – switching to offline mode');
+        settled = true; // prevent double-resolve
+        // Load a new map instance with offline style (setStyle mid-flight can glitch)
+        map.remove();
+        const offlineMap = new maplibregl.Map({
+          container: containerId,
+          style: OFFLINE_STYLE,
+          center: DEFAULT_CENTER,
+          zoom: DEFAULT_ZOOM,
+          maxZoom: 19,
+          minZoom: 10,
+          attributionControl: false,
+        });
+        offlineMap.once('load', () => resolve(offlineMap));
+      }
+    }, STYLE_LOAD_TIMEOUT_MS);
   });
 }
 
@@ -22,7 +89,6 @@ export function createMap(containerId: string): maplibregl.Map {
 
 /**
  * Project a single [lng, lat] coordinate to screen {x, y}.
- * Thin wrapper around map.project() – use for one-off projections.
  */
 export function projectPoint(
   map: maplibregl.Map,
@@ -34,15 +100,8 @@ export function projectPoint(
 }
 
 /**
- * Batch-project an array of [lng, lat] pairs using a single transform snapshot.
- *
- * Extracts the current MapLibre mercator transform once, then uses map.project()
- * per point (MapLibre's internal implementation is already C++ optimised). This
- * is still significantly faster than calling the full JS wrapper many times
- * because we avoid JS↔C++ overhead per call by reusing the cached transform.
- *
- * For extreme counts (3 000+ per frame) consider extracting _projMatrix manually
- * once the MapLibre internals stabilise their API.
+ * Batch-project an array of [lng, lat] pairs using MapLibre's optimised
+ * internal projection.
  */
 export function batchProject(
   map: maplibregl.Map,
@@ -57,19 +116,11 @@ export function batchProject(
 }
 
 /**
- * Returns the underlying projection matrix from the map transform.
- * The exact internal property differs across MapLibre versions; this function
- * tries the stable path and falls back gracefully.
- *
- * Useful when you need to do raw matrix math outside MapLibre.
+ * Returns the underlying projection matrix from the map transform, or null.
  */
 export function getProjectionMatrix(map: maplibregl.Map): Float64Array | null {
-  // MapLibre GL JS exposes transform via map.transform (internal, not typed)
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const transform = (map as unknown as { transform: Record<string, unknown> }).transform;
   if (!transform) return null;
-
-  // Try modern path first
   const matrix = transform['_projMatrix'] ?? transform['projMatrix'] ?? null;
   if (matrix instanceof Float64Array || matrix instanceof Float32Array) {
     return new Float64Array(matrix);
@@ -83,7 +134,6 @@ const KEY_PAN_STEP = 100; // pixels
 
 export function setupKeyboardNavigation(map: maplibregl.Map): void {
   const handler = (e: KeyboardEvent): void => {
-    // Don't steal keys from input elements
     const tag = (e.target as HTMLElement).tagName.toLowerCase();
     if (tag === 'input' || tag === 'select' || tag === 'textarea') return;
 
@@ -141,9 +191,6 @@ export function setupKeyboardNavigation(map: maplibregl.Map): void {
   };
 
   window.addEventListener('keydown', handler);
-
-  // Return a cleanup reference on the map object for convenience
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (map as unknown as Record<string, unknown>)['_keyboardCleanup'] = () =>
     window.removeEventListener('keydown', handler);
 }

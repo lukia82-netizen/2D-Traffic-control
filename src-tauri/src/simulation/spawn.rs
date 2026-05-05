@@ -22,7 +22,7 @@ impl SpawnSystem {
     pub fn new(spawn_points: Vec<NodeIndex>) -> Self {
         SpawnSystem {
             spawn_points,
-            base_rate: 0.5,
+            base_rate: 2.0, // vehicles/real_second at multiplier=1.0
             accumulator: 0.0,
             rng: StdRng::from_entropy(),
             next_id: 1,

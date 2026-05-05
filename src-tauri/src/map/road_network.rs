@@ -57,6 +57,88 @@ pub struct MapData {
     pub spawn_points: Vec<NodeIndex>,
 }
 
+/// Build a simple 5×5 grid road network centred on Kraków.
+/// Used as a fallback when the Overpass API is not reachable.
+pub fn build_demo_road_network() -> MapData {
+    const CX: f64 = 19.940;       // centre longitude
+    const CY: f64 = 50.060;       // centre latitude
+    const STEP_LNG: f64 = 0.004;  // ~300 m
+    const STEP_LAT: f64 = 0.003;
+    const COLS: usize = 5;
+    const ROWS: usize = 5;
+
+    let mut graph = RoadGraph::new();
+    let mut node_index_map: HashMap<u64, NodeIndex> = HashMap::new();
+
+    let nid = |r: usize, c: usize| -> u64 { (r * COLS + c) as u64 };
+
+    for r in 0..ROWS {
+        for c in 0..COLS {
+            let lat = CY + (r as f64 - (ROWS / 2) as f64) * STEP_LAT;
+            let lng = CX + (c as f64 - (COLS / 2) as f64) * STEP_LNG;
+            let idx = graph.add_node(RoadNode {
+                osm_id: nid(r, c),
+                lat,
+                lng,
+                intersection_type: IntersectionType::TrafficLight,
+            });
+            node_index_map.insert(nid(r, c), idx);
+        }
+    }
+
+    let add_edge = |graph: &mut RoadGraph, a: NodeIndex, b: NodeIndex| {
+        let src = &graph[a];
+        let tgt = &graph[b];
+        let length_m = haversine_distance_m(src.lat, src.lng, tgt.lat, tgt.lng);
+        let edge = RoadEdge {
+            osm_id: 0,
+            lanes: 2,
+            max_speed: 50.0 / 3.6,
+            oneway: false,
+            infra_type: InfraType::Normal,
+            layer: 0,
+            length_m,
+            lane_directions: build_lane_directions(2),
+            decision_points: [length_m * 0.25, length_m * 0.5, length_m * 0.75],
+        };
+        let rev = RoadEdge {
+            lane_directions: build_lane_directions_reversed(2),
+            ..edge.clone()
+        };
+        graph.add_edge(a, b, edge);
+        graph.add_edge(b, a, rev);
+    };
+
+    // Horizontal edges
+    for r in 0..ROWS {
+        for c in 0..(COLS - 1) {
+            let a = node_index_map[&nid(r, c)];
+            let b = node_index_map[&nid(r, c + 1)];
+            add_edge(&mut graph, a, b);
+        }
+    }
+    // Vertical edges
+    for r in 0..(ROWS - 1) {
+        for c in 0..COLS {
+            let a = node_index_map[&nid(r, c)];
+            let b = node_index_map[&nid(r + 1, c)];
+            add_edge(&mut graph, a, b);
+        }
+    }
+
+    let bbox = compute_bbox(&graph);
+    let spawn_points = find_spawn_points(&graph, &bbox);
+
+    log::info!(
+        "Built DEMO road grid: {} nodes, {} edges, {} spawn points",
+        graph.node_count(),
+        graph.edge_count(),
+        spawn_points.len()
+    );
+
+    MapData { graph, node_index_map, bbox, spawn_points }
+}
+
 pub fn build_road_network(osm_data: OsmData) -> MapData {
     let mut graph = RoadGraph::new();
     let mut node_index_map: HashMap<u64, NodeIndex> = HashMap::new();
