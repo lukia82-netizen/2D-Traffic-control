@@ -121,14 +121,14 @@ ai-tests-5-traf/
 │       │   ├── spatial_grid.rs        # Siatka komórek O(1) wyszukiwania sąsiadów
 │       │   ├── spawn.rs               # SpawnSystem + DayCycle curve + OD-based + transit
 │       │   ├── od_model.rs            # ODModel: generowanie par OD, progi pieszego, typy podróży
-│       │   ├── speed_config.rs        # SpeedConfig + ComplianceRange + RouteConfig, Arc<RwLock>
+│       │   ├── speed_config.rs        # SpeedConfig + ComplianceRange + RouteConfig + RageConfig
 │       │   ├── tram_sim.rs            # TramSim: IDM uproszczony + stop dwell + współdzielony tor
 │       │   └── congestion.rs          # congestionLevel per edge, alerty
 │       ├── traffic/
 │       │   ├── traffic_light.rs       # FSM: Green→Yellow→Red, 4 tryby
 │       │   └── intersection.rs        # Klasyfikacja: lights/stop/yield/equal
 │       └── vehicles/
-│           ├── vehicle.rs             # VehicleState: id,lat,lng,angle,speed,type,satisfaction,trip_kind,personal_compliance,route_alpha
+│           ├── vehicle.rs             # VehicleState: id,lat,lng,angle,speed,type,frustration,trip_kind,personal_compliance,route_alpha,standstill_time,same_intersection_stops
 │           ├── types.rs               # Car/Van/Bus/Truck/Tram - wymiary, v0, a_max
 │           └── driver.rs             # Normal/Sunday/Pirat/Cautious - parametry IDM
 │
@@ -196,6 +196,9 @@ highlight_update (po invoke highlight_building):
 
 tram_stop_update (na każde zatrzymanie tramwaju na przystanku):
   JSON: { stop_id: u64, tram_id: u32, boarded: u16, alighted: u16, waiting: u16 }
+
+game_over (jednorazowy gdy warunek przegranej):
+  JSON: { reason: "avg_frustration"|"mass_rage", value: f32, timestamp_game: f32 }
 ```
 
 **Tauri commands (Frontend → Rust):**
@@ -512,16 +515,135 @@ Frontend (PixiJS) zmienia kolor sprite'a podświetlonych pojazdów na jaskrawy (
 - **Automatyczny (fixed-time)** - predefiniowane cykle
 - **Adaptacyjny (czujniki)** - czas fazy zależy od liczby aut w kolejce (sensor loop)
 
-### System zadowolenia
-- Każdy pojazd ma `satisfaction: f32` (0.0–100.0) liczony w Rust
-- Stoi (speed < 0.5 m/s) → `satisfaction` spada z tempem `decay_rate` zależnym od profilu
-- Jedzie → `satisfaction` rośnie z `recovery_rate`
-- `wait_threshold_real_s` - czas **realny** (nie gry) po którym frustracja narasta szybciej:
-  - Normal: 45s realnych → przy timeScale=60 to 45min czasu gry
-  - Sunday: 90s realnych
-  - Pirat: 15s realnych
-- Globalny wynik = średnia ważona `satisfaction` wszystkich aktywnych pojazdów
-- Wysyłany do frontendu w polu `satisfaction` w `vehicle_frame` binarnym
+### System frustracji - Traffic Rage Meter
+
+Każdy pojazd ma `frustration: f32 (0.0–100.0)` liczony w Rust (zastępuje poprzednią nazwę `satisfaction` - wyżej = gorzej). Wysyłany w polu `satisfaction` binarnego pakietu (odwrócona interpretacja po stronie frontendu: `frustration = 100 - satisfaction`).
+
+#### Trzy źródła wzrostu frustracji
+
+**1. Stanie w miejscu (wykładnicze)**
+
+```rust
+// sim_loop.rs - co tick symulacji
+if vehicle.speed < 0.5 {  // m/s - stoi
+    vehicle.standstill_time_real_s += dt_real;
+    let t = vehicle.standstill_time_real_s;
+    let threshold = profile.wait_threshold_real_s;
+    // Liniowy wzrost do progu, potem wykładniczy
+    let rate = if t < threshold {
+        profile.decay_rate_linear           // np. 0.5/s realnych dla Normal
+    } else {
+        profile.decay_rate_linear * (1.0 + ((t - threshold) / threshold).powi(2))
+    };
+    vehicle.frustration = (vehicle.frustration + rate * dt_real).min(100.0);
+} else {
+    vehicle.standstill_time_real_s = 0.0;  // reset po ruszeniu
+    vehicle.frustration = (vehicle.frustration - profile.recovery_rate * dt_real).max(0.0);
+}
+```
+
+`wait_threshold_real_s` per profil:
+- Normal: 45s, Sunday: 90s, Pirat: 15s, Cautious: 60s
+
+**2. Pełzanie** (powolna jazda bez pełnego zatrzymania)
+
+```rust
+// Pełzanie: jedzie, ale poniżej 20% limit speed przez >10s
+let crawl_speed = edge.max_speed * 0.20;
+if vehicle.speed > 0.5 && vehicle.speed < crawl_speed {
+    vehicle.crawl_time_real_s += dt_real;
+    if vehicle.crawl_time_real_s > profile.crawl_threshold_s {  // np. 10s
+        // Frustracja rośnie wolniej niż stanie, ale stale
+        vehicle.frustration += profile.crawl_rate * dt_real;
+    }
+} else {
+    vehicle.crawl_time_real_s = 0.0;
+}
+```
+
+**3. Wielokrotne zatrzymanie na tym samym skrzyżowaniu**
+
+`VehicleState` przechowuje `last_intersection_id: Option<u64>` i `same_intersection_stops: u8`:
+
+```rust
+if vehicle.speed < 0.5 && vehicle.is_at_intersection() {
+    let iid = vehicle.current_intersection_id();
+    if vehicle.last_intersection_id == Some(iid) {
+        vehicle.same_intersection_stops += 1;
+        // Bonus frustracja za każdy kolejny cykl czerwonego na tym samym skrzyżowaniu
+        let bonus = profile.repeat_stop_bonus * vehicle.same_intersection_stops as f32;
+        vehicle.frustration = (vehicle.frustration + bonus).min(100.0);
+    } else {
+        vehicle.last_intersection_id = Some(iid);
+        vehicle.same_intersection_stops = 1;
+    }
+}
+```
+
+`repeat_stop_bonus` per profil: Normal=2.0, Pirat=8.0, Sunday=0.5, Cautious=1.0
+
+#### Progi wizualne i stany
+
+| `frustration` | Stan | Kolor dymka | Efekt PixiJS |
+|---|---|---|---|
+| 0–40 | Spokojny | brak | brak |
+| 40–65 | Zniecierpliwiony | żółty `!` | mały dymek pulsujący |
+| 65–85 | Sfrustrowany | pomarańczowy `!!` | większy dymek |
+| 85–99 | Wściekły | czerwony `!!!` | duży dymek + szybkie pulsowanie |
+| 100 | Rage quit | czerwony `💢` + miganie | pojazd "wysiada" z symulacji (despawn) |
+
+#### Warunki przegranej
+
+```
+PRZEGRANA gdy:
+  (1) średnia frustracja wszystkich aktywnych pojazdów > 80.0  (przez ≥30s realnych)
+  (2) LUB więcej niż 5% aut jednocześnie ma frustration == 100.0
+```
+
+Warunek (1) daje graczowi czas na reakcję (30s realne). Warunek (2) chroni przed nagłym spike'iem.
+
+Rust emituje event `game_over` gdy któryś warunek spełniony:
+```
+game_over (jednorazowy):
+  JSON: { reason: "avg_frustration"|"mass_rage", value: f32, timestamp_game: f32 }
+```
+
+#### Wizualizacja dymków w PixiJS (`VehicleRenderer.ts`)
+
+Dymki **nie są** w `ParticleContainer` (brak wsparcia dla złożonych grafik). Renderowane jako osobna `Container` z prerenderedowanymi `RenderTexture` per stan (4 tekstury: żółta, pomarańczowa, czerwona, rage):
+
+```typescript
+// VehicleRenderer.ts
+// Dymek wyświetlany gdy frustration > 40
+// Pozycja: nad pojazdem (+8px w górę po project())
+// Przeliczane co klatkę jak pozycja pojazdu (przez transformMatrix)
+// Tekstura wybierana raz przy przekroczeniu progu, nie co klatkę
+```
+
+Łącznie dymki to dodatkowy Layer 4c (lub wbudowany w Layer 4 z osobnym `Container`). Koszt: ~1 dodatkowy draw call dla wszystkich dymków gdy `Container` zbatchowany.
+
+Flaga `frustration` dodana do binarnego pakietu - JUŻ JEST jako `satisfaction` w bajcie 24-27 (zreinterpretowane: 0.0 = spokojny, 100.0 = rage).
+
+#### Parametry w `SpeedConfig` / `RageConfig`
+
+Nowy blok w `speed_config.rs`:
+
+```rust
+pub struct RageConfig {
+    pub standstill_threshold_s:  [f32; 4],  // per profil [Normal, Sunday, Pirat, Cautious]
+    pub decay_rate_linear:       [f32; 4],  // frustracja/s przy staniu
+    pub recovery_rate:           [f32; 4],  // frustracja/s przy jeździe
+    pub crawl_fraction:          f32,       // default: 0.20 (20% limitu = pełzanie)
+    pub crawl_threshold_s:       f32,       // default: 10.0s
+    pub crawl_rate:              [f32; 4],  // frustracja/s przy pełzaniu
+    pub repeat_stop_bonus:       [f32; 4],  // bonus per kolejny cykl na skrzyżowaniu
+    pub global_loss_threshold:   f32,       // default: 80.0
+    pub global_loss_duration_s:  f32,       // default: 30.0
+    pub mass_rage_fraction:      f32,       // default: 0.05 (5% pojazdów)
+}
+```
+
+Modyfikowalne przez ten sam command `set_speed_config`.
 
 ### Pasy i skrzyżowania
 - Każda droga ma N pasów z kierunkami (np. lewy pas = skręt w lewo, prawy = prosto/prawo)
@@ -910,16 +1032,20 @@ Okno Tauri (WebView)
 │   ├── Layer 4: Pojazdy naziemne + tramwaje (ParticleContainer - 1 draw call)
 │   │             auta: type 0-3, highlighted=żółty, resta alpha 0.4 przy highlight
 │   │             tramwaje: type=4, sprite 20×3m żółty, zawsze na wierzchu aut (sort)
+│   ├── Layer 4b: Dymki frustracji (Container z 4 RenderTexture - ~1 draw call)
+│   │             frustration>40: żółty!, >65: pomarańczowy!!, >85: czerwony!!!, =100: 💢+miganie
+│   │             pozycja: nad pojazdem (+8px), przeliczana co klatkę przez transformMatrix
 │   ├── Layer 5: Pojazdy na wiaduktach (ParticleContainer - 1 draw call)
 │   ├── Layer 6: Dynamic sprite: światła drogowe (RenderTexture, rebuild on light_state_change)
 │   └── Layer 7: Dynamic sprite: congestion overlay (RenderTexture, rebuild on congestion_update)
 │       [Łącznie: ~7 draw calls niezależnie od liczby pojazdów, tramwajów i skrzyżowań]
 │
 └── HTML overlay (top, position:absolute, pointer-events:auto dla HUD elementów)
-    ├── Pasek zadowolenia (CSS progress bar)
+    ├── Traffic Rage Meter (CSS gradient bar: zielony→żółty→czerwony, wypełnienie = avg frustration)
     ├── Zegar gry + suwak timeScale (HTML input range)
     ├── Panel sterowania światłami (HTML div, pokazywany po kliknięciu)
-    └── Edge indicators (pulsujące div'y na ramce - CSS animation)
+    ├── Edge indicators (pulsujące div'y na ramce - CSS animation)
+    └── Game Over overlay (fullscreen div z animacją, wywoływany przez event game_over)
 ```
 
 ## Dane mapowe
