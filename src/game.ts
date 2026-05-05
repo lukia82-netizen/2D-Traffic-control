@@ -14,6 +14,7 @@ import {
 } from './bridge/events';
 import type { VehicleState, CongestionData, LightStateUpdate } from './bridge/events';
 import { PixiOverlay } from './rendering/PixiOverlay';
+import { CameraManager } from './rendering/CameraManager';
 import { VehicleRenderer } from './rendering/VehicleRenderer';
 import { InfraRenderer } from './rendering/InfraRenderer';
 import { CongestionRenderer } from './rendering/CongestionRenderer';
@@ -94,6 +95,7 @@ export class Game {
   private readonly map: maplibregl.Map;
   private readonly overlay: PixiOverlay;
 
+  private camera!: CameraManager;
   private vehicleRenderer!: VehicleRenderer;
   private infraRenderer!: InfraRenderer;
   private congestionRenderer!: CongestionRenderer;
@@ -130,8 +132,9 @@ export class Game {
     this.tauriAvailable = typeof (window as unknown as Record<string, unknown>)['__TAURI_INTERNALS__'] !== 'undefined';
 
     // Instantiate sub-systems
-    this.vehicleRenderer = new VehicleRenderer(this.overlay, this.map);
-    this.infraRenderer = new InfraRenderer(this.overlay, this.map);
+    this.camera = new CameraManager(this.map);
+    this.vehicleRenderer = new VehicleRenderer(this.overlay, this.map, this.camera);
+    this.infraRenderer = new InfraRenderer(this.overlay, this.map, this.camera);
     this.congestionRenderer = new CongestionRenderer(
       this.overlay,
       this.map,

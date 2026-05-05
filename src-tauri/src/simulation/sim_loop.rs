@@ -184,10 +184,12 @@ pub fn run_simulation(
         // --- Remove despawned vehicles ---
         vehicles.retain(|v| !v.despawned);
 
-        // --- Serialize and send vehicle frame ---
-        let frame = serialize_vehicles(&vehicles);
-        let encoded = base64::engine::general_purpose::STANDARD.encode(&frame);
-        let _ = vehicle_channel.send(encoded);
+        // --- Serialize and send vehicle frame (skip if no vehicles yet) ---
+        if !vehicles.is_empty() {
+            let frame = serialize_vehicles(&vehicles);
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&frame);
+            let _ = vehicle_channel.send(encoded);
+        }
 
         // --- Congestion update every 500 ms ---
         congestion_timer += real_dt_s;

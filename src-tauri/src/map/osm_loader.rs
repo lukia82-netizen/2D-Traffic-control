@@ -52,25 +52,31 @@ pub async fn fetch_osm_data(bbox: [f64; 4]) -> Result<OsmData, String> {
     // bbox is [west, south, east, north] (GeoJSON / frontend convention)
     let [west, south, east, north] = bbox;
 
+    // Overpass QL: fetch highway ways + their member nodes in one request.
+    // Using `>;` to expand ways to nodes, then `out body qt;` to output all.
+    // Limiting to road types relevant for city traffic simulation.
     let query = format!(
-        "[out:json][timeout:90];(way[highway]({south},{west},{north},{east});node(w););out body;>;out skel qt;",
+        "[out:json][timeout:60];\
+        (way[highway~\"motorway|trunk|primary|secondary|tertiary|residential|service|unclassified|living_street\"]\
+        ({south},{west},{north},{east});>;);\
+        out body qt;",
     );
 
     let url = "https://overpass-api.de/api/interpreter".to_string();
-    let body = format!("data={}", urlencoding_simple(&query));
 
     log::info!("Fetching OSM data from Overpass API, bbox: {:?}", bbox);
 
     let text = tokio::task::spawn_blocking(move || -> Result<String, String> {
         let client = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(90))
+            .user_agent("TrafficControl2D/0.1 (tauri desktop app)")
             .build()
             .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
 
+        // Use .form() for correct application/x-www-form-urlencoded encoding
         let response = client
             .post(&url)
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .body(body)
+            .form(&[("data", &query)])
             .send()
             .map_err(|e| format!("HTTP request failed: {}", e))?;
 
@@ -88,18 +94,6 @@ pub async fn fetch_osm_data(bbox: [f64; 4]) -> Result<OsmData, String> {
     parse_overpass_json(&text)
 }
 
-fn urlencoding_simple(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() * 2);
-    for byte in s.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
-            | b'-' | b'_' | b'.' | b'~' => out.push(byte as char),
-            b' ' => out.push('+'),
-            b => out.push_str(&format!("%{:02X}", b)),
-        }
-    }
-    out
-}
 
 fn parse_overpass_json(json_text: &str) -> Result<OsmData, String> {
     let overpass: OverpassResponse = serde_json::from_str(json_text)

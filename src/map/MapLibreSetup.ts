@@ -51,6 +51,16 @@ export async function createMap(containerId: string): Promise<maplibregl.Map> {
       resolve(map);
     };
 
+    // Suppress missing sprite image warnings (online styles reference POI icons
+    // that may not exist in the sprite sheet — harmless but noisy in DevTools)
+    map.on('styleimagemissing', (e: { id: string }) => {
+      // Provide a 1×1 transparent placeholder so MapLibre stops complaining
+      if (!map.hasImage(e.id)) {
+        const empty = new ImageData(1, 1);
+        map.addImage(e.id, empty);
+      }
+    });
+
     // Happy path – online tiles loaded in time
     map.once('load', () => settle());
 

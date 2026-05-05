@@ -2,12 +2,11 @@ import * as PIXI from 'pixi.js';
 import maplibregl from 'maplibre-gl';
 import type { MapData, EdgeData } from '../bridge/commands';
 import type { PixiOverlay } from './PixiOverlay';
+import type { CameraManager } from './CameraManager';
 import { projectPoint } from '../map/MapLibreSetup';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const ARROW_SPACING_PX = 80;   // draw oneway arrow every N pixels along road
-const ARROW_SIZE = 8;           // half-size of arrowhead in pixels
 const TUNNEL_DASH_COLOR = 0x334455;
 const TUNNEL_ALPHA = 0.6;
 const BRIDGE_SHADOW_OFFSET = 4;
@@ -26,15 +25,17 @@ const BRIDGE_SHADOW_ALPHA = 0.35;
 export class InfraRenderer {
   private readonly overlay: PixiOverlay;
   private readonly map: maplibregl.Map;
+  private readonly camera: CameraManager;
 
   private staticSprite: PIXI.Sprite | null = null;
   private staticTexture: PIXI.RenderTexture | null = null;
   private tunnelSprite: PIXI.Sprite | null = null;
   private tunnelTexture: PIXI.RenderTexture | null = null;
 
-  constructor(overlay: PixiOverlay, map: maplibregl.Map) {
+  constructor(overlay: PixiOverlay, map: maplibregl.Map, camera: CameraManager) {
     this.overlay = overlay;
     this.map = map;
+    this.camera = camera;
   }
 
   // ─── Public API ────────────────────────────────────────────────────────────
@@ -102,7 +103,7 @@ export class InfraRenderer {
     to: { x: number; y: number },
     edge: EdgeData,
   ): void {
-    const laneW = edge.lanes * 4;
+    const laneW = this.camera.getRoadOverlayWidth(edge.lanes);
     gfx.setStrokeStyle({
       width: laneW + 6,
       color: 0x111122,
@@ -118,18 +119,19 @@ export class InfraRenderer {
     from: { x: number; y: number },
     to: { x: number; y: number },
   ): void {
+    const spacing = this.camera.getArrowSpacing();
     const dx = to.x - from.x;
     const dy = to.y - from.y;
     const len = Math.hypot(dx, dy);
-    if (len < ARROW_SPACING_PX) return;
+    if (len < spacing) return;
 
     const ux = dx / len;
     const uy = dy / len;
     const angle = Math.atan2(dy, dx);
-    const numArrows = Math.floor(len / ARROW_SPACING_PX);
+    const numArrows = Math.floor(len / spacing);
 
     for (let i = 1; i <= numArrows; i++) {
-      const t = (i * ARROW_SPACING_PX) / len;
+      const t = (i * spacing) / len;
       const cx = from.x + dx * t;
       const cy = from.y + dy * t;
       this.drawArrow(gfx, cx, cy, angle, ux, uy);
@@ -144,13 +146,14 @@ export class InfraRenderer {
     ux: number,
     uy: number,
   ): void {
+    const sz = this.camera.getArrowSize();
     // Perpendicular vector
     const px = -uy;
     const py = ux;
 
-    const tip = { x: x + ux * ARROW_SIZE, y: y + uy * ARROW_SIZE };
-    const left = { x: x - ux * ARROW_SIZE + px * ARROW_SIZE * 0.6, y: y - uy * ARROW_SIZE + py * ARROW_SIZE * 0.6 };
-    const right = { x: x - ux * ARROW_SIZE - px * ARROW_SIZE * 0.6, y: y - uy * ARROW_SIZE - py * ARROW_SIZE * 0.6 };
+    const tip   = { x: x + ux * sz,                       y: y + uy * sz };
+    const left  = { x: x - ux * sz + px * sz * 0.6,  y: y - uy * sz + py * sz * 0.6 };
+    const right = { x: x - ux * sz - px * sz * 0.6,  y: y - uy * sz - py * sz * 0.6 };
 
     gfx
       .moveTo(tip.x, tip.y)
@@ -177,7 +180,7 @@ export class InfraRenderer {
       const fromPx = projectPoint(this.map, fromNode.lng, fromNode.lat);
       const toPx = projectPoint(this.map, toNode.lng, toNode.lat);
 
-      const laneW = Math.max(4, edge.lanes * 5);
+      const laneW = Math.max(4, this.camera.getRoadOverlayWidth(edge.lanes));
 
       // Dashed tunnel line
       gfx.setStrokeStyle({
