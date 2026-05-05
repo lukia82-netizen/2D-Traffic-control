@@ -21,3 +21,6 @@ Thumbs.db
 
 # Temp MinGW/toolchain downloads (not part of project)
 *.zip
+
+# Vite cache artifacts
+vite.config.ts.timestamp-*.mjs
