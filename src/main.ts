@@ -6,17 +6,8 @@ import { Game } from './game';
 
 async function bootstrap(): Promise<void> {
   // ── 1. MapLibre ─────────────────────────────────────────────────────────────
-  const map = createMap('map-container');
-
-  // Wait for the map style to fully load before attaching anything
-  await new Promise<void>((resolve) => {
-    if (map.isStyleLoaded()) {
-      resolve();
-    } else {
-      map.once('load', () => resolve());
-    }
-  });
-
+  // createMap handles online/offline fallback internally — always resolves.
+  const map = await createMap('map-container');
   setupKeyboardNavigation(map);
 
   // ── 2. PixiJS overlay ───────────────────────────────────────────────────────
@@ -29,9 +20,7 @@ async function bootstrap(): Promise<void> {
 
   // Expose for debugging in dev builds
   if (import.meta.env.DEV) {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (window as unknown as Record<string, unknown>)['_game'] = game;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (window as unknown as Record<string, unknown>)['_map'] = map;
   }
 }

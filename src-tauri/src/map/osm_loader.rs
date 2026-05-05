@@ -44,40 +44,46 @@ struct OverpassElement {
     tags: HashMap<String, String>,
 }
 
-pub fn fetch_osm_data(bbox: [f64; 4]) -> Result<OsmData, String> {
-    let [south, west, north, east] = bbox;
+/// Fetch road data from the Overpass API for the given bounding box.
+/// bbox = [west, south, east, north] (GeoJSON convention).
+/// Uses tokio::task::spawn_blocking to safely wrap the blocking HTTP call
+/// without blocking the async Tauri command executor.
+pub async fn fetch_osm_data(bbox: [f64; 4]) -> Result<OsmData, String> {
+    // bbox is [west, south, east, north] (GeoJSON / frontend convention)
+    let [west, south, east, north] = bbox;
 
     let query = format!(
         "[out:json][timeout:90];(way[highway]({south},{west},{north},{east});node(w););out body;>;out skel qt;",
-        south = south,
-        west = west,
-        north = north,
-        east = east
     );
 
-    let url = "https://overpass-api.de/api/interpreter";
+    let url = "https://overpass-api.de/api/interpreter".to_string();
+    let body = format!("data={}", urlencoding_simple(&query));
 
     log::info!("Fetching OSM data from Overpass API, bbox: {:?}", bbox);
 
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
-        .build()
-        .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
+    let text = tokio::task::spawn_blocking(move || -> Result<String, String> {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(90))
+            .build()
+            .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
 
-    let response = client
-        .post(url)
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .body(format!("data={}", urlencoding_simple(&query)))
-        .send()
-        .map_err(|e| format!("HTTP request failed: {}", e))?;
+        let response = client
+            .post(&url)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(body)
+            .send()
+            .map_err(|e| format!("HTTP request failed: {}", e))?;
 
-    if !response.status().is_success() {
-        return Err(format!("Overpass API returned status: {}", response.status()));
-    }
+        if !response.status().is_success() {
+            return Err(format!("Overpass API returned status: {}", response.status()));
+        }
 
-    let text = response
-        .text()
-        .map_err(|e| format!("Failed to read response body: {}", e))?;
+        response
+            .text()
+            .map_err(|e| format!("Failed to read response body: {}", e))
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking failed: {}", e))??;
 
     parse_overpass_json(&text)
 }

@@ -5,6 +5,7 @@ import type { MapData } from './bridge/commands';
 import {
   loadMap,
   startSimulation,
+  setTimeScale,
 } from './bridge/commands';
 import {
   parseVehicleFrame,
@@ -22,6 +23,60 @@ import { GameClockUI } from './time/GameClockUI';
 
 // Default Kraków bbox: [west, south, east, north]
 const DEFAULT_BBOX: [number, number, number, number] = [19.925, 50.052, 19.955, 50.068];
+
+// ─── Demo road network ─────────────────────────────────────────────────────
+// Used as a fallback when the Overpass API is not reachable (e.g., corporate
+// firewall). Generates a simple 5×5 grid of roads around the Kraków centre.
+
+function buildDemoMapData(): MapData {
+  const CX = 19.940;       // centre longitude
+  const CY = 50.060;       // centre latitude
+  const STEP_LNG = 0.004;  // ~300 m
+  const STEP_LAT = 0.003;
+
+  const COLS = 5;
+  const ROWS = 5;
+
+  const nodes: MapData['nodes'] = [];
+  const edges: MapData['edges'] = [];
+  const spawnPoints: MapData['spawnPoints'] = [];
+
+  const nid = (r: number, c: number): number => r * COLS + c;
+
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS; c++) {
+      nodes.push({
+        id: nid(r, c),
+        lat: CY + (r - Math.floor(ROWS / 2)) * STEP_LAT,
+        lng: CX + (c - Math.floor(COLS / 2)) * STEP_LNG,
+        intersectionType: 'traffic_light',
+      });
+    }
+  }
+
+  const addEdgePair = (a: number, b: number): void => {
+    edges.push({ from: a, to: b, lanes: 2, maxSpeed: 50, oneway: false, infraType: 'normal', layer: 0, lengthM: 300 });
+    edges.push({ from: b, to: a, lanes: 2, maxSpeed: 50, oneway: false, infraType: 'normal', layer: 0, lengthM: 300 });
+  };
+
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS - 1; c++) addEdgePair(nid(r, c), nid(r, c + 1));
+  }
+  for (let r = 0; r < ROWS - 1; r++) {
+    for (let c = 0; c < COLS; c++) addEdgePair(nid(r, c), nid(r + 1, c));
+  }
+
+  for (let c = 0; c < COLS; c++) {
+    spawnPoints.push([nodes[nid(0, c)].lat, nodes[nid(0, c)].lng]);
+    spawnPoints.push([nodes[nid(ROWS - 1, c)].lat, nodes[nid(ROWS - 1, c)].lng]);
+  }
+  for (let r = 1; r < ROWS - 1; r++) {
+    spawnPoints.push([nodes[nid(r, 0)].lat, nodes[nid(r, 0)].lng]);
+    spawnPoints.push([nodes[nid(r, COLS - 1)].lat, nodes[nid(r, COLS - 1)].lng]);
+  }
+
+  return { nodes, edges, spawnPoints, bbox: DEFAULT_BBOX };
+}
 
 // Simulation starts at 06:00 (game seconds since midnight)
 const GAME_START_TIME_S = 6 * 3600;
@@ -118,19 +173,23 @@ export class Game {
   // ─── Map loading ───────────────────────────────────────────────────────────
 
   private async loadMapData(): Promise<void> {
+    this.uiRenderer.showNotification('Loading map data…', 'info');
     try {
-      this.uiRenderer.showNotification('Loading map data…', 'info');
       this.mapData = await loadMap(DEFAULT_BBOX);
-      this.infraRenderer.buildStaticLayer(this.mapData);
-      this.trafficLightUI.init(this.mapData.nodes);
       this.uiRenderer.showNotification(
         `Map loaded – ${this.mapData.nodes.length} nodes, ${this.mapData.edges.length} edges`,
         'info',
       );
     } catch (err) {
-      console.error('Failed to load map:', err);
-      this.uiRenderer.showNotification('Map load failed – check console', 'error');
+      console.warn('Overpass API unavailable, using demo road network:', err);
+      this.mapData = buildDemoMapData();
+      this.uiRenderer.showNotification(
+        'Offline mode – demo road network (5×5 grid)',
+        'warning',
+      );
     }
+    this.infraRenderer.buildStaticLayer(this.mapData);
+    this.trafficLightUI.init(this.mapData.nodes);
   }
 
   // ─── Event subscriptions ───────────────────────────────────────────────────
@@ -152,6 +211,8 @@ export class Game {
 
     try {
       await startSimulation(channel);
+      // Sync the initial time scale – GameClockUI defaults to 60 but Rust starts at 1.0
+      await setTimeScale(this.gameClockUI.timeScale);
     } catch (err) {
       console.error('Failed to start simulation:', err);
       this.uiRenderer.showNotification('Simulation start failed', 'error');
