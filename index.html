@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Traffic Control</title>
+    <link
+      rel="stylesheet"
+      href="https://unpkg.com/maplibre-gl@5/dist/maplibre-gl.css"
+    />
+    <link rel="stylesheet" href="/src/styles/main.css" />
+  </head>
+  <body>
+    <div id="map-container"></div>
+    <div id="pixi-container"></div>
+
+    <div id="hud-overlay">
+      <!-- Top-left: Game clock -->
+      <div id="clock-display">
+        <div id="clock-time">06:00</div>
+        <div id="clock-day-bar">
+          <div id="clock-day-progress"></div>
+          <div id="clock-day-label">Day progress</div>
+        </div>
+      </div>
+
+      <!-- Top-right: Satisfaction -->
+      <div id="satisfaction-bar">
+        <div id="satisfaction-label">Satisfaction</div>
+        <div id="satisfaction-track">
+          <div id="satisfaction-fill"></div>
+        </div>
+        <div id="satisfaction-value">100%</div>
+      </div>
+
+      <!-- Bottom-left: Control panel -->
+      <div id="control-panel">
+        <div id="control-panel-header">
+          <span id="control-panel-title">Traffic Control</span>
+          <span id="vehicle-count">0 vehicles</span>
+        </div>
+        <div id="time-controls">
+          <button id="pause-btn" class="ctrl-btn" title="Pause/Resume">⏸</button>
+          <div id="speed-control">
+            <label for="speed-slider">Speed ×</label>
+            <input type="range" id="speed-slider" min="1" max="360" value="60" step="1" />
+            <span id="speed-value">60</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Right: Traffic light control panel (hidden by default) -->
+      <div id="light-control-panel" class="hidden">
+        <div id="light-panel-header">
+          <span id="light-panel-title">Intersection</span>
+          <button id="light-panel-close" class="icon-btn">✕</button>
+        </div>
+        <div id="light-phase-indicator">
+          <div class="phase-dot" id="phase-red"></div>
+          <div class="phase-dot" id="phase-yellow"></div>
+          <div class="phase-dot" id="phase-green"></div>
+        </div>
+        <div id="light-timer">--s</div>
+        <div id="light-mode-select">
+          <label>Mode</label>
+          <select id="light-mode">
+            <option value="Auto">Auto</option>
+            <option value="SemiAuto">Semi-Auto</option>
+            <option value="Manual">Manual</option>
+            <option value="Adaptive">Adaptive</option>
+          </select>
+        </div>
+        <div id="light-manual-controls" class="hidden">
+          <button class="phase-btn" data-phase="0">🔴 Red</button>
+          <button class="phase-btn" data-phase="1">🟡 Yellow</button>
+          <button class="phase-btn" data-phase="2">🟢 Green</button>
+        </div>
+      </div>
+
+      <!-- Notification area -->
+      <div id="notification-area"></div>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

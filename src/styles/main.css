@@ -1,0 +1,541 @@
+/* ============================================================
+   Reset & base
+   ============================================================ */
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: #1a1a2e;
+  font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+  font-size: 13px;
+  color: #e0e0e0;
+  user-select: none;
+}
+
+/* ============================================================
+   Layer stack
+   ============================================================ */
+#map-container {
+  position: absolute;
+  inset: 0;
+  width: 100vw;
+  height: 100vh;
+  z-index: 0;
+}
+
+#pixi-container {
+  position: absolute;
+  inset: 0;
+  width: 100vw;
+  height: 100vh;
+  z-index: 1;
+  pointer-events: none;
+}
+
+#pixi-container canvas {
+  display: block;
+}
+
+#hud-overlay {
+  position: absolute;
+  inset: 0;
+  width: 100vw;
+  height: 100vh;
+  z-index: 2;
+  pointer-events: none;
+}
+
+/* All direct HUD children that need clicks get pointer-events back */
+#hud-overlay > * {
+  pointer-events: auto;
+}
+
+/* ============================================================
+   Glassmorphism utility
+   ============================================================ */
+.glass {
+  background: rgba(10, 10, 30, 0.72);
+  backdrop-filter: blur(12px) saturate(1.4);
+  -webkit-backdrop-filter: blur(12px) saturate(1.4);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 12px;
+}
+
+/* ============================================================
+   Clock display - top left
+   ============================================================ */
+#clock-display {
+  position: absolute;
+  top: 16px;
+  left: 16px;
+  min-width: 160px;
+  padding: 10px 14px;
+  background: rgba(10, 10, 30, 0.72);
+  backdrop-filter: blur(12px) saturate(1.4);
+  -webkit-backdrop-filter: blur(12px) saturate(1.4);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 12px;
+}
+
+#clock-time {
+  font-size: 28px;
+  font-weight: 700;
+  letter-spacing: 2px;
+  color: #00d4ff;
+  text-shadow: 0 0 12px rgba(0, 212, 255, 0.5);
+  font-variant-numeric: tabular-nums;
+}
+
+#clock-day-bar {
+  position: relative;
+  margin-top: 6px;
+  height: 6px;
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+#clock-day-progress {
+  height: 100%;
+  width: 25%;
+  background: linear-gradient(90deg, #00d4ff, #0090ff);
+  border-radius: 3px;
+  transition: width 1s linear;
+}
+
+#clock-day-label {
+  position: absolute;
+  bottom: -16px;
+  left: 0;
+  font-size: 10px;
+  color: rgba(255, 255, 255, 0.4);
+  letter-spacing: 0.5px;
+}
+
+/* ============================================================
+   Satisfaction bar - top right
+   ============================================================ */
+#satisfaction-bar {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  min-width: 180px;
+  padding: 10px 14px;
+  background: rgba(10, 10, 30, 0.72);
+  backdrop-filter: blur(12px) saturate(1.4);
+  -webkit-backdrop-filter: blur(12px) saturate(1.4);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+#satisfaction-label {
+  font-size: 11px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: rgba(255, 255, 255, 0.5);
+}
+
+#satisfaction-track {
+  height: 8px;
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+#satisfaction-fill {
+  height: 100%;
+  width: 100%;
+  background: linear-gradient(90deg, #00d4ff, #00ff88);
+  border-radius: 4px;
+  transition: width 0.6s ease, background 0.6s ease;
+}
+
+#satisfaction-value {
+  font-size: 18px;
+  font-weight: 700;
+  color: #00ff88;
+  text-shadow: 0 0 8px rgba(0, 255, 136, 0.4);
+  text-align: right;
+}
+
+/* ============================================================
+   Control panel - bottom left
+   ============================================================ */
+#control-panel {
+  position: absolute;
+  bottom: 20px;
+  left: 16px;
+  min-width: 240px;
+  padding: 14px 16px;
+  background: rgba(10, 10, 30, 0.80);
+  backdrop-filter: blur(14px) saturate(1.4);
+  -webkit-backdrop-filter: blur(14px) saturate(1.4);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+#control-panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+#control-panel-title {
+  font-size: 12px;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  color: #00d4ff;
+}
+
+#vehicle-count {
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.5);
+}
+
+#time-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.ctrl-btn {
+  width: 34px;
+  height: 34px;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 8px;
+  background: rgba(0, 212, 255, 0.12);
+  color: #00d4ff;
+  font-size: 16px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.2s, border-color 0.2s;
+  flex-shrink: 0;
+}
+
+.ctrl-btn:hover {
+  background: rgba(0, 212, 255, 0.25);
+  border-color: rgba(0, 212, 255, 0.4);
+}
+
+.ctrl-btn.paused {
+  background: rgba(255, 107, 53, 0.18);
+  border-color: rgba(255, 107, 53, 0.4);
+  color: #ff6b35;
+}
+
+#speed-control {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+}
+
+#speed-control label {
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.5);
+  white-space: nowrap;
+}
+
+#speed-slider {
+  flex: 1;
+  height: 4px;
+  -webkit-appearance: none;
+  appearance: none;
+  background: rgba(255, 255, 255, 0.15);
+  border-radius: 2px;
+  outline: none;
+  cursor: pointer;
+}
+
+#speed-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #00d4ff;
+  box-shadow: 0 0 6px rgba(0, 212, 255, 0.6);
+  cursor: pointer;
+}
+
+#speed-value {
+  font-size: 11px;
+  font-weight: 600;
+  color: #00d4ff;
+  min-width: 24px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ============================================================
+   Traffic light control panel - right side
+   ============================================================ */
+#light-control-panel {
+  position: absolute;
+  top: 50%;
+  right: 16px;
+  transform: translateY(-50%);
+  width: 200px;
+  padding: 16px;
+  background: rgba(10, 10, 30, 0.85);
+  backdrop-filter: blur(14px) saturate(1.4);
+  -webkit-backdrop-filter: blur(14px) saturate(1.4);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  transition: opacity 0.2s, transform 0.2s;
+}
+
+#light-control-panel.hidden {
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(-50%) translateX(12px);
+}
+
+#light-panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+#light-panel-title {
+  font-size: 12px;
+  letter-spacing: 1.2px;
+  text-transform: uppercase;
+  color: rgba(255, 255, 255, 0.7);
+}
+
+.icon-btn {
+  background: none;
+  border: none;
+  color: rgba(255, 255, 255, 0.4);
+  font-size: 14px;
+  cursor: pointer;
+  padding: 2px 4px;
+  border-radius: 4px;
+  transition: color 0.15s, background 0.15s;
+}
+
+.icon-btn:hover {
+  color: #fff;
+  background: rgba(255, 255, 255, 0.1);
+}
+
+#light-phase-indicator {
+  display: flex;
+  justify-content: center;
+  gap: 12px;
+  padding: 4px 0;
+}
+
+.phase-dot {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  border: 2px solid rgba(255, 255, 255, 0.15);
+  transition: box-shadow 0.3s, border-color 0.3s, opacity 0.3s;
+  opacity: 0.3;
+}
+
+.phase-dot.active {
+  opacity: 1;
+  border-color: transparent;
+}
+
+#phase-red { background: #ff3b3b; }
+#phase-red.active { box-shadow: 0 0 16px rgba(255, 59, 59, 0.8); }
+
+#phase-yellow { background: #ffd040; }
+#phase-yellow.active { box-shadow: 0 0 16px rgba(255, 208, 64, 0.8); }
+
+#phase-green { background: #3ddc84; }
+#phase-green.active { box-shadow: 0 0 16px rgba(61, 220, 132, 0.8); }
+
+#light-timer {
+  text-align: center;
+  font-size: 22px;
+  font-weight: 700;
+  color: #fff;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 1px;
+}
+
+#light-mode-select {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+#light-mode-select label {
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.4);
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+}
+
+#light-mode {
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 6px;
+  color: #e0e0e0;
+  font-size: 13px;
+  padding: 5px 8px;
+  cursor: pointer;
+  outline: none;
+}
+
+#light-mode:focus {
+  border-color: rgba(0, 212, 255, 0.4);
+}
+
+#light-manual-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+#light-manual-controls.hidden {
+  display: none;
+}
+
+.phase-btn {
+  padding: 6px 10px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.05);
+  color: #e0e0e0;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+  text-align: left;
+}
+
+.phase-btn:hover {
+  background: rgba(255, 255, 255, 0.12);
+  border-color: rgba(255, 255, 255, 0.25);
+}
+
+/* ============================================================
+   Notification area
+   ============================================================ */
+#notification-area {
+  position: absolute;
+  top: 80px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: center;
+  pointer-events: none;
+  z-index: 10;
+}
+
+.notification {
+  padding: 8px 18px;
+  border-radius: 20px;
+  font-size: 13px;
+  font-weight: 500;
+  letter-spacing: 0.3px;
+  animation: notif-in 0.25s ease forwards;
+  white-space: nowrap;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.notification.info {
+  background: rgba(0, 212, 255, 0.2);
+  color: #00d4ff;
+  border-color: rgba(0, 212, 255, 0.3);
+}
+
+.notification.warning {
+  background: rgba(255, 208, 64, 0.2);
+  color: #ffd040;
+  border-color: rgba(255, 208, 64, 0.3);
+}
+
+.notification.error {
+  background: rgba(255, 59, 59, 0.2);
+  color: #ff3b3b;
+  border-color: rgba(255, 59, 59, 0.3);
+}
+
+.notification.fade-out {
+  animation: notif-out 0.3s ease forwards;
+}
+
+@keyframes notif-in {
+  from { opacity: 0; transform: translateY(-10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes notif-out {
+  from { opacity: 1; transform: translateY(0); }
+  to { opacity: 0; transform: translateY(-8px); }
+}
+
+/* ============================================================
+   Edge congestion indicators (injected by CongestionRenderer)
+   ============================================================ */
+.edge-indicator {
+  position: absolute;
+  pointer-events: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  font-size: 11px;
+  font-weight: 700;
+  animation: pulse-indicator 1.2s ease-in-out infinite;
+  z-index: 5;
+}
+
+.edge-indicator.warning {
+  background: rgba(255, 208, 64, 0.85);
+  color: #1a1a2e;
+  box-shadow: 0 0 12px rgba(255, 208, 64, 0.6);
+}
+
+.edge-indicator.critical {
+  background: rgba(255, 59, 59, 0.9);
+  color: #fff;
+  box-shadow: 0 0 14px rgba(255, 59, 59, 0.7);
+}
+
+@keyframes pulse-indicator {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50% { transform: scale(1.15); opacity: 0.75; }
+}
+
+/* ============================================================
+   Scrollbar hiding for any inner scrollable areas
+   ============================================================ */
+::-webkit-scrollbar {
+  width: 4px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.15);
+  border-radius: 2px;
+}
