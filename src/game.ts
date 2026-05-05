@@ -22,8 +22,9 @@ import { UIRenderer } from './rendering/UIRenderer';
 import { TrafficLightUI } from './traffic/TrafficLightUI';
 import { GameClockUI } from './time/GameClockUI';
 
-// Default Kraków bbox: [west, south, east, north]
-const DEFAULT_BBOX: [number, number, number, number] = [19.925, 50.052, 19.955, 50.068];
+// Kraków Śródmieście – ~2 km × 2 km centred on Rynek Główny (19.9368, 50.0614)
+// west, south, east, north
+const DEFAULT_BBOX: [number, number, number, number] = [19.922, 50.051, 19.952, 50.072];
 
 // ─── Demo road network ─────────────────────────────────────────────────────
 // Used as a fallback when the Overpass API is not reachable (e.g., corporate

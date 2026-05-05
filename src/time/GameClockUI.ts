@@ -20,7 +20,7 @@ export class GameClockUI {
   private readonly speedValue: HTMLElement;
 
   private isPaused = false;
-  private currentTimeScale = 60; // 1 real second = 1 game minute
+  private currentTimeScale = 15; // 1 real second = 15 game seconds (4 min/real-min)
 
   constructor() {
     this.clockTime = this.require('clock-time');

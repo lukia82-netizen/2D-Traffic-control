@@ -8,6 +8,10 @@ use crate::vehicles::types::VehicleType;
 use crate::vehicles::driver::DriverProfile;
 use crate::simulation::pathfinding::{find_path, random_destination};
 
+/// Hard cap on total vehicles in the simulation.
+/// Keeps the demo area (2 km²) playable at 60 fps.
+const MAX_VEHICLES: usize = 150;
+
 pub struct SpawnSystem {
     pub spawn_points: Vec<NodeIndex>,
     /// Vehicles per real second at spawn multiplier = 1.0
@@ -22,7 +26,7 @@ impl SpawnSystem {
     pub fn new(spawn_points: Vec<NodeIndex>) -> Self {
         SpawnSystem {
             spawn_points,
-            base_rate: 2.0, // vehicles/real_second at multiplier=1.0
+            base_rate: 0.5, // vehicles/real_second at multiplier=1.0
             accumulator: 0.0,
             rng: StdRng::from_entropy(),
             next_id: 1,
@@ -30,14 +34,24 @@ impl SpawnSystem {
     }
 
     /// Tick the spawn system and return any new vehicles to add this frame.
-    pub fn tick(&mut self, dt_real_s: f32, multiplier: f32, map: &MapData) -> Vec<Vehicle> {
-        if self.spawn_points.is_empty() {
+    /// `current_vehicle_count` is used to enforce the global vehicle cap.
+    pub fn tick(
+        &mut self,
+        dt_real_s: f32,
+        multiplier: f32,
+        map: &MapData,
+        current_vehicle_count: usize,
+    ) -> Vec<Vehicle> {
+        if self.spawn_points.is_empty() || current_vehicle_count >= MAX_VEHICLES {
             return Vec::new();
         }
 
         self.accumulator += self.base_rate * multiplier * dt_real_s;
         let to_spawn = self.accumulator.floor() as u32;
         self.accumulator -= to_spawn as f32;
+
+        // Never exceed the cap in a single tick
+        let to_spawn = to_spawn.min((MAX_VEHICLES - current_vehicle_count) as u32);
 
         let mut new_vehicles = Vec::with_capacity(to_spawn as usize);
 

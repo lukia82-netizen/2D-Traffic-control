@@ -1,9 +1,9 @@
 import maplibregl from 'maplibre-gl';
 
-// Default map center: Kraków Śródmieście
-const DEFAULT_CENTER: [number, number] = [19.940, 50.060];
-const DEFAULT_ZOOM = 16;
-const KRAKOW_BBOX: [number, number, number, number] = [19.925, 50.052, 19.955, 50.068];
+// Default map center: Kraków Rynek Główny
+const DEFAULT_CENTER: [number, number] = [19.9368, 50.0614];
+const DEFAULT_ZOOM = 15;
+const KRAKOW_BBOX: [number, number, number, number] = [19.922, 50.051, 19.952, 50.072];
 
 // Offline fallback style — dark background, no network required
 const OFFLINE_STYLE: maplibregl.StyleSpecification = {

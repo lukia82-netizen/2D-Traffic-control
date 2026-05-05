@@ -90,7 +90,7 @@ pub fn run_simulation(
         {
             let guard = graph_lock.read();
             if let Some(map) = guard.as_ref() {
-                let new_vehicles = spawn_system.tick(real_dt_s, spawn_multiplier, map);
+                let new_vehicles = spawn_system.tick(real_dt_s, spawn_multiplier, map, vehicles.len());
                 vehicles.extend(new_vehicles);
             }
         }

@@ -109,7 +109,7 @@ ai-tests-5-traf/
 │       ├── commands.rs                # #[tauri::command] handlers
 │       ├── map/
 │       │   ├── osm_loader.rs          # osmpbf → raw nodes/ways/relations
-│       │   ├── road_network.rs        # petgraph DiGraph, RoadEdge (pasy, oneway, bridge, tunnel, layer)
+│       │   ├── road_network.rs        # petgraph DiGraph, RoadEdge; parse_oneway(tags) obsługuje oneway/roundabout/motorway/no
 │       │   ├── building_loader.rs     # osmpbf building=* → Building{id,polygon,type,access_node}
 │       │   ├── building_network.rs   # rstar R-tree: centroid → nearest road NodeIndex, O(log n)
 │       │   └── tram_network.rs       # railway=tram → TramGraph + TramStop, shared track detection
@@ -234,7 +234,7 @@ enum IntersectionType { TrafficLight, Stop, Yield, Equal }
 type RoadGraph = petgraph::Graph<RoadNode, RoadEdge, Directed>;
 ```
 
-- Overpass API pobiera `way[highway]`, `node[traffic_signals]`, `node[stop]`, `node[give_way]`, tagi `oneway`, `bridge`, `tunnel`, `layer`, `lanes`, `maxspeed`, `maxspeed:urban`, `zone:traffic`
+- Overpass API pobiera `way[highway]`, `node[traffic_signals]`, `node[stop]`, `node[give_way]`, tagi `oneway`, `junction`, `bridge`, `tunnel`, `layer`, `lanes`, `maxspeed`, `maxspeed:urban`, `zone:traffic`
 - `RoadEdge.max_speed` wyznaczana wg priorytetu: (1) tag `maxspeed` → (2) `zone:traffic=urban/rural` + typ drogi → (3) heurystyka urban/rural z gęstości węzłów - patrz sekcja "Prędkości"
 - `RoadEdge` rozszerzone o pole `urban: bool` - wpływa na default speed limit gdy brak tagu `maxspeed`
 - A* przez `petgraph::algo::astar` z wagą = czas przejazdu (`length / max_speed`)
@@ -870,9 +870,73 @@ Pan/zoom obsługuje **wyłącznie MapLibre** (brak dodatkowych bibliotek):
 ### Drogi jednokierunkowe, wiadukty, tunele
 
 **Drogi jednokierunkowe:**
-- OSM tag `oneway=yes/−1` → krawędź w grafie tylko w jednym kierunku
-- Renderowane ze strzałką na asfalcie wskazującą kierunek jazdy (co ~80px wzdłuż drogi)
-- Pojazdy nie mogą jechać pod prąd (walidacja przy pathfinding)
+
+`parse_oneway` w `road_network.rs` musi obsługiwać **5 przypadków** (aktualny kod obsługuje tylko pierwsze 3):
+
+| Warunek OSM | Wynik | Status w kodzie |
+|---|---|---|
+| `oneway=yes` / `oneway=true` / `oneway=1` | → 1 (zgodnie z węzłami) | **jest** |
+| `oneway=-1` / `oneway=reverse` | → -1 (pod prąd węzłów) | **jest** |
+| brak tagu `oneway` (i żaden z poniższych) | → 0 (dwukierunkowa) | **jest** |
+| `oneway=no` (explicit override) | → 0 (wymuś dwukierunkową) | **brak - do dodania** |
+| `junction=roundabout` | → 1 (rondo zawsze jednokierunkowe) | **brak - do dodania** |
+| `highway=motorway` lub `motorway_link` | → 1 (każda jezdnia osobna w OSM) | **brak - do dodania** |
+
+Poprawiona logika `parse_oneway` pobiera cały `tags: &HashMap`:
+
+```rust
+// road_network.rs
+fn parse_oneway(tags: &HashMap<String, String>) -> i8 {
+    // explicit oneway=no → override wszystkiego
+    if tags.get("oneway").map(|s| s.as_str()) == Some("no") {
+        return 0;
+    }
+    // explicit oneway tag
+    match tags.get("oneway").map(|s| s.as_str()) {
+        Some("yes") | Some("true") | Some("1") => return 1,
+        Some("-1") | Some("reverse")            => return -1,
+        _ => {}
+    }
+    // rondo - domyślnie jednokierunkowe (brak tagu oneway w OSM)
+    if tags.get("junction").map(|s| s.as_str()) == Some("roundabout") {
+        return 1;
+    }
+    // autostrada - każda jezdnia rysowana osobno jako jednokierunkowa
+    match tags.get("highway").map(|s| s.as_str()) {
+        Some("motorway") | Some("motorway_link") => return 1,
+        _ => {}
+    }
+    0  // domyślnie dwukierunkowa
+}
+```
+
+**Zmiana sygnatury:** `parse_oneway` teraz bierze `&HashMap<String, String>` zamiast `Option<&str>` - wywołanie staje się `parse_oneway(&way.tags)`.
+
+**Implikacje dla rend renderowania rond:**
+- Węzły wchodzące w skład ronda (`junction=roundabout`) dostaną `intersection_type` = nowy wariant `Roundabout` zamiast `Plain`
+- PixiJS renderuje okrągłą strzałkę kierunkową na rondzie (zamiast prostych strzałek oneway)
+- Logika pathfinding: wjazd na rondo = krawędź jednokierunkowa, pojazd musi objechać do właściwego zjazdu
+
+**Nowy wariant `IntersectionType`:**
+
+```rust
+pub enum IntersectionType {
+    Plain,
+    TrafficLight,
+    Stop,
+    Yield,
+    Roundabout,   // ← nowy: junction=roundabout
+}
+```
+
+`determine_intersection_type` rozszerzone o:
+```rust
+if tags.get("junction").map(|s| s.as_str()) == Some("roundabout") {
+    return IntersectionType::Roundabout;
+}
+```
+
+Renderowane ze strzałką na asfalcie wskazującą kierunek jazdy (co ~80px wzdłuż drogi). Pojazdy nie mogą jechać pod prąd (walidacja przez petgraph - krawędź po prostu nie istnieje w tym kierunku).
 
 **Wiadukty (mosty):**
 - OSM tag `bridge=yes` + `layer > 0` → droga renderowana wyżej wizualnie
