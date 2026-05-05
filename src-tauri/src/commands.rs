@@ -50,13 +50,13 @@ pub struct MapDataResponse {
 }
 
 #[command]
-pub fn load_map(
+pub async fn load_map(
     bbox: BBox,
-    state: State<AppState>,
+    state: State<'_, AppState>,
 ) -> Result<MapDataResponse, String> {
     log::info!("load_map called with bbox: west={}, south={}, east={}, north={}", bbox.west, bbox.south, bbox.east, bbox.north);
 
-    let map_data = match fetch_osm_data([bbox.south, bbox.west, bbox.north, bbox.east]) {
+    let map_data = match fetch_osm_data([bbox.west, bbox.south, bbox.east, bbox.north]).await {
         Ok(osm_data) => {
             log::info!("OSM data fetched successfully, building road network");
             build_road_network(osm_data)
