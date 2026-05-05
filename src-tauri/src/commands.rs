@@ -5,11 +5,20 @@ use serde::{Deserialize, Serialize};
 use crate::state::{AppState, SimCommand, SimControl, LightControlMode};
 use crate::map::osm_loader::fetch_osm_data;
 use crate::map::road_network::{build_road_network, MapData};
+
+#[derive(Debug, Deserialize)]
+pub struct BBox {
+    pub west: f64,
+    pub south: f64,
+    pub east: f64,
+    pub north: f64,
+}
 use crate::simulation::sim_loop::run_simulation;
 use crate::simulation::congestion::CongestionData;
 use crate::traffic::traffic_light::LightStateUpdate;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct NodeData {
     pub id: u64,
     pub lat: f64,
@@ -18,7 +27,9 @@ pub struct NodeData {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct EdgeData {
+    pub id: u64,
     pub from: u64,
     pub to: u64,
     pub lanes: u8,
@@ -30,6 +41,7 @@ pub struct EdgeData {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MapDataResponse {
     pub nodes: Vec<NodeData>,
     pub edges: Vec<EdgeData>,
@@ -39,12 +51,13 @@ pub struct MapDataResponse {
 
 #[command]
 pub fn load_map(
-    bbox: [f64; 4],
+    bbox: BBox,
     state: State<AppState>,
 ) -> Result<MapDataResponse, String> {
-    log::info!("load_map called with bbox: {:?}", bbox);
+    log::info!("load_map called with bbox: west={}, south={}, east={}, north={}", bbox.west, bbox.south, bbox.east, bbox.north);
 
-    let osm_data = fetch_osm_data(bbox).map_err(|e| format!("Failed to fetch OSM data: {}", e))?;
+    let osm_data = fetch_osm_data([bbox.south, bbox.west, bbox.north, bbox.east])
+        .map_err(|e| format!("Failed to fetch OSM data: {}", e))?;
     let map_data = build_road_network(osm_data);
 
     let response = build_map_response(&map_data);
@@ -81,6 +94,7 @@ fn build_map_response(map_data: &MapData) -> MapDataResponse {
         let from_node = &map_data.graph[edge_ref.source()];
         let to_node = &map_data.graph[edge_ref.target()];
         edges.push(EdgeData {
+            id: edge_ref.id().index() as u64,
             from: from_node.osm_id,
             to: to_node.osm_id,
             lanes: edge.lanes,

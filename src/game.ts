@@ -129,7 +129,8 @@ export class Game {
       );
     } catch (err) {
       console.error('Failed to load map:', err);
-      this.uiRenderer.showNotification('Map load failed – check console', 'error');
+      const message = err instanceof Error ? err.message : String(err);
+      this.uiRenderer.showNotification(`Map load failed — ${message}`, 'error');
     }
   }
 
