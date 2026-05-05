@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::state::{AppState, SimCommand, SimControl, LightControlMode};
 use crate::map::osm_loader::fetch_osm_data;
-use crate::map::road_network::{build_road_network, build_demo_road_network, MapData};
+use crate::map::road_network::{build_road_network, build_demo_road_network, MapData, BuildingPolygon};
 use crate::simulation::sim_loop::run_simulation;
 use crate::simulation::congestion::CongestionData;
 use crate::traffic::traffic_light::LightStateUpdate;
@@ -29,6 +29,13 @@ pub struct EdgeData {
     pub infra_type: String,
     pub layer: i8,
     pub length_m: f32,
+    pub road_type: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct BuildingData {
+    pub polygon: Vec<[f64; 2]>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -38,6 +45,7 @@ pub struct MapDataResponse {
     pub edges: Vec<EdgeData>,
     pub spawn_points: Vec<[f64; 2]>,
     pub bbox: [f64; 4],
+    pub buildings: Vec<BuildingData>,
 }
 
 #[command]
@@ -104,6 +112,7 @@ fn build_map_response(map_data: &MapData) -> MapDataResponse {
             },
             layer: edge.layer,
             length_m: edge.length_m,
+            road_type: edge.road_type.clone(),
         });
     }
 
@@ -116,11 +125,16 @@ fn build_map_response(map_data: &MapData) -> MapDataResponse {
         })
         .collect();
 
+    let buildings: Vec<BuildingData> = map_data.buildings.iter()
+        .map(|b: &BuildingPolygon| BuildingData { polygon: b.polygon.clone() })
+        .collect();
+
     MapDataResponse {
         nodes,
         edges,
         spawn_points,
         bbox: map_data.bbox,
+        buildings,
     }
 }
 

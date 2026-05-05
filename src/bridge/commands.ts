@@ -25,6 +25,12 @@ export interface EdgeData {
   infraType: string;
   layer: number;
   lengthM: number;
+  roadType: string;
+}
+
+export interface BuildingPolygon {
+  /** Ordered list of [lat, lng] vertices */
+  polygon: [number, number][];
 }
 
 export interface MapData {
@@ -32,6 +38,7 @@ export interface MapData {
   edges: EdgeData[];
   spawnPoints: [number, number][];
   bbox: [number, number, number, number];
+  buildings: BuildingPolygon[];
 }
 
 // ─── Typed invoke wrappers ────────────────────────────────────────────────────

@@ -46,6 +46,14 @@ pub struct RoadEdge {
     pub length_m: f32,
     pub lane_directions: Vec<LaneDirection>,
     pub decision_points: [f32; 3],
+    /// OSM highway tag value: "primary", "residential", etc.
+    pub road_type: String,
+}
+
+/// A building polygon represented as an ordered list of [lat, lng] vertices.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuildingPolygon {
+    pub polygon: Vec<[f64; 2]>,
 }
 
 pub type RoadGraph = DiGraph<RoadNode, RoadEdge>;
@@ -55,6 +63,7 @@ pub struct MapData {
     pub node_index_map: HashMap<u64, NodeIndex>,
     pub bbox: [f64; 4],
     pub spawn_points: Vec<NodeIndex>,
+    pub buildings: Vec<BuildingPolygon>,
 }
 
 /// Build a simple 5×5 grid road network centred on Kraków.
@@ -100,6 +109,7 @@ pub fn build_demo_road_network() -> MapData {
             length_m,
             lane_directions: build_lane_directions(2),
             decision_points: [length_m * 0.25, length_m * 0.5, length_m * 0.75],
+            road_type: "residential".to_string(),
         };
         let rev = RoadEdge {
             lane_directions: build_lane_directions_reversed(2),
@@ -136,7 +146,7 @@ pub fn build_demo_road_network() -> MapData {
         spawn_points.len()
     );
 
-    MapData { graph, node_index_map, bbox, spawn_points }
+    MapData { graph, node_index_map, bbox, spawn_points, buildings: Vec::new() }
 }
 
 pub fn build_road_network(osm_data: OsmData) -> MapData {
@@ -176,13 +186,19 @@ pub fn build_road_network(osm_data: OsmData) -> MapData {
     // Add graph edges
     for way in &osm_data.ways {
         let tags = &way.tags;
+        // Skip building ways — they are handled separately below
+        if !tags.contains_key("highway") { continue; }
+
         let oneway = parse_oneway(tags.get("oneway").map(|s| s.as_str()));
-        let lanes = parse_lanes(tags.get("lanes").map(|s| s.as_str()));
+        let highway_type = tags.get("highway").map(|s| s.as_str()).unwrap_or("unclassified");
+        let lanes = parse_lanes(tags.get("lanes").map(|s| s.as_str()),
+                                highway_type);
         let max_speed = parse_max_speed(tags.get("maxspeed").map(|s| s.as_str()),
-                                        tags.get("highway").map(|s| s.as_str()));
+                                        Some(highway_type));
         let infra_type = parse_infra_type(tags);
         let layer = parse_layer(tags.get("layer").map(|s| s.as_str()));
         let lane_directions = build_lane_directions(lanes);
+        let road_type = highway_type.to_string();
 
         for window in way.node_refs.windows(2) {
             let from_id = window[0];
@@ -209,6 +225,7 @@ pub fn build_road_network(osm_data: OsmData) -> MapData {
                 length_m,
                 lane_directions: lane_directions.clone(),
                 decision_points,
+                road_type: road_type.clone(),
             };
 
             match oneway {
@@ -243,11 +260,33 @@ pub fn build_road_network(osm_data: OsmData) -> MapData {
         spawn_points.len()
     );
 
+    // ── Parse building polygons ───────────────────────────────────────────────
+    let mut buildings: Vec<BuildingPolygon> = Vec::new();
+    for way in &osm_data.ways {
+        if !way.tags.contains_key("building") { continue; }
+        let polygon: Vec<[f64; 2]> = way.node_refs.iter()
+            .filter_map(|&nid| osm_data.nodes.get(&nid))
+            .map(|n| [n.lat, n.lng])
+            .collect();
+        if polygon.len() >= 3 {
+            buildings.push(BuildingPolygon { polygon });
+        }
+    }
+
+    log::info!(
+        "Built road graph: {} nodes, {} edges, {} spawn points, {} buildings",
+        graph.node_count(),
+        graph.edge_count(),
+        spawn_points.len(),
+        buildings.len(),
+    );
+
     MapData {
         graph,
         node_index_map,
         bbox,
         spawn_points,
+        buildings,
     }
 }
 
@@ -280,12 +319,18 @@ fn parse_oneway(value: Option<&str>) -> i8 {
     }
 }
 
-fn parse_lanes(value: Option<&str>) -> u8 {
-    value
-        .and_then(|s| s.parse::<u8>().ok())
-        .unwrap_or(1)
-        .max(1)
-        .min(8)
+fn parse_lanes(value: Option<&str>, highway: &str) -> u8 {
+    if let Some(n) = value.and_then(|s| s.parse::<u8>().ok()) {
+        return n.max(1).min(8);
+    }
+    // Defaults by road type when OSM tag is absent
+    match highway {
+        "motorway" | "trunk"                       => 3,
+        "primary"                                  => 2,
+        "secondary" | "tertiary"                   => 2,
+        "residential" | "living_street" | "service"=> 1,
+        _                                          => 1,
+    }
 }
 
 fn parse_max_speed(maxspeed: Option<&str>, highway: Option<&str>) -> f32 {

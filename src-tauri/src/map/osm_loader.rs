@@ -52,13 +52,16 @@ pub async fn fetch_osm_data(bbox: [f64; 4]) -> Result<OsmData, String> {
     // bbox is [west, south, east, north] (GeoJSON / frontend convention)
     let [west, south, east, north] = bbox;
 
-    // Overpass QL: fetch highway ways + their member nodes in one request.
-    // Using `>;` to expand ways to nodes, then `out body qt;` to output all.
-    // Limiting to road types relevant for city traffic simulation.
+    // Overpass QL: fetch highway ways + building footprints + all member nodes.
+    // `>;` expands ways to their constituent nodes.
     let query = format!(
         "[out:json][timeout:60];\
-        (way[highway~\"motorway|trunk|primary|secondary|tertiary|residential|service|unclassified|living_street\"]\
-        ({south},{west},{north},{east});>;);\
+        (\
+          way[highway~\"motorway|trunk|primary|secondary|tertiary|residential|service|unclassified|living_street\"]\
+          ({south},{west},{north},{east});\
+          way[building]({south},{west},{north},{east});\
+          >;\
+        );\
         out body qt;",
     );
 
@@ -115,6 +118,7 @@ fn parse_overpass_json(json_text: &str) -> Result<OsmData, String> {
                 );
             }
             "way" => {
+                // Accept all ways (highway + building); road_network.rs filters by tag
                 if !element.nodes.is_empty() {
                     osm_data.ways.push(OsmWay {
                         id: element.id,

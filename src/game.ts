@@ -15,6 +15,8 @@ import {
 import type { VehicleState, CongestionData, LightStateUpdate } from './bridge/events';
 import { PixiOverlay } from './rendering/PixiOverlay';
 import { CameraManager } from './rendering/CameraManager';
+import { RoadRenderer } from './rendering/RoadRenderer';
+import { BuildingRenderer } from './rendering/BuildingRenderer';
 import { VehicleRenderer } from './rendering/VehicleRenderer';
 import { InfraRenderer } from './rendering/InfraRenderer';
 import { CongestionRenderer } from './rendering/CongestionRenderer';
@@ -22,9 +24,10 @@ import { UIRenderer } from './rendering/UIRenderer';
 import { TrafficLightUI } from './traffic/TrafficLightUI';
 import { GameClockUI } from './time/GameClockUI';
 
-// Kraków Śródmieście – ~2 km × 2 km centred on Rynek Główny (19.9368, 50.0614)
+// Kraków Śródmieście – ~1 km × 1 km centred on Rynek Główny (19.9368, 50.0614)
+// 0.007° lng ≈ 500 m, 0.0045° lat ≈ 500 m  →  total 1 km × 1 km
 // west, south, east, north
-const DEFAULT_BBOX: [number, number, number, number] = [19.922, 50.051, 19.952, 50.072];
+const DEFAULT_BBOX: [number, number, number, number] = [19.930, 50.057, 19.944, 50.066];
 
 // ─── Demo road network ─────────────────────────────────────────────────────
 // Used as a fallback when the Overpass API is not reachable (e.g., corporate
@@ -57,8 +60,8 @@ function buildDemoMapData(): MapData {
   }
 
   const addEdgePair = (a: number, b: number): void => {
-    edges.push({ from: a, to: b, lanes: 2, maxSpeed: 50, oneway: false, infraType: 'normal', layer: 0, lengthM: 300 });
-    edges.push({ from: b, to: a, lanes: 2, maxSpeed: 50, oneway: false, infraType: 'normal', layer: 0, lengthM: 300 });
+    edges.push({ from: a, to: b, lanes: 2, maxSpeed: 50, oneway: false, infraType: 'normal', layer: 0, lengthM: 300, roadType: 'residential' });
+    edges.push({ from: b, to: a, lanes: 2, maxSpeed: 50, oneway: false, infraType: 'normal', layer: 0, lengthM: 300, roadType: 'residential' });
   };
 
   for (let r = 0; r < ROWS; r++) {
@@ -77,7 +80,7 @@ function buildDemoMapData(): MapData {
     spawnPoints.push([nodes[nid(r, COLS - 1)].lat, nodes[nid(r, COLS - 1)].lng]);
   }
 
-  return { nodes, edges, spawnPoints, bbox: DEFAULT_BBOX };
+  return { nodes, edges, spawnPoints, bbox: DEFAULT_BBOX, buildings: [] };
 }
 
 // Simulation starts at 06:00 (game seconds since midnight)
@@ -97,6 +100,8 @@ export class Game {
   private readonly overlay: PixiOverlay;
 
   private camera!: CameraManager;
+  private roadRenderer!: RoadRenderer;
+  private buildingRenderer!: BuildingRenderer;
   private vehicleRenderer!: VehicleRenderer;
   private infraRenderer!: InfraRenderer;
   private congestionRenderer!: CongestionRenderer;
@@ -134,6 +139,8 @@ export class Game {
 
     // Instantiate sub-systems
     this.camera = new CameraManager(this.map);
+    this.buildingRenderer = new BuildingRenderer(this.overlay, this.map);
+    this.roadRenderer = new RoadRenderer(this.overlay, this.map, this.camera);
     this.vehicleRenderer = new VehicleRenderer(this.overlay, this.map, this.camera);
     this.infraRenderer = new InfraRenderer(this.overlay, this.map, this.camera);
     this.congestionRenderer = new CongestionRenderer(
@@ -166,6 +173,8 @@ export class Game {
     // Hook infra rebuild on every map camera move
     this.map.on('render', () => {
       if (this.mapData) {
+        this.buildingRenderer.rebuildOnCameraChange(this.mapData);
+        this.roadRenderer.rebuildOnCameraChange(this.mapData);
         this.infraRenderer.rebuildOnCameraChange(this.mapData);
       }
     });
@@ -192,6 +201,8 @@ export class Game {
         'warning',
       );
     }
+    this.buildingRenderer.build(this.mapData);
+    this.roadRenderer.build(this.mapData);
     this.infraRenderer.buildStaticLayer(this.mapData);
     this.trafficLightUI.init(this.mapData.nodes);
   }
@@ -286,6 +297,8 @@ export class Game {
   destroy(): void {
     this.unlistenCongestion?.();
     this.unlistenLights?.();
+    this.buildingRenderer.destroy();
+    this.roadRenderer.destroy();
     this.vehicleRenderer.destroy();
     this.infraRenderer.destroy();
     this.congestionRenderer.destroy();

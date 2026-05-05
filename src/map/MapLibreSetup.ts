@@ -2,8 +2,8 @@ import maplibregl from 'maplibre-gl';
 
 // Default map center: Kraków Rynek Główny
 const DEFAULT_CENTER: [number, number] = [19.9368, 50.0614];
-const DEFAULT_ZOOM = 15;
-const KRAKOW_BBOX: [number, number, number, number] = [19.922, 50.051, 19.952, 50.072];
+const DEFAULT_ZOOM = 16;
+const KRAKOW_BBOX: [number, number, number, number] = [19.930, 50.057, 19.944, 50.066];
 
 // Offline fallback style — dark background, no network required
 const OFFLINE_STYLE: maplibregl.StyleSpecification = {
@@ -27,71 +27,23 @@ const STYLE_LOAD_TIMEOUT_MS = 6000;
 // ─── Factory ──────────────────────────────────────────────────────────────────
 
 /**
- * Creates a MapLibre map that always loads quickly.
- * Tries the online tile style first (6s timeout), then falls back to a
- * dark offline background so the app never hangs waiting for the network.
+ * Creates a MapLibre map in "sketch" mode — pure offline dark canvas.
+ * Roads and buildings are drawn by PixiJS from OSM data, so we don't need
+ * map tiles at all. MapLibre is kept only for its camera (pan/zoom) and
+ * coordinate projection system.
  */
 export async function createMap(containerId: string): Promise<maplibregl.Map> {
   return new Promise((resolve) => {
     const map = new maplibregl.Map({
       container: containerId,
-      style: ONLINE_STYLE_URL,
+      style: OFFLINE_STYLE,   // always offline – PixiJS draws the map
       center: DEFAULT_CENTER,
       zoom: DEFAULT_ZOOM,
       maxZoom: 19,
-      minZoom: 10,
+      minZoom: 12,
       attributionControl: false,
     });
-
-    let settled = false;
-
-    const settle = (): void => {
-      if (settled) return;
-      settled = true;
-      resolve(map);
-    };
-
-    // Suppress missing sprite image warnings (online styles reference POI icons
-    // that may not exist in the sprite sheet — harmless but noisy in DevTools)
-    map.on('styleimagemissing', (e: { id: string }) => {
-      // Provide a 1×1 transparent placeholder so MapLibre stops complaining
-      if (!map.hasImage(e.id)) {
-        const empty = new ImageData(1, 1);
-        map.addImage(e.id, empty);
-      }
-    });
-
-    // Happy path – online tiles loaded in time
-    map.once('load', () => settle());
-
-    // If the style fails to load at all, fall back immediately
-    map.once('error', () => {
-      if (!settled) {
-        console.warn('[MapLibre] Style load error – switching to offline mode');
-        map.setStyle(OFFLINE_STYLE);
-        map.once('styledata', () => settle());
-      }
-    });
-
-    // Timeout fallback – corporate firewalls may silently drop the request
-    setTimeout(() => {
-      if (!settled) {
-        console.warn('[MapLibre] Style load timed out – switching to offline mode');
-        settled = true; // prevent double-resolve
-        // Load a new map instance with offline style (setStyle mid-flight can glitch)
-        map.remove();
-        const offlineMap = new maplibregl.Map({
-          container: containerId,
-          style: OFFLINE_STYLE,
-          center: DEFAULT_CENTER,
-          zoom: DEFAULT_ZOOM,
-          maxZoom: 19,
-          minZoom: 10,
-          attributionControl: false,
-        });
-        offlineMap.once('load', () => resolve(offlineMap));
-      }
-    }, STYLE_LOAD_TIMEOUT_MS);
+    map.once('load', () => resolve(map));
   });
 }
 
