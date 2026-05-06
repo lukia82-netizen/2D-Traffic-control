@@ -13,6 +13,14 @@ use crate::simulation::speed_config::SpeedConfig;
 
 // ── Response DTOs ─────────────────────────────────────────────────────────────
 
+#[derive(Debug, Deserialize)]
+pub struct BBox {
+    pub west: f64,
+    pub south: f64,
+    pub east: f64,
+    pub north: f64,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct NodeData {
@@ -25,6 +33,7 @@ pub struct NodeData {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct EdgeData {
+    pub id: u64,
     pub from: u64,
     pub to: u64,
     pub lanes: u8,
@@ -86,33 +95,19 @@ pub struct MapDataResponse {
 ///   Values: `"mixed"` | `"one_lane"` | `"two_lane"` | `"three_lane"`
 #[command]
 pub async fn load_map(
-    bbox: [f64; 4],
-    force_sandbox: Option<String>,
+    bbox: BBox,
     state: State<'_, AppState>,
 ) -> Result<MapDataResponse, String> {
-    log::info!("load_map called with bbox: {:?}, force_sandbox: {:?}", bbox, force_sandbox);
+    log::info!("load_map called with bbox: west={}, south={}, east={}, north={}", bbox.west, bbox.south, bbox.east, bbox.north);
 
-    // If the caller explicitly requested a sandbox grid, skip Overpass entirely.
-    if let Some(ref grid_type) = force_sandbox {
-        let map_data = if grid_type == "single_road" {
-            build_single_road_network(bbox)
-        } else {
-            build_demo_road_network(grid_type, bbox)
-        };
-        let response = build_map_response(&map_data);
-        let mut guard = state.road_graph.write();
-        *guard = Some(map_data);
-        return Ok(response);
-    }
-
-    let map_data = match fetch_osm_data(bbox).await {
+    let map_data = match fetch_osm_data([bbox.west, bbox.south, bbox.east, bbox.north]).await {
         Ok(osm_data) => {
             log::info!("OSM data fetched, building road network");
             build_road_network(osm_data)
         }
         Err(e) => {
-            log::warn!("Overpass API unavailable ({}), falling back to sandbox mixed grid", e);
-            build_demo_road_network("mixed", bbox)
+            log::warn!("Overpass API unavailable ({}) , using demo road network", e);
+            build_demo_road_network()
         }
     };
 
@@ -120,6 +115,65 @@ pub async fn load_map(
     let mut guard = state.road_graph.write();
     *guard = Some(map_data);
     Ok(response)
+}
+
+fn build_map_response(map_data: &MapData) -> MapDataResponse {
+    use petgraph::visit::EdgeRef;
+    use crate::map::road_network::IntersectionType;
+
+    let mut nodes = Vec::new();
+    for node_idx in map_data.graph.node_indices() {
+        let node = &map_data.graph[node_idx];
+        nodes.push(NodeData {
+            id: node.osm_id,
+            lat: node.lat,
+            lng: node.lng,
+            intersection_type: match node.intersection_type {
+                IntersectionType::Plain => "plain".to_string(),
+                IntersectionType::TrafficLight => "traffic_light".to_string(),
+                IntersectionType::Stop => "stop".to_string(),
+                IntersectionType::Yield => "yield".to_string(),
+            },
+        });
+    }
+
+    let mut edges = Vec::new();
+    for edge_ref in map_data.graph.edge_references() {
+        let edge = edge_ref.weight();
+        let from_node = &map_data.graph[edge_ref.source()];
+        let to_node = &map_data.graph[edge_ref.target()];
+        edges.push(EdgeData {
+            id: edge_ref.id().index() as u64,
+            from: from_node.osm_id,
+            to: to_node.osm_id,
+            lanes: edge.lanes,
+            max_speed: edge.max_speed,
+            oneway: edge.oneway,
+            infra_type: match edge.infra_type {
+                crate::map::road_network::InfraType::Normal => "normal".to_string(),
+                crate::map::road_network::InfraType::Bridge => "bridge".to_string(),
+                crate::map::road_network::InfraType::Tunnel => "tunnel".to_string(),
+            },
+            layer: edge.layer,
+            length_m: edge.length_m,
+        });
+    }
+
+    let spawn_points: Vec<[f64; 2]> = map_data
+        .spawn_points
+        .iter()
+        .map(|&idx| {
+            let node = &map_data.graph[idx];
+            [node.lat, node.lng]
+        })
+        .collect();
+
+    MapDataResponse {
+        nodes,
+        edges,
+        spawn_points,
+        bbox: map_data.bbox,
+    }
 }
 
 #[command]

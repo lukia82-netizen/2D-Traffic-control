@@ -293,10 +293,11 @@ export class Game {
         'info',
       );
     } catch (err) {
-      console.warn('Overpass API unavailable, using demo road network:', err);
+      console.warn('Failed to load live map data; using offline demo network:', err);
+      const message = err instanceof Error ? err.message : String(err);
       this.mapData = buildDemoMapData();
       this.uiRenderer.showNotification(
-        'Offline mode – demo road network (5×5 grid)',
+        `Live map unavailable — demo network active (${message})`,
         'warning',
       );
     }

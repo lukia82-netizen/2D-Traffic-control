@@ -98,8 +98,12 @@ export async function loadMap(
   forceSandbox?: string | null,
 ): Promise<MapData> {
   return invoke<MapData>('load_map', {
-    bbox,
-    forceSandbox: forceSandbox ?? null,
+    bbox: {
+      west: bbox[0],
+      south: bbox[1],
+      east: bbox[2],
+      north: bbox[3],
+    },
   });
 }
 
