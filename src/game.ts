@@ -147,6 +147,7 @@ export class Game {
   private currentBbox: [number, number, number, number] = DEFAULT_BBOX;
   /** null = real OSM data; string = sandbox grid type ('mixed'|'one_lane'|'single_road'|…) */
   private currentGridMode: string | null = 'single_road';
+  private nightMode = false;
 
   constructor(map: maplibregl.Map, overlay: PixiOverlay) {
     this.map = map;
@@ -472,6 +473,7 @@ export class Game {
     // Advance game clock
     const realDeltaS = ticker.deltaMS / 1000;
     this.gameTimeS += realDeltaS * this.gameClockUI.timeScale;
+    this.updateNightMode();
 
     // Update clock HUD
     this.gameClockUI.updateClock(this.gameTimeS);
@@ -491,6 +493,15 @@ export class Game {
 
     // Update score
     this.updateScore(realDeltaS);
+  }
+
+  private updateNightMode(): void {
+    const hour = (this.gameTimeS / 3600) % 24;
+    const shouldBeNight = hour >= 20 || hour < 6;
+    if (shouldBeNight === this.nightMode) return;
+    this.nightMode = shouldBeNight;
+    this.vehicleRenderer.setNightMode(this.nightMode);
+    document.body.classList.toggle('night-mode', this.nightMode);
   }
 
   // ─── Derived state ─────────────────────────────────────────────────────────
