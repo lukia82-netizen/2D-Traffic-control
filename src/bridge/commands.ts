@@ -95,7 +95,7 @@ export interface MapData {
  */
 export async function loadMap(
   bbox: [number, number, number, number],
-  forceSandbox?: string | null,
+  _forceSandbox?: string | null,
 ): Promise<MapData> {
   return invoke<MapData>('load_map', {
     bbox: {

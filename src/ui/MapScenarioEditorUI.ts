@@ -21,8 +21,13 @@ const EMPTY_MAP: MapData = {
   tramStops: [],
 };
 
+const EDITOR_COLLAPSED_KEY = 'traffic-control-editor-collapsed';
+
 export class MapScenarioEditorUI {
   private readonly panel: HTMLElement;
+  /** Content below the compact title bar (hidden when collapsed). */
+  private readonly panelBody: HTMLElement;
+  private readonly collapseToggle: HTMLButtonElement;
   private readonly mapJson: HTMLTextAreaElement;
   private readonly scenarioName: HTMLInputElement;
   private readonly scenarioDescription: HTMLInputElement;
@@ -35,7 +40,10 @@ export class MapScenarioEditorUI {
   onApplyScenario: (scenario: ScenarioData) => void = () => undefined;
 
   constructor() {
-    this.panel = this.buildPanel();
+    const built = this.buildPanel();
+    this.panel = built.root;
+    this.panelBody = built.body;
+    this.collapseToggle = built.toggleBtn;
     document.body.appendChild(this.panel);
 
     this.mapJson = this.require('editor-map-json') as HTMLTextAreaElement;
@@ -47,12 +55,44 @@ export class MapScenarioEditorUI {
     this.scenarioList = this.require('editor-scenario-list') as HTMLSelectElement;
 
     this.mapJson.value = JSON.stringify(EMPTY_MAP, null, 2);
+    this.collapseToggle.addEventListener('click', () =>
+      this.applyCollapsed(!this.panel.classList.contains('editor-panel--collapsed')),
+    );
+    try {
+      const saved = sessionStorage.getItem(EDITOR_COLLAPSED_KEY);
+      const wantCollapsed = saved === null ? true : saved === '1'; // default: zwinięty
+      this.applyCollapsed(wantCollapsed);
+    } catch {
+      this.applyCollapsed(true);
+    }
     this.bindEvents();
     this.refreshScenarioList();
   }
 
+  /** Collapse to a small chip (default) or show full editor. */
+  applyCollapsed(collapsed: boolean): void {
+    this.panel.classList.toggle('editor-panel--collapsed', collapsed);
+    const label = collapsed ? 'Mapa — rozwiń' : 'Mapa — zwiń';
+    this.collapseToggle.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+    this.collapseToggle.title = collapsed
+      ? 'Rozwiń edytor mapy i scenariusza'
+      : 'Zwiń edytor (zostanie wąski pasek)';
+    this.collapseToggle.textContent = collapsed ? '▸' : '▾';
+    this.collapseToggle.setAttribute('aria-label', label);
+    try {
+      sessionStorage.setItem(EDITOR_COLLAPSED_KEY, collapsed ? '1' : '0');
+    } catch {
+      /* ignore */
+    }
+    this.panelBody.setAttribute('aria-hidden', collapsed ? 'true' : 'false');
+  }
+
   setMapData(data: MapData): void {
     this.mapJson.value = JSON.stringify(data, null, 2);
+  }
+
+  destroy(): void {
+    this.panel.remove();
   }
 
   private bindEvents(): void {
@@ -179,10 +219,34 @@ export class MapScenarioEditorUI {
     this.scenarioStartTime.value = this.formatSecondsToTime(scenario.startTimeS);
   }
 
-  private buildPanel(): HTMLElement {
+  private buildPanel(): {
+    root: HTMLElement;
+    body: HTMLElement;
+    toggleBtn: HTMLButtonElement;
+  } {
     const panel = document.createElement('div');
-    panel.className = 'editor-panel';
-    panel.innerHTML = `
+    panel.className = 'editor-panel editor-panel--collapsed';
+    panel.setAttribute('role', 'region');
+    panel.setAttribute('aria-label', 'Edytor mapy i scenariusza');
+
+    const titleBar = document.createElement('div');
+    titleBar.className = 'editor-titlebar';
+
+    const titleText = document.createElement('span');
+    titleText.className = 'editor-titlebar-label';
+    titleText.textContent = 'MAP / scenariusz';
+
+    const toggle = document.createElement('button');
+    toggle.type = 'button';
+    toggle.className = 'editor-collapse-btn';
+
+    titleBar.appendChild(titleText);
+    titleBar.appendChild(toggle);
+
+    const body = document.createElement('div');
+    body.className = 'editor-panel-body';
+
+    body.innerHTML = `
       <div class="editor-header">MAP & SCENARIO EDITOR</div>
       <label class="editor-label">Mapa (JSON)</label>
       <textarea id="editor-map-json" class="editor-textarea"></textarea>
@@ -212,7 +276,10 @@ export class MapScenarioEditorUI {
         <button id="editor-load-scenario-btn" class="editor-btn">Wczytaj i uruchom</button>
       </div>
     `;
-    return panel;
+
+    panel.appendChild(titleBar);
+    panel.appendChild(body);
+    return { root: panel, body, toggleBtn: toggle };
   }
 
   private require(id: string): HTMLElement {
