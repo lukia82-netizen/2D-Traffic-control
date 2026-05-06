@@ -12,15 +12,37 @@ const TUNNEL_ALPHA = 0.6;
 const BRIDGE_SHADOW_OFFSET = 4;
 const BRIDGE_SHADOW_ALPHA = 0.35;
 
+/** How fast animated arrows scroll along one-way roads (px / second). */
+const ARROW_SCROLL_SPEED = 28;
+
+// ─── Internal types ───────────────────────────────────────────────────────────
+
+interface ArrowEdgeInfo {
+  /** Individual arrow triangles placed along this edge. */
+  arrows: PIXI.Graphics[];
+  startX: number;
+  startY: number;
+  /** Unit direction vector (from → to). */
+  dirX: number;
+  dirY: number;
+  spacing: number;
+  segLen: number;
+}
+
 // ─── InfraRenderer ───────────────────────────────────────────────────────────
 
 /**
- * Renders static infrastructure markings (oneway arrows, lane markings,
- * tunnel overlays, bridge shadows) into a RenderTexture that is then
- * displayed as a single sprite.
+ * Renders infrastructure markings in two passes:
  *
- * Call buildStaticLayer() once on map load, then rebuildOnCameraChange()
- * on every map 'render' event so arrows follow map panning/zooming.
+ * 1. **Static layer** (`staticMarkings` / `tunnelOverlay`): bridge shadows and
+ *    tunnel dashes baked into `RenderTexture`s — rebuilt on camera change.
+ *
+ * 2. **Animated arrow layer** (`arrowLayer`): live `PIXI.Graphics` triangles
+ *    on one-way roads that scroll in the direction of travel.  Call
+ *    `update(deltaMS)` every game-loop tick to advance the animation.
+ *
+ * Call `buildStaticLayer()` once on map load and `rebuildOnCameraChange()` on
+ * every map `render` event.
  */
 export class InfraRenderer {
   private readonly overlay: PixiOverlay;
@@ -31,6 +53,10 @@ export class InfraRenderer {
   private staticTexture: PIXI.RenderTexture | null = null;
   private tunnelSprite: PIXI.Sprite | null = null;
   private tunnelTexture: PIXI.RenderTexture | null = null;
+
+  /** Accumulated scroll offset in pixels, reset modulo max-segment-length. */
+  private arrowPhase = 0;
+  private arrowEdges: ArrowEdgeInfo[] = [];
 
   constructor(overlay: PixiOverlay, map: maplibregl.Map, camera: CameraManager) {
     this.overlay = overlay;
@@ -43,17 +69,41 @@ export class InfraRenderer {
   buildStaticLayer(mapData: MapData): void {
     this.rebuildMarkings(mapData);
     this.rebuildTunnelOverlay(mapData);
+    this.rebuildArrows(mapData);
   }
 
   /**
-   * Must be called on map 'render' so arrows/overlays move with the camera.
+   * Must be called on map `render` so all markings follow camera pan / zoom.
    */
   rebuildOnCameraChange(mapData: MapData): void {
     this.rebuildMarkings(mapData);
     this.rebuildTunnelOverlay(mapData);
+    this.rebuildArrows(mapData);
   }
 
-  // ─── Markings (oneway arrows + bridge shadows) ─────────────────────────────
+  /**
+   * Advance the arrow animation.  Call once per game-loop tick.
+   * The animation runs even when the simulation is paused so that the map
+   * always looks alive.
+   */
+  update(deltaMS: number): void {
+    if (this.arrowEdges.length === 0) return;
+
+    this.arrowPhase += (deltaMS / 1000) * ARROW_SCROLL_SPEED;
+
+    for (const edge of this.arrowEdges) {
+      const { arrows, startX, startY, dirX, dirY, spacing, segLen } = edge;
+      const phaseOffset = this.arrowPhase % spacing;
+
+      for (let i = 0; i < arrows.length; i++) {
+        const t = (i * spacing + phaseOffset) % segLen;
+        arrows[i].x = startX + dirX * t;
+        arrows[i].y = startY + dirY * t;
+      }
+    }
+  }
+
+  // ─── Static markings (bridge shadows only) ─────────────────────────────────
 
   private rebuildMarkings(mapData: MapData): void {
     const w = this.overlay.width;
@@ -62,30 +112,21 @@ export class InfraRenderer {
     const gfx = new PIXI.Graphics();
 
     for (const edge of mapData.edges) {
+      if (edge.infraType !== 'bridge') continue;
+
       const fromNode = mapData.nodes.find((n) => n.id === edge.from);
       const toNode = mapData.nodes.find((n) => n.id === edge.to);
       if (!fromNode || !toNode) continue;
 
       const fromPx = projectPoint(this.map, fromNode.lng, fromNode.lat);
       const toPx = projectPoint(this.map, toNode.lng, toNode.lat);
-
-      // Bridge shadow
-      if (edge.infraType === 'bridge') {
-        this.drawBridgeShadow(gfx, fromPx, toPx, edge);
-      }
-
-      // Oneway arrows
-      if (edge.oneway) {
-        this.drawOnewayArrows(gfx, fromPx, toPx);
-      }
+      this.drawBridgeShadow(gfx, fromPx, toPx, edge);
     }
 
-    // Render to texture
     const rt = PIXI.RenderTexture.create({ width: w, height: h });
     this.overlay.app.renderer.render({ container: gfx, target: rt });
     gfx.destroy();
 
-    // Swap sprites
     if (this.staticTexture) this.staticTexture.destroy(true);
     this.staticTexture = rt;
 
@@ -114,53 +155,73 @@ export class InfraRenderer {
     gfx.stroke();
   }
 
-  private drawOnewayArrows(
-    gfx: PIXI.Graphics,
-    from: { x: number; y: number },
-    to: { x: number; y: number },
-  ): void {
-    const spacing = this.camera.getArrowSpacing();
-    const dx = to.x - from.x;
-    const dy = to.y - from.y;
-    const len = Math.hypot(dx, dy);
-    if (len < spacing) return;
+  // ─── Animated oneway arrows ────────────────────────────────────────────────
 
-    const ux = dx / len;
-    const uy = dy / len;
-    const angle = Math.atan2(dy, dx);
-    const numArrows = Math.floor(len / spacing);
-
-    for (let i = 1; i <= numArrows; i++) {
-      const t = (i * spacing) / len;
-      const cx = from.x + dx * t;
-      const cy = from.y + dy * t;
-      this.drawArrow(gfx, cx, cy, angle, ux, uy);
+  private rebuildArrows(mapData: MapData): void {
+    // Destroy all previous arrow graphics and clear the layer
+    for (const edge of this.arrowEdges) {
+      for (const a of edge.arrows) a.destroy();
     }
+    this.arrowEdges = [];
+    this.overlay.arrowLayer.removeChildren();
+
+    const spacing = this.camera.getArrowSpacing();
+
+    for (const edge of mapData.edges) {
+      if (!edge.oneway) continue;
+
+      const fromNode = mapData.nodes.find((n) => n.id === edge.from);
+      const toNode = mapData.nodes.find((n) => n.id === edge.to);
+      if (!fromNode || !toNode) continue;
+
+      const from = projectPoint(this.map, fromNode.lng, fromNode.lat);
+      const to = projectPoint(this.map, toNode.lng, toNode.lat);
+
+      const dx = to.x - from.x;
+      const dy = to.y - from.y;
+      const segLen = Math.hypot(dx, dy);
+      if (segLen < spacing) continue;
+
+      const dirX = dx / segLen;
+      const dirY = dy / segLen;
+      const numArrows = Math.floor(segLen / spacing);
+
+      const arrows: PIXI.Graphics[] = [];
+      for (let i = 0; i < numArrows; i++) {
+        const gfx = this.makeArrowShape(dirX, dirY);
+        this.overlay.arrowLayer.addChild(gfx);
+        arrows.push(gfx);
+      }
+
+      this.arrowEdges.push({
+        arrows,
+        startX: from.x,
+        startY: from.y,
+        dirX,
+        dirY,
+        spacing,
+        segLen,
+      });
+    }
+
+    // Immediately position all arrows at the current phase so there is no
+    // one-frame pop after a camera change.
+    this.update(0);
   }
 
-  private drawArrow(
-    gfx: PIXI.Graphics,
-    x: number,
-    y: number,
-    _angle: number,
-    ux: number,
-    uy: number,
-  ): void {
+  private makeArrowShape(dirX: number, dirY: number): PIXI.Graphics {
     const sz = this.camera.getArrowSize();
-    // Perpendicular vector
-    const px = -uy;
-    const py = ux;
+    const px = -dirY;
+    const py = dirX;
 
-    const tip   = { x: x + ux * sz,                       y: y + uy * sz };
-    const left  = { x: x - ux * sz + px * sz * 0.6,  y: y - uy * sz + py * sz * 0.6 };
-    const right = { x: x - ux * sz - px * sz * 0.6,  y: y - uy * sz - py * sz * 0.6 };
-
+    const gfx = new PIXI.Graphics();
     gfx
-      .moveTo(tip.x, tip.y)
-      .lineTo(left.x, left.y)
-      .lineTo(right.x, right.y)
+      .moveTo(dirX * sz, dirY * sz)
+      .lineTo(-dirX * sz + px * sz * 0.6, -dirY * sz + py * sz * 0.6)
+      .lineTo(-dirX * sz - px * sz * 0.6, -dirY * sz - py * sz * 0.6)
       .closePath()
-      .fill({ color: 0xffffff, alpha: 0.45 });
+      .fill({ color: 0xffffff, alpha: 0.5 });
+    return gfx;
   }
 
   // ─── Tunnel overlay ────────────────────────────────────────────────────────
@@ -182,7 +243,6 @@ export class InfraRenderer {
 
       const laneW = Math.max(4, this.camera.getRoadOverlayWidth(edge.lanes));
 
-      // Dashed tunnel line
       gfx.setStrokeStyle({
         width: laneW,
         color: TUNNEL_DASH_COLOR,
@@ -192,7 +252,6 @@ export class InfraRenderer {
       gfx.lineTo(toPx.x, toPx.y);
       gfx.stroke();
 
-      // Tunnel portal markers
       this.drawTunnelPortal(gfx, fromPx.x, fromPx.y);
       this.drawTunnelPortal(gfx, toPx.x, toPx.y);
     }
@@ -223,5 +282,9 @@ export class InfraRenderer {
     this.staticTexture?.destroy(true);
     this.tunnelSprite?.destroy();
     this.tunnelTexture?.destroy(true);
+    for (const edge of this.arrowEdges) {
+      for (const a of edge.arrows) a.destroy();
+    }
+    this.arrowEdges = [];
   }
 }

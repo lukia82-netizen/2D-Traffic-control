@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::state::{AppState, SimCommand, SimControl, LightControlMode};
 use crate::map::osm_loader::fetch_osm_data;
-use crate::map::road_network::{build_road_network, build_demo_road_network, MapData, BuildingPolygon};
+use crate::map::road_network::{build_road_network, build_demo_road_network, MapData, BuildingPolygon, RestrictionKind};
 use crate::simulation::sim_loop::run_simulation;
 use crate::simulation::congestion::CongestionData;
 use crate::traffic::traffic_light::LightStateUpdate;
@@ -38,6 +38,15 @@ pub struct BuildingData {
     pub polygon: Vec<[f64; 2]>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnRestrictionData {
+    pub from_way_id: u64,
+    pub via_node_id: u64,
+    pub to_way_id: u64,
+    pub kind: String,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MapDataResponse {
@@ -46,6 +55,7 @@ pub struct MapDataResponse {
     pub spawn_points: Vec<[f64; 2]>,
     pub bbox: [f64; 4],
     pub buildings: Vec<BuildingData>,
+    pub restrictions: Vec<TurnRestrictionData>,
 }
 
 #[command]
@@ -129,12 +139,31 @@ fn build_map_response(map_data: &MapData) -> MapDataResponse {
         .map(|b: &BuildingPolygon| BuildingData { polygon: b.polygon.clone() })
         .collect();
 
+    let restrictions: Vec<TurnRestrictionData> = map_data.restrictions.iter()
+        .map(|r| TurnRestrictionData {
+            from_way_id: r.from_way_id,
+            via_node_id: r.via_node_id,
+            to_way_id: r.to_way_id,
+            kind: match r.kind {
+                RestrictionKind::NoLeftTurn    => "no_left_turn",
+                RestrictionKind::NoRightTurn   => "no_right_turn",
+                RestrictionKind::NoStraightOn  => "no_straight_on",
+                RestrictionKind::NoUTurn       => "no_u_turn",
+                RestrictionKind::OnlyLeftTurn  => "only_left_turn",
+                RestrictionKind::OnlyRightTurn => "only_right_turn",
+                RestrictionKind::OnlyStraightOn=> "only_straight_on",
+                RestrictionKind::NoEntry       => "no_entry",
+            }.to_string(),
+        })
+        .collect();
+
     MapDataResponse {
         nodes,
         edges,
         spawn_points,
         bbox: map_data.bbox,
         buildings,
+        restrictions,
     }
 }
 

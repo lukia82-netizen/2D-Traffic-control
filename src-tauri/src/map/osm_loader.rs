@@ -16,10 +16,47 @@ pub struct OsmWay {
     pub tags: HashMap<String, String>,
 }
 
+/// A single member of an OSM relation (role = "from", "via", or "to").
+#[derive(Debug, Clone)]
+pub struct OsmMember {
+    pub member_type: String, // "node" | "way"
+    pub ref_id: u64,
+    pub role: String,
+}
+
+/// A parsed OSM relation — used primarily for turn restrictions
+/// (`type=restriction`).
+#[derive(Debug, Clone)]
+pub struct OsmRelation {
+    pub id: u64,
+    pub tags: HashMap<String, String>,
+    pub members: Vec<OsmMember>,
+}
+
 #[derive(Debug, Default)]
 pub struct OsmData {
     pub nodes: HashMap<u64, OsmNode>,
     pub ways: Vec<OsmWay>,
+    pub relations: Vec<OsmRelation>,
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Returns `true` when the OSM `oneway` tag marks forward-only travel.
+pub fn is_oneway(way: &OsmWay) -> bool {
+    matches!(
+        way.tags.get("oneway").map(String::as_str),
+        Some("yes" | "true" | "1")
+    )
+}
+
+/// Returns `true` when the `oneway` tag marks reverse-only travel (rare but
+/// valid in OSM: `oneway=-1`).
+pub fn is_reverse_oneway(way: &OsmWay) -> bool {
+    matches!(
+        way.tags.get("oneway").map(String::as_str),
+        Some("-1" | "reverse")
+    )
 }
 
 // --- Overpass JSON deserialization ---
@@ -27,6 +64,16 @@ pub struct OsmData {
 #[derive(Deserialize)]
 struct OverpassResponse {
     elements: Vec<OverpassElement>,
+}
+
+#[derive(Deserialize)]
+struct OverpassMember {
+    #[serde(rename = "type")]
+    member_type: String,
+    #[serde(rename = "ref")]
+    ref_id: u64,
+    #[serde(default)]
+    role: String,
 }
 
 #[derive(Deserialize)]
@@ -42,6 +89,8 @@ struct OverpassElement {
     nodes: Vec<u64>,
     #[serde(default)]
     tags: HashMap<String, String>,
+    #[serde(default)]
+    members: Vec<OverpassMember>,
 }
 
 /// Fetch road data from the Overpass API for the given bounding box.
@@ -52,16 +101,20 @@ pub async fn fetch_osm_data(bbox: [f64; 4]) -> Result<OsmData, String> {
     // bbox is [west, south, east, north] (GeoJSON / frontend convention)
     let [west, south, east, north] = bbox;
 
-    // Overpass QL: fetch highway ways + building footprints + all member nodes.
-    // `>;` expands ways to their constituent nodes.
+    // Overpass QL:
+    //  1. Collect highway ways, building ways, and turn-restriction relations
+    //  2. (._;>;) — re-union with itself + recurse-down to get ALL member nodes
+    //     and ways referenced by the collected elements
+    //  3. Output everything in one response
     let query = format!(
         "[out:json][timeout:60];\
         (\
           way[highway~\"motorway|trunk|primary|secondary|tertiary|residential|service|unclassified|living_street\"]\
           ({south},{west},{north},{east});\
           way[building]({south},{west},{north},{east});\
-          >;\
+          relation[type=restriction]({south},{west},{north},{east});\
         );\
+        (._;>;);\
         out body qt;",
     );
 
@@ -127,14 +180,31 @@ fn parse_overpass_json(json_text: &str) -> Result<OsmData, String> {
                     });
                 }
             }
+            "relation" => {
+                let members = element
+                    .members
+                    .into_iter()
+                    .map(|m| OsmMember {
+                        member_type: m.member_type,
+                        ref_id: m.ref_id,
+                        role: m.role,
+                    })
+                    .collect();
+                osm_data.relations.push(OsmRelation {
+                    id: element.id,
+                    tags: element.tags,
+                    members,
+                });
+            }
             _ => {}
         }
     }
 
     log::info!(
-        "Parsed OSM data: {} nodes, {} ways",
+        "Parsed OSM data: {} nodes, {} ways, {} relations",
         osm_data.nodes.len(),
-        osm_data.ways.len()
+        osm_data.ways.len(),
+        osm_data.relations.len(),
     );
 
     Ok(osm_data)

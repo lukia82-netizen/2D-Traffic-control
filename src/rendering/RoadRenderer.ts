@@ -1,50 +1,54 @@
 import * as PIXI from 'pixi.js';
 import maplibregl from 'maplibre-gl';
-import type { MapData, EdgeData } from '../bridge/commands';
+import type { MapData, EdgeData, NodeData } from '../bridge/commands';
 import type { PixiOverlay } from './PixiOverlay';
 import type { CameraManager } from './CameraManager';
 import { projectPoint } from '../map/MapLibreSetup';
 
 // ─── Road colour palette (sketch / game aesthetic) ────────────────────────────
-//  Dark background: #1a1a2e  →  roads are lighter
 
 interface RoadStyle {
-  fill: number;
-  /** Lane width in metres (used for pixel width calculation) */
-  lanePx: number;
+  color: number;
+  /** Base stroke half-width in pixels at zoom 16 */
+  halfPx: number;
   zIndex: number;
 }
 
 const ROAD_STYLES: Record<string, RoadStyle> = {
-  motorway:       { fill: 0xd0c090, lanePx: 5, zIndex: 5 },
-  motorway_link:  { fill: 0xc8b880, lanePx: 4, zIndex: 4 },
-  trunk:          { fill: 0xd0c090, lanePx: 5, zIndex: 5 },
-  trunk_link:     { fill: 0xc8b880, lanePx: 4, zIndex: 4 },
-  primary:        { fill: 0xb8b8b8, lanePx: 4, zIndex: 4 },
-  primary_link:   { fill: 0xa8a8a8, lanePx: 3, zIndex: 3 },
-  secondary:      { fill: 0x999999, lanePx: 3, zIndex: 3 },
-  secondary_link: { fill: 0x888888, lanePx: 3, zIndex: 3 },
-  tertiary:       { fill: 0x808080, lanePx: 3, zIndex: 2 },
-  tertiary_link:  { fill: 0x707070, lanePx: 2, zIndex: 2 },
-  residential:    { fill: 0x686868, lanePx: 2, zIndex: 1 },
-  living_street:  { fill: 0x505050, lanePx: 2, zIndex: 1 },
-  service:        { fill: 0x484848, lanePx: 2, zIndex: 1 },
-  unclassified:   { fill: 0x606060, lanePx: 2, zIndex: 1 },
+  motorway:       { color: 0xe8d080, halfPx: 10, zIndex: 5 },
+  motorway_link:  { color: 0xe0c870, halfPx:  7, zIndex: 4 },
+  trunk:          { color: 0xe8d080, halfPx: 10, zIndex: 5 },
+  trunk_link:     { color: 0xe0c870, halfPx:  7, zIndex: 4 },
+  primary:        { color: 0xcccccc, halfPx:  8, zIndex: 4 },
+  primary_link:   { color: 0xbbbbbb, halfPx:  6, zIndex: 3 },
+  secondary:      { color: 0xaaaaaa, halfPx:  6, zIndex: 3 },
+  secondary_link: { color: 0x999999, halfPx:  5, zIndex: 3 },
+  tertiary:       { color: 0x909090, halfPx:  5, zIndex: 2 },
+  tertiary_link:  { color: 0x808080, halfPx:  4, zIndex: 2 },
+  residential:    { color: 0x787878, halfPx:  4, zIndex: 1 },
+  living_street:  { color: 0x646464, halfPx:  3, zIndex: 1 },
+  service:        { color: 0x585858, halfPx:  3, zIndex: 1 },
+  unclassified:   { color: 0x6c6c6c, halfPx:  4, zIndex: 1 },
 };
-const DEFAULT_ROAD_STYLE: RoadStyle = { fill: 0x606060, lanePx: 2, zIndex: 0 };
+const DEFAULT_STYLE: RoadStyle = { color: 0x707070, halfPx: 4, zIndex: 0 };
 
 // ─── RoadRenderer ─────────────────────────────────────────────────────────────
 
-/**
- * Draws road geometry as PixiJS polygons (sketch mode).
- * Re-renders every time the camera moves so road widths stay proportional.
- */
 export class RoadRenderer {
   private readonly overlay: PixiOverlay;
   private readonly map: maplibregl.Map;
   private readonly camera: CameraManager;
 
-  private roadGraphics: PIXI.Graphics | null = null;
+  private gfx: PIXI.Graphics | null = null;
+
+  /**
+   * O(1) node lookup built once per mapData load — avoids O(n) Array.find()
+   * on every render frame which would block the main thread for thousands of nodes.
+   */
+  private nodeMap: Map<number, NodeData> = new Map();
+
+  /** Edges pre-sorted by zIndex (minor roads first, major roads on top). */
+  private sortedEdges: EdgeData[] = [];
 
   constructor(overlay: PixiOverlay, map: maplibregl.Map, camera: CameraManager) {
     this.overlay = overlay;
@@ -54,120 +58,110 @@ export class RoadRenderer {
 
   // ─── Public API ────────────────────────────────────────────────────────────
 
+  /** Call once when mapData first arrives — builds lookup caches. */
   build(mapData: MapData): void {
-    this.rebuild(mapData);
+    // Build O(1) node lookup
+    this.nodeMap.clear();
+    for (const n of mapData.nodes) {
+      this.nodeMap.set(n.id, n);
+    }
+
+    // Pre-sort: minor roads (low zIndex) first so major roads render on top
+    this.sortedEdges = [...mapData.edges].sort(
+      (a, b) => this.styleFor(a).zIndex - this.styleFor(b).zIndex,
+    );
+
+    this.drawRoads();
   }
 
-  /** Call on every map 'render' event to keep roads aligned with camera. */
-  rebuildOnCameraChange(mapData: MapData): void {
-    this.rebuild(mapData);
+  /** Called on every map 'render' event (pan / zoom). */
+  rebuildOnCameraChange(_mapData: MapData): void {
+    this.drawRoads();
   }
 
   // ─── Rendering ─────────────────────────────────────────────────────────────
 
-  private rebuild(mapData: MapData): void {
-    if (!this.roadGraphics) {
-      this.roadGraphics = new PIXI.Graphics();
-      this.overlay.roads.addChild(this.roadGraphics);
+  private drawRoads(): void {
+    if (this.sortedEdges.length === 0) return;
+
+    if (!this.gfx) {
+      this.gfx = new PIXI.Graphics();
+      this.overlay.roads.addChild(this.gfx);
     }
-    const gfx = this.roadGraphics;
+
+    const gfx = this.gfx;
     gfx.clear();
 
     const zoom = this.camera.zoom;
+    const zoomScale = Math.pow(2, zoom - 16);
 
-    // Sort edges by zIndex so major roads draw on top of minor ones
-    const sorted = [...mapData.edges].sort(
-      (a, b) => this.styleFor(a).zIndex - this.styleFor(b).zIndex,
-    );
-
-    for (const edge of sorted) {
-      const fromNode = mapData.nodes.find((n) => n.id === edge.from);
-      const toNode   = mapData.nodes.find((n) => n.id === edge.to);
+    for (const edge of this.sortedEdges) {
+      const fromNode = this.nodeMap.get(edge.from);
+      const toNode   = this.nodeMap.get(edge.to);
       if (!fromNode || !toNode) continue;
 
       const from = projectPoint(this.map, fromNode.lng, fromNode.lat);
       const to   = projectPoint(this.map, toNode.lng,   toNode.lat);
 
-      const style = this.styleFor(edge);
-      // Total road width in pixels = lanes × per-lane px, scaled by zoom
-      const laneZoom = Math.pow(2, zoom - 16);
-      const halfWidth = Math.max(1.5, edge.lanes * style.lanePx * laneZoom);
+      const dx = to.x - from.x;
+      const dy = to.y - from.y;
+      const len = Math.hypot(dx, dy);
+      if (len < 0.5) continue;
 
-      this.drawRoadSegment(gfx, from, to, halfWidth, style.fill, edge.infraType);
+      const style  = this.styleFor(edge);
+      const lanes  = Math.max(1, edge.lanes);
+      // Width = lanes × base half-width × zoom factor, minimum 2px
+      const w = Math.max(2, lanes * style.halfPx * zoomScale);
+      const alpha = edge.infraType === 'tunnel' ? 0.5 : 1.0;
+
+      // ── Casing / kerb (dark outline drawn first, slightly wider) ──────────
+      gfx.moveTo(from.x, from.y).lineTo(to.x, to.y)
+         .stroke({ width: w * 2 + 2, color: 0x1a1a1a, alpha, cap: 'round' });
+
+      // ── Road fill ─────────────────────────────────────────────────────────
+      gfx.moveTo(from.x, from.y).lineTo(to.x, to.y)
+         .stroke({ width: w * 2, color: style.color, alpha, cap: 'round' });
+
+      // ── Centre line (only at higher zoom and wider roads) ─────────────────
+      if (w > 5 && !edge.oneway) {
+        const ux = dx / len;
+        const uy = dy / len;
+        this.drawDashes(gfx, from, to, ux, uy, len);
+      }
     }
   }
 
-  private drawRoadSegment(
+  private drawDashes(
     gfx: PIXI.Graphics,
     from: { x: number; y: number },
-    to:   { x: number; y: number },
-    halfW: number,
-    color: number,
-    infraType: string,
-  ): void {
-    const dx = to.x - from.x;
-    const dy = to.y - from.y;
-    const len = Math.hypot(dx, dy);
-    if (len < 0.5) return;
-
-    // Perpendicular unit vector
-    const px = -dy / len;
-    const py =  dx / len;
-
-    // Road polygon (rectangle)
-    const pts = [
-      from.x + px * halfW, from.y + py * halfW,
-      to.x   + px * halfW, to.y   + py * halfW,
-      to.x   - px * halfW, to.y   - py * halfW,
-      from.x - px * halfW, from.y - py * halfW,
-    ];
-
-    const alpha = infraType === 'tunnel' ? 0.5 : 1.0;
-    gfx.poly(pts).fill({ color, alpha });
-
-    // Road edge lines (kerb)
-    const kerbColor = 0x333333;
-    gfx.poly(pts).stroke({ color: kerbColor, width: 0.8, alpha: 0.6 });
-
-    // Center line for two-way roads (dashed white)
-    if (halfW > 4) {
-      this.drawCenterLine(gfx, from, to, dx, dy, len);
-    }
-  }
-
-  private drawCenterLine(
-    gfx: PIXI.Graphics,
-    from: { x: number; y: number },
-    to:   { x: number; y: number },
-    dx: number,
-    dy: number,
+    to: { x: number; y: number },
+    ux: number,
+    uy: number,
     len: number,
   ): void {
-    const dashLen = 10;
-    const gapLen  = 8;
-    const stepLen = dashLen + gapLen;
-    const steps   = Math.floor(len / stepLen);
+    const DASH = 10;
+    const GAP  =  8;
+    const STEP = DASH + GAP;
+    const count = Math.floor(len / STEP);
 
-    const ux = dx / len;
-    const uy = dy / len;
-
-    for (let i = 0; i < steps; i++) {
-      const t0 = i * stepLen / len;
-      const t1 = (i * stepLen + dashLen) / len;
-
-      gfx.moveTo(from.x + ux * t0 * len, from.y + uy * t0 * len)
-         .lineTo(from.x + ux * t1 * len, from.y + uy * t1 * len);
+    for (let i = 0; i < count; i++) {
+      const d0 = i * STEP;
+      const d1 = d0 + DASH;
+      gfx
+        .moveTo(from.x + ux * d0, from.y + uy * d0)
+        .lineTo(from.x + ux * d1, from.y + uy * d1)
+        .stroke({ width: 0.8, color: 0xffffff, alpha: 0.35 });
     }
-    gfx.stroke({ color: 0xffffff, width: 0.8, alpha: 0.3 });
   }
 
   private styleFor(edge: EdgeData): RoadStyle {
-    return ROAD_STYLES[edge.roadType] ?? DEFAULT_ROAD_STYLE;
+    return ROAD_STYLES[edge.roadType] ?? DEFAULT_STYLE;
   }
 
   // ─── Cleanup ───────────────────────────────────────────────────────────────
 
   destroy(): void {
-    this.roadGraphics?.destroy();
+    this.gfx?.destroy();
+    this.nodeMap.clear();
   }
 }

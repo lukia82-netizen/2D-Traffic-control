@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use petgraph::graph::{DiGraph, NodeIndex};
 use serde::{Deserialize, Serialize};
 
-use crate::map::osm_loader::OsmData;
+use crate::map::osm_loader::{OsmData, OsmRelation};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum IntersectionType {
@@ -56,6 +56,30 @@ pub struct BuildingPolygon {
     pub polygon: Vec<[f64; 2]>,
 }
 
+/// OSM turn-restriction kinds derived from the `restriction` tag.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RestrictionKind {
+    NoLeftTurn,
+    NoRightTurn,
+    NoStraightOn,
+    NoUTurn,
+    OnlyLeftTurn,
+    OnlyRightTurn,
+    OnlyStraightOn,
+    NoEntry,
+}
+
+/// A resolved turn restriction: vehicles arriving via `from_way_id` and
+/// passing through `via_node_id` may not (or may only) proceed onto
+/// `to_way_id` according to `kind`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TurnRestriction {
+    pub from_way_id: u64,
+    pub via_node_id: u64,
+    pub to_way_id: u64,
+    pub kind: RestrictionKind,
+}
+
 pub type RoadGraph = DiGraph<RoadNode, RoadEdge>;
 
 pub struct MapData {
@@ -64,6 +88,7 @@ pub struct MapData {
     pub bbox: [f64; 4],
     pub spawn_points: Vec<NodeIndex>,
     pub buildings: Vec<BuildingPolygon>,
+    pub restrictions: Vec<TurnRestriction>,
 }
 
 /// Build a simple 5×5 grid road network centred on Kraków.
@@ -146,22 +171,25 @@ pub fn build_demo_road_network() -> MapData {
         spawn_points.len()
     );
 
-    MapData { graph, node_index_map, bbox, spawn_points, buildings: Vec::new() }
+    MapData { graph, node_index_map, bbox, spawn_points, buildings: Vec::new(), restrictions: Vec::new() }
 }
 
 pub fn build_road_network(osm_data: OsmData) -> MapData {
     let mut graph = RoadGraph::new();
     let mut node_index_map: HashMap<u64, NodeIndex> = HashMap::new();
 
-    // Collect all node ids that appear in highway ways
+    // Collect node ids from HIGHWAY ways only (not buildings).
+    // Building polygon nodes are handled separately and must not pollute the
+    // road graph (they would add ~12 000 extra nodes and slow everything down).
     let mut used_node_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
     for way in &osm_data.ways {
+        if !way.tags.contains_key("highway") { continue; }
         for &node_id in &way.node_refs {
             used_node_ids.insert(node_id);
         }
     }
 
-    // Add graph nodes
+    // Add road-graph nodes
     for &node_id in &used_node_ids {
         if let Some(osm_node) = osm_data.nodes.get(&node_id) {
             let intersection_type = determine_intersection_type(&osm_node.tags);
@@ -175,9 +203,10 @@ pub fn build_road_network(osm_data: OsmData) -> MapData {
         }
     }
 
-    // Count how many ways reference each node to find junctions
+    // Count how many highway ways reference each node (to detect junctions)
     let mut node_way_count: HashMap<u64, u32> = HashMap::new();
     for way in &osm_data.ways {
+        if !way.tags.contains_key("highway") { continue; }
         for &nid in &way.node_refs {
             *node_way_count.entry(nid).or_insert(0) += 1;
         }
@@ -197,7 +226,10 @@ pub fn build_road_network(osm_data: OsmData) -> MapData {
                                         Some(highway_type));
         let infra_type = parse_infra_type(tags);
         let layer = parse_layer(tags.get("layer").map(|s| s.as_str()));
-        let lane_directions = build_lane_directions(lanes);
+        let lane_directions = tags
+            .get("turn:lanes")
+            .map(|s| parse_turn_lanes(s))
+            .unwrap_or_else(|| build_lane_directions(lanes));
         let road_type = highway_type.to_string();
 
         for window in way.node_refs.windows(2) {
@@ -253,13 +285,6 @@ pub fn build_road_network(osm_data: OsmData) -> MapData {
     // Identify spawn points: nodes on the boundary or high-degree nodes
     let spawn_points = find_spawn_points(&graph, &bbox);
 
-    log::info!(
-        "Built road graph: {} nodes, {} edges, {} spawn points",
-        graph.node_count(),
-        graph.edge_count(),
-        spawn_points.len()
-    );
-
     // ── Parse building polygons ───────────────────────────────────────────────
     let mut buildings: Vec<BuildingPolygon> = Vec::new();
     for way in &osm_data.ways {
@@ -273,12 +298,16 @@ pub fn build_road_network(osm_data: OsmData) -> MapData {
         }
     }
 
+    // ── Parse turn restrictions ───────────────────────────────────────────────
+    let restrictions = build_turn_restrictions(&osm_data.relations);
+
     log::info!(
-        "Built road graph: {} nodes, {} edges, {} spawn points, {} buildings",
+        "Built road graph: {} nodes, {} edges, {} spawn points, {} buildings, {} restrictions",
         graph.node_count(),
         graph.edge_count(),
         spawn_points.len(),
         buildings.len(),
+        restrictions.len(),
     );
 
     MapData {
@@ -287,6 +316,7 @@ pub fn build_road_network(osm_data: OsmData) -> MapData {
         bbox,
         spawn_points,
         buildings,
+        restrictions,
     }
 }
 
@@ -400,6 +430,63 @@ fn build_lane_directions_reversed(lanes: u8) -> Vec<LaneDirection> {
     let mut dirs = build_lane_directions(lanes);
     dirs.reverse();
     dirs
+}
+
+/// Parse a `turn:lanes` tag value such as `"left|through|right"` into a
+/// per-lane direction list.  Multiple directions per lane (e.g. `left;through`)
+/// resolve to the first listed direction.  Falls back to `Straight` for
+/// unrecognised values.
+fn parse_turn_lanes(tag: &str) -> Vec<LaneDirection> {
+    tag.split('|')
+        .map(|lane| {
+            let first = lane.split(';').next().unwrap_or("through").trim();
+            match first {
+                "left" | "sharp_left" | "slight_left" => LaneDirection::Left,
+                "right" | "sharp_right" | "slight_right" => LaneDirection::Right,
+                "reverse" => LaneDirection::UTurn,
+                _ => LaneDirection::Straight,
+            }
+        })
+        .collect()
+}
+
+fn parse_restriction_kind(s: &str) -> Option<RestrictionKind> {
+    match s {
+        "no_left_turn"     => Some(RestrictionKind::NoLeftTurn),
+        "no_right_turn"    => Some(RestrictionKind::NoRightTurn),
+        "no_straight_on"   => Some(RestrictionKind::NoStraightOn),
+        "no_u_turn"        => Some(RestrictionKind::NoUTurn),
+        "only_left_turn"   => Some(RestrictionKind::OnlyLeftTurn),
+        "only_right_turn"  => Some(RestrictionKind::OnlyRightTurn),
+        "only_straight_on" => Some(RestrictionKind::OnlyStraightOn),
+        "no_entry"         => Some(RestrictionKind::NoEntry),
+        _                  => None,
+    }
+}
+
+fn build_turn_restrictions(relations: &[OsmRelation]) -> Vec<TurnRestriction> {
+    relations
+        .iter()
+        .filter_map(|rel| {
+            // Only handle simple node-via restrictions
+            let restriction_tag = rel.tags.get("restriction")?;
+            let kind = parse_restriction_kind(restriction_tag)?;
+
+            let from_way_id = rel.members.iter()
+                .find(|m| m.role == "from" && m.member_type == "way")
+                .map(|m| m.ref_id)?;
+
+            let via_node_id = rel.members.iter()
+                .find(|m| m.role == "via" && m.member_type == "node")
+                .map(|m| m.ref_id)?;
+
+            let to_way_id = rel.members.iter()
+                .find(|m| m.role == "to" && m.member_type == "way")
+                .map(|m| m.ref_id)?;
+
+            Some(TurnRestriction { from_way_id, via_node_id, to_way_id, kind })
+        })
+        .collect()
 }
 
 pub fn haversine_distance_m(lat1: f64, lng1: f64, lat2: f64, lng2: f64) -> f32 {

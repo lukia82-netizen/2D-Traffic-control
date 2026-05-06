@@ -6,19 +6,21 @@ import * as PIXI from 'pixi.js';
  * Layer ordering (sketch mode — PixiJS draws everything):
  *   0 – buildings        Building footprints (filled gray polygons)
  *   1 – roads            Road geometry (colored rectangles by road type)
- *   2 – tunnelOverlay    Dashed lines over tunnel roads
- *   3 – staticMarkings   Oneway arrows, lane markings
- *   4 – tunnelVehicles   Vehicles inside tunnels (α 0.25)
- *   5 – groundVehicles   Surface-level vehicles
- *   6 – bridgeVehicles   Vehicles on bridges
- *   7 – trafficLights    Traffic light state sprites
- *   8 – congestionLayer  Congestion heat overlay
+ *   2 – arrowLayer       Animated oneway-direction arrows (live containers)
+ *   3 – tunnelOverlay    Dashed lines over tunnel roads
+ *   4 – staticMarkings   Bridge shadows and other static road markings
+ *   5 – tunnelVehicles   Vehicles inside tunnels (α 0.25)
+ *   6 – groundVehicles   Surface-level vehicles
+ *   7 – bridgeVehicles   Vehicles on bridges
+ *   8 – trafficLights    Traffic light state sprites
+ *   9 – congestionLayer  Congestion heat overlay
  */
 export class PixiOverlay {
   app!: PIXI.Application;
 
   buildings!: PIXI.Container;
   roads!: PIXI.Container;
+  arrowLayer!: PIXI.Container;
   tunnelOverlay!: PIXI.Container;
   staticMarkings!: PIXI.Container;
   tunnelVehicles!: PIXI.Container;
@@ -54,6 +56,7 @@ export class PixiOverlay {
     // Build the layer stack (order = render order, bottom to top)
     this.buildings       = new PIXI.Container();
     this.roads           = new PIXI.Container();
+    this.arrowLayer      = new PIXI.Container();
     this.tunnelOverlay   = new PIXI.Container();
     this.staticMarkings  = new PIXI.Container();
     this.tunnelVehicles  = new PIXI.Container();
@@ -64,6 +67,7 @@ export class PixiOverlay {
 
     this.app.stage.addChild(this.buildings);
     this.app.stage.addChild(this.roads);
+    this.app.stage.addChild(this.arrowLayer);
     this.app.stage.addChild(this.tunnelOverlay);
     this.app.stage.addChild(this.staticMarkings);
     this.app.stage.addChild(this.tunnelVehicles);

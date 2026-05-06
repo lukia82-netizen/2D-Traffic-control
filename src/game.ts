@@ -80,7 +80,7 @@ function buildDemoMapData(): MapData {
     spawnPoints.push([nodes[nid(r, COLS - 1)].lat, nodes[nid(r, COLS - 1)].lng]);
   }
 
-  return { nodes, edges, spawnPoints, bbox: DEFAULT_BBOX, buildings: [] };
+  return { nodes, edges, spawnPoints, bbox: DEFAULT_BBOX, buildings: [], restrictions: [] };
 }
 
 // Simulation starts at 06:00 (game seconds since midnight)
@@ -261,6 +261,9 @@ export class Game {
   // ─── Main game loop ────────────────────────────────────────────────────────
 
   private gameLoop(ticker: PIXI.Ticker): void {
+    // Animate oneway arrows regardless of pause state
+    this.infraRenderer.update(ticker.deltaMS);
+
     if (this.gameClockUI.paused) return;
 
     // Advance game clock

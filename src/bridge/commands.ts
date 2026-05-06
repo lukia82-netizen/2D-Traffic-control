@@ -33,12 +33,28 @@ export interface BuildingPolygon {
   polygon: [number, number][];
 }
 
+export interface TurnRestriction {
+  fromWayId: number;
+  viaNodeId: number;
+  toWayId: number;
+  kind:
+    | 'no_left_turn'
+    | 'no_right_turn'
+    | 'no_straight_on'
+    | 'no_u_turn'
+    | 'only_left_turn'
+    | 'only_right_turn'
+    | 'only_straight_on'
+    | 'no_entry';
+}
+
 export interface MapData {
   nodes: NodeData[];
   edges: EdgeData[];
   spawnPoints: [number, number][];
   bbox: [number, number, number, number];
   buildings: BuildingPolygon[];
+  restrictions: TurnRestriction[];
 }
 
 // ─── Typed invoke wrappers ────────────────────────────────────────────────────
