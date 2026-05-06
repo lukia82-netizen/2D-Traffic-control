@@ -25,11 +25,16 @@ import { UIRenderer } from './rendering/UIRenderer';
 import { TrafficLightUI } from './traffic/TrafficLightUI';
 import { TrafficLightRenderer } from './rendering/TrafficLightRenderer';
 import { GameClockUI } from './time/GameClockUI';
+import { SandboxUI } from './ui/SandboxUI';
+import { LESZNO_BBOX } from './map/MapLibreSetup';
 
-// Kraków Śródmieście – ~1 km × 1 km centred on Rynek Główny (19.9368, 50.0614)
-// 0.007° lng ≈ 500 m, 0.0045° lat ≈ 500 m  →  total 1 km × 1 km
-// west, south, east, north
-const DEFAULT_BBOX: [number, number, number, number] = [19.930, 50.057, 19.944, 50.066];
+// ─── Mode: always start in SANDBOX ───────────────────────────────────────────
+// Sandbox uses Leszno, skips building rendering (big perf win), shows
+// the layer/legend panel.  A full game menu will replace this later.
+const SANDBOX_MODE = true;
+
+// Sandbox default city bbox (Leszno ~2km × 2km)
+const DEFAULT_BBOX: [number, number, number, number] = LESZNO_BBOX;
 
 // ─── Demo road network ─────────────────────────────────────────────────────
 // Used as a fallback when the Overpass API is not reachable (e.g., corporate
@@ -116,8 +121,7 @@ export class Game {
   private mapData: MapData | null = null;
   private readonly vehicles: Map<number, VehicleState> = new Map();
 
-  // infra type per vehicle id (populated from map data by Rust; we approximate
-  // from edge data on the frontend until Rust sends per-vehicle infra)
+  // infra type per vehicle id
   private readonly vehicleInfraMap: Map<number, string> = new Map();
 
   // Accumulated game time in seconds
@@ -134,6 +138,10 @@ export class Game {
 
   // Whether the Rust backend is available (desktop Tauri vs browser dev mode)
   private tauriAvailable = false;
+
+  // Sandbox mode
+  private sandboxUI: SandboxUI | null = null;
+  private vehiclesVisible = true;
 
   constructor(map: maplibregl.Map, overlay: PixiOverlay) {
     this.map = map;
@@ -168,12 +176,17 @@ export class Game {
     // Init HUD controls
     this.gameClockUI.init();
 
+    // ── Sandbox UI ────────────────────────────────────────────────────────
+    if (SANDBOX_MODE) {
+      this.sandboxUI = new SandboxUI();
+      this.wireSandboxUI();
+    }
+
     if (this.tauriAvailable) {
       await this.loadMapData();
       await this.subscribeToEvents();
       await this.startRustSimulation();
     } else {
-      // Dev / browser mode: show placeholder notification
       this.uiRenderer.showNotification(
         'Running in browser – Tauri backend not available',
         'warning',
@@ -183,7 +196,7 @@ export class Game {
     // Hook infra rebuild on every map camera move
     this.map.on('render', () => {
       if (this.mapData) {
-        this.buildingRenderer.rebuildOnCameraChange(this.mapData);
+        if (!SANDBOX_MODE) this.buildingRenderer.rebuildOnCameraChange(this.mapData);
         this.roadRenderer.rebuildOnCameraChange(this.mapData);
         this.infraRenderer.rebuildOnCameraChange(this.mapData);
         this.trafficLightRenderer.rebuildOnCameraChange();
@@ -192,6 +205,34 @@ export class Game {
 
     // Start the PixiJS ticker
     this.overlay.app.ticker.add((ticker) => this.gameLoop(ticker));
+  }
+
+  // ─── Sandbox wiring ────────────────────────────────────────────────────────
+
+  private wireSandboxUI(): void {
+    const ui = this.sandboxUI!;
+
+    ui.onLayerToggle = (group, visible) => {
+      this.roadRenderer.setGroupVisible(group, visible);
+    };
+
+    ui.onOsmModeToggle = (enabled) => {
+      this.roadRenderer.setOsmMode(enabled);
+    };
+
+    ui.onVehicleToggle = (visible) => {
+      this.vehiclesVisible = visible;
+      this.overlay.groundVehicles.visible = visible;
+      this.overlay.bridgeVehicles.visible = visible;
+      this.overlay.tunnelVehicles.visible = visible;
+    };
+
+    ui.onBuildingToggle = (visible) => {
+      this.overlay.buildings.visible = visible;
+      if (visible && this.mapData) {
+        this.buildingRenderer.build(this.mapData);
+      }
+    };
   }
 
   // ─── Map loading ───────────────────────────────────────────────────────────
@@ -212,7 +253,7 @@ export class Game {
         'warning',
       );
     }
-    this.buildingRenderer.build(this.mapData);
+    if (!SANDBOX_MODE) this.buildingRenderer.build(this.mapData);
     this.roadRenderer.build(this.mapData);
     this.infraRenderer.buildStaticLayer(this.mapData);
     this.trafficLightUI.init(this.mapData.nodes);
@@ -307,7 +348,14 @@ export class Game {
     this.gameClockUI.updateClock(this.gameTimeS);
 
     // Render vehicles
-    this.vehicleRenderer.update(this.vehicles, this.vehicleInfraMap);
+    if (this.vehiclesVisible) {
+      this.vehicleRenderer.update(this.vehicles, this.vehicleInfraMap);
+    }
+
+    // Update sandbox stats
+    if (this.sandboxUI) {
+      this.sandboxUI.update(this.vehicles.size, this.overlay.app.ticker.FPS);
+    }
 
     // Update satisfaction bar from vehicle states
     this.updateSatisfaction();
@@ -355,6 +403,7 @@ export class Game {
     this.unlistenCongestion?.();
     this.unlistenLights?.();
     this.unlistenGameOver?.();
+    this.sandboxUI?.destroy();
     this.buildingRenderer.destroy();
     this.roadRenderer.destroy();
     this.vehicleRenderer.destroy();

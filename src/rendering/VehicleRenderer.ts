@@ -30,13 +30,17 @@ const DOT_COLORS: Record<number, number> = {
 /**
  * Base pixel dimensions at spriteScale = 1.0.
  * CameraManager.getCarVisuals().spriteScale multiplies these.
+ *
+ * Target: ~60% lane fill at zoom 16 (spriteScale 2×, lane = 24 px).
+ * → effective width at zoom 16 = w * 2 ≈ 14 px, i.e. w ≈ 7 px.
+ * Taller vehicles get narrower effective width matching real proportions.
  */
 const VEHICLE_DIMS: Record<number, { w: number; h: number }> = {
-  0: { w: 6,  h: 12 }, // Car
-  1: { w: 7,  h: 16 }, // Van
-  2: { w: 9,  h: 32 }, // Bus
-  3: { w: 10, h: 48 }, // Truck
-  4: { w: 8,  h: 56 }, // Tram  (20 m body)
+  0: { w: 6,  h: 12 }, // Car   – 12 px wide at zoom 16 (50 % lane fill)
+  1: { w: 7,  h: 16 }, // Van   – 14 px wide (58 %)
+  2: { w: 7,  h: 28 }, // Bus   – 14 px wide (58 %) – was 9×32
+  3: { w: 8,  h: 38 }, // Truck – 16 px wide (67 %) – was 10×48
+  4: { w: 7,  h: 52 }, // Tram  – 14 px wide (58 %) – was 8×56
 };
 
 /** Frustration thresholds for visual bubbles. */

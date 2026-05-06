@@ -121,13 +121,18 @@ export class CameraManager {
   }
 
   /**
-   * Returns the pixel offset from road centerline to the center of the right
-   * lane at the current zoom.  Matches the halfPx=9 residential road standard
-   * used in RoadRenderer so cars sit visually inside their lane.
+   * Returns the pixel offset from road centreline to the vehicle's screen
+   * position (right-hand traffic convention).
+   *
+   * Design rationale:
+   *   The residential halfPx=12 means one lane = 24 px at zoom 16.
+   *   Using halfPx/2 = 6 px keeps a 12 px-wide car sprite (scale 2×) fully
+   *   inside BOTH 1-lane oneway roads (±12 px half-stroke) and 2-lane
+   *   bidirectional roads (±24 px), without the old `max(4,…)` hard floor
+   *   that was pushing cars outside narrow roads at zoom < 16.
    */
   getLaneOffset(): number {
-    // halfPx=9 is the residential reference; half of that is one lane center
-    return Math.max(4, 9 * Math.pow(2, this.zoom - 16));
+    return Math.max(1.5, 6 * Math.pow(2, this.zoom - 16));
   }
 
   /**

@@ -1,9 +1,21 @@
 import maplibregl from 'maplibre-gl';
 
-// Default map center: Kraków Rynek Główny
-const DEFAULT_CENTER: [number, number] = [19.9368, 50.0614];
-const DEFAULT_ZOOM = 16;
-const KRAKOW_BBOX: [number, number, number, number] = [19.930, 50.057, 19.944, 50.066];
+// ─── City presets ─────────────────────────────────────────────────────────────
+
+/** Kraków – Rynek Główny, ~1 km × 1 km */
+export const KRAKOW_CENTER: [number, number] = [19.9368, 50.0614];
+export const KRAKOW_BBOX: [number, number, number, number] = [19.930, 50.057, 19.944, 50.066];
+
+/** Leszno – centrum, ~2 km × 2 km (sandbox default) */
+export const LESZNO_CENTER: [number, number] = [16.575, 51.845];
+export const LESZNO_BBOX: [number, number, number, number] = [16.555, 51.833, 16.600, 51.858];
+
+// Active defaults (sandbox starts with Leszno)
+const DEFAULT_CENTER = LESZNO_CENTER;
+const DEFAULT_ZOOM = 15;
+// legacy alias kept for Rust commands.ts
+const DEFAULT_CENTER_KRAKOW = KRAKOW_CENTER;
+void DEFAULT_CENTER_KRAKOW;
 
 // OpenFreeMap – free vector tiles, no API key required
 // https://openfreemap.org
