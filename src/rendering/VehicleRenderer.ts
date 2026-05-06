@@ -57,6 +57,18 @@ const VEHICLE_WIDTH_FILL: Record<number, number> = {
   4: 0.90, // tram
 };
 
+/**
+ * Vehicle length as a multiple of rendered width.
+ * Fixed per type so zoom changes do not stretch vehicles unnaturally.
+ */
+const VEHICLE_LENGTH_FACTOR: Record<number, number> = {
+  0: 1.9, // car
+  1: 2.2, // van
+  2: 2.8, // bus
+  3: 3.2, // truck
+  4: 4.2, // tram
+};
+
 /** Frustration thresholds for visual bubbles. */
 const FRUSTRATION_CALM     = 40;
 const FRUSTRATION_ANNOYED  = 65;
@@ -348,7 +360,7 @@ export class VehicleRenderer {
   private renderSprites(
     vehicles: Map<number, VehicleState>,
     infraMap: Map<number, string>,
-    spriteScale: number,
+    _spriteScale: number,
   ): void {
     const bounds = this.map.getBounds();
     const laneWidthPx = this.camera.getLaneOffset() * 2;
@@ -368,6 +380,7 @@ export class VehicleRenderer {
       const typeId = v.vehicleType < VEHICLE_TYPES.length ? v.vehicleType : 0;
       const dims = VEHICLE_DIMS[typeId] ?? VEHICLE_DIMS[0];
       const widthFill = VEHICLE_WIDTH_FILL[typeId] ?? VEHICLE_WIDTH_FILL[0];
+      const lengthFactor = VEHICLE_LENGTH_FACTOR[typeId] ?? VEHICLE_LENGTH_FACTOR[0];
       const infraType = infraMap.get(id) ?? 'normal';
       const isTunnel = infraType === 'tunnel';
       const isBridge = infraType === 'bridge';
@@ -405,8 +418,7 @@ export class VehicleRenderer {
       rect.rotation = angle;
       // Width tracks lane width directly so car-to-lane proportion is stable at every zoom.
       const targetWidth = Math.max(4, laneWidthPx * widthFill);
-      const aspect = dims.h / Math.max(1, dims.w);
-      const targetHeight = targetWidth * aspect * Math.max(0.85, spriteScale / 2.2);
+      const targetHeight = targetWidth * lengthFactor;
       rect.scale.set(targetWidth / dims.w, targetHeight / dims.h);
       rect.alpha = isTunnel ? TUNNEL_ALPHA : 1;
       rect.visible = true;
