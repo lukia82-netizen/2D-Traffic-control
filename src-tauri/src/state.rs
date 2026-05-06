@@ -27,6 +27,7 @@ pub enum SimCommand {
     Resume,
     SetTimeScale(f32),
     SetSpeedConfig(SpeedConfig),
+    SetMaxVehicles(usize),
     SetLightMode {
         intersection_id: u64,
         mode: LightControlMode,

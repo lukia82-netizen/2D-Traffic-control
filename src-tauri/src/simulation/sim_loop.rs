@@ -1,5 +1,6 @@
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
+use std::collections::HashMap;
 use parking_lot::RwLock;
 use std::sync::Arc;
 use rayon::prelude::*;
@@ -7,6 +8,7 @@ use tauri::ipc::Channel;
 use tauri::{AppHandle, Emitter};
 use base64::Engine;
 use serde::Serialize;
+use petgraph::graph::EdgeIndex;
 
 use crate::map::road_network::{MapData, IntersectionType};
 use crate::state::SimCommand;
@@ -15,7 +17,6 @@ use crate::time::day_cycle::DayCycle;
 use crate::traffic::intersection::IntersectionManager;
 use crate::vehicles::vehicle::Vehicle;
 use crate::simulation::idm::idm_acceleration;
-use crate::simulation::spatial_grid::SpatialGrid;
 use crate::simulation::spawn::SpawnSystem;
 use crate::simulation::lane_change::{decide_lane_change, compute_vehicle_target_lane};
 use crate::simulation::congestion::compute_congestion;
@@ -24,8 +25,10 @@ use crate::simulation::speed_config::SpeedConfig;
 use crate::simulation::tram_sim::TramSim;
 
 const TARGET_TICK_S: f32 = 1.0 / 60.0;
-const GRID_CELL_DEG: f64 = 0.00045;
 const CONGESTION_INTERVAL_S: f32 = 0.5;
+
+/// Physical length of a vehicle subtracted from the gap so IDM sees bumper-to-bumper distance.
+const VEHICLE_LENGTH_M: f32 = 4.5;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -43,7 +46,6 @@ pub fn run_simulation(
 ) {
     let mut clock = GameClock::new();
     let mut vehicles: Vec<Vehicle> = Vec::with_capacity(512);
-    let mut spatial_grid = SpatialGrid::new(GRID_CELL_DEG);
     let mut congestion_timer = 0.0f32;
     let mut high_frustration_timer = 0.0f32;
 
@@ -70,6 +72,10 @@ pub fn run_simulation(
 
         (intersections, spawn, od, tram)
     };
+
+    // Per-(edge, lane) sorted vehicle index buckets — rebuilt every tick.
+    // Key: (EdgeIndex, lane_number), Value: Vec of indices into `vehicles` sorted by edge_progress ascending.
+    let mut edge_lane_vehicles: HashMap<(EdgeIndex, u8), Vec<usize>> = HashMap::new();
 
     let mut last_tick = Instant::now();
     log::info!("Simulation loop started");
@@ -133,10 +139,21 @@ pub fn run_simulation(
             }
         }
 
-        // ── Rebuild spatial grid ─────────────────────────────────────────────
-        spatial_grid.clear();
-        for v in &vehicles {
-            spatial_grid.insert(v.id, v.lat, v.lng);
+        // ── Build per-(edge, lane) sorted buckets for O(1) leader lookup ────
+        edge_lane_vehicles.clear();
+        for (i, v) in vehicles.iter().enumerate() {
+            if v.route_pos < v.route.len() {
+                let key = (v.route[v.route_pos], v.current_lane);
+                edge_lane_vehicles.entry(key).or_default().push(i);
+            }
+        }
+        for bucket in edge_lane_vehicles.values_mut() {
+            // Sort ascending: vehicle with lowest edge_progress is at front of bucket (closest to edge start)
+            bucket.sort_unstable_by(|&a, &b| {
+                vehicles[a].edge_progress
+                    .partial_cmp(&vehicles[b].edge_progress)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
         }
 
         // ── Parallel IDM ─────────────────────────────────────────────────────
@@ -150,21 +167,13 @@ pub fn run_simulation(
             if let Some(map) = guard.as_ref() {
                 vehicles
                     .par_iter()
-                    .map(|v| {
-                        let leader = find_leader(v, &vehicles, &spatial_grid);
-                        let (gap, delta_v) = match leader {
-                            Some(lid) => {
-                                if let Some(lv) = vehicles.iter().find(|o| o.id == lid) {
-                                    let dist = geo_dist_approx(v.lat, v.lng, lv.lat, lv.lng);
-                                    (dist, v.speed - lv.speed)
-                                } else {
-                                    (1000.0, 0.0)
-                                }
-                            }
-                            None => (1000.0, 0.0),
-                        };
+                    .enumerate()
+                    .map(|(i, v)| {
+                        // Arc-length gap via per-edge sorted bucket
+                        let (gap, delta_v) =
+                            find_leader_arc(i, v, &vehicles, &edge_lane_vehicles, map);
 
-                        // Also check trams as potential obstacles (shared track).
+                        // Tram as potential obstacle
                         let (gap, delta_v) =
                             apply_tram_leader_effect(v, gap, delta_v, &tram_snapshot);
 
@@ -311,6 +320,7 @@ fn handle_command(
         SimCommand::Resume                 => clock.resume(),
         SimCommand::SetTimeScale(s)        => clock.set_time_scale(s),
         SimCommand::SetSpeedConfig(cfg)    => spawn_system.set_speed_config(cfg),
+        SimCommand::SetMaxVehicles(n)      => spawn_system.max_vehicles = n,
         SimCommand::SetLightMode { intersection_id, mode } => {
             intersections.set_mode(intersection_id, mode);
         }
@@ -326,31 +336,79 @@ fn handle_command(
 
 // ── Physics helpers ────────────────────────────────────────────────────────────
 
-fn find_leader(ego: &Vehicle, vehicles: &[Vehicle], grid: &SpatialGrid) -> Option<u32> {
-    if ego.route_pos >= ego.route.len() { return None; }
+/// Find the leader vehicle using per-edge sorted buckets and arc-length gap.
+///
+/// Returns `(gap_m, delta_v_ms)` — bumper-to-bumper gap in metres and speed
+/// difference (ego − leader) in m/s.  Uses 1000 m / 0.0 when no leader exists.
+///
+/// Gap is measured along the road (arc length), not Euclidean distance, which
+/// prevents phantom collisions on curved segments and at edge boundaries.
+fn find_leader_arc(
+    ego_idx: usize,
+    ego: &Vehicle,
+    vehicles: &[Vehicle],
+    edge_lane_vehicles: &HashMap<(EdgeIndex, u8), Vec<usize>>,
+    map: &MapData,
+) -> (f32, f32) {
+    if ego.route_pos >= ego.route.len() {
+        return (1000.0, 0.0);
+    }
+
     let ego_edge = ego.route[ego.route_pos];
-    let nearby   = grid.query_nearby(ego.lat, ego.lng, 2);
+    let ego_lane = ego.current_lane;
+    let ego_edge_len = map.graph.edge_weight(ego_edge).map(|e| e.length_m).unwrap_or(50.0);
 
-    let mut best_id   = None;
-    let mut best_dist = f32::MAX;
-
-    for &id in &nearby {
-        if id == ego.id { continue; }
-        if let Some(other) = vehicles.iter().find(|v| v.id == id) {
-            if other.route_pos < other.route.len()
-                && other.route[other.route_pos] == ego_edge
-                && other.current_lane == ego.current_lane
-                && other.edge_progress > ego.edge_progress
-            {
-                let dist = geo_dist_approx(ego.lat, ego.lng, other.lat, other.lng);
-                if dist < best_dist {
-                    best_dist = dist;
-                    best_id   = Some(id);
-                }
+    // ── Same edge, same lane ──────────────────────────────────────────────────
+    if let Some(bucket) = edge_lane_vehicles.get(&(ego_edge, ego_lane)) {
+        // Bucket is sorted by edge_progress ascending; find ego's position.
+        if let Some(pos) = bucket.iter().position(|&idx| idx == ego_idx) {
+            if let Some(&leader_idx) = bucket.get(pos + 1) {
+                let leader = &vehicles[leader_idx];
+                let gap = (leader.edge_progress - ego.edge_progress) * ego_edge_len
+                    - VEHICLE_LENGTH_M;
+                return (gap.max(0.01), ego.speed - leader.speed);
             }
         }
     }
-    best_id
+
+    // ── Look ahead to next edge when ego is past 60 % of current edge ────────
+    if ego.edge_progress >= 0.60 && ego.route_pos + 1 < ego.route.len() {
+        let next_edge = ego.route[ego.route_pos + 1];
+        let next_edge_len = map.graph.edge_weight(next_edge).map(|e| e.length_m).unwrap_or(50.0);
+        let dist_to_end = (1.0 - ego.edge_progress) * ego_edge_len;
+
+        // Check same lane on next edge, then adjacent lanes (merging / slight
+        // offset between directional lanes on a two-way road).
+        let lanes_to_check: [u8; 3] = [
+            ego_lane,
+            ego_lane.saturating_sub(1),
+            ego_lane.saturating_add(1),
+        ];
+        let mut best_gap = f32::MAX;
+        let mut best_dv  = 0.0f32;
+
+        for &lane in &lanes_to_check {
+            if let Some(bucket) = edge_lane_vehicles.get(&(next_edge, lane)) {
+                // Lowest progress in bucket = vehicle closest to the edge start = closest to us
+                if let Some(&leader_idx) = bucket.first() {
+                    let leader = &vehicles[leader_idx];
+                    let leader_from_start = leader.edge_progress * next_edge_len;
+                    let gap = dist_to_end + leader_from_start - VEHICLE_LENGTH_M;
+                    let gap = gap.max(0.01);
+                    if gap < best_gap {
+                        best_gap = gap;
+                        best_dv  = ego.speed - leader.speed;
+                    }
+                }
+            }
+        }
+
+        if best_gap < 1000.0 {
+            return (best_gap, best_dv);
+        }
+    }
+
+    (1000.0, 0.0) // free road ahead
 }
 
 #[inline]

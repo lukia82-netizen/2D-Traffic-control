@@ -199,6 +199,13 @@ pub fn set_speed_config(
     send_sim_command(&state, SimCommand::SetSpeedConfig(config))
 }
 
+/// Set the maximum number of simultaneously active (non-tram) vehicles.
+/// Takes effect immediately; excess vehicles already on the road are not removed.
+#[command]
+pub fn set_max_vehicles(count: usize, state: State<AppState>) -> Result<(), String> {
+    send_sim_command(&state, SimCommand::SetMaxVehicles(count))
+}
+
 /// Set the green and red phase durations for a traffic light.
 /// Effective in SemiAuto and Auto modes; ignored in Manual and Adaptive.
 #[command]

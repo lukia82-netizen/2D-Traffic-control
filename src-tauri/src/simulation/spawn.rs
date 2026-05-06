@@ -13,8 +13,8 @@ use crate::vehicles::vehicle::Vehicle;
 use crate::vehicles::types::VehicleType;
 use crate::vehicles::driver::DriverProfile;
 
-/// Hard cap on total non-tram vehicles in the simulation.
-const MAX_VEHICLES: usize = 500;
+/// Default hard cap on total non-tram vehicles in the simulation.
+const DEFAULT_MAX_VEHICLES: usize = 100;
 
 /// Fraction of spawns that are pure-transit (boundary → boundary).
 const TRANSIT_FRACTION: f32 = 0.25;
@@ -32,6 +32,8 @@ pub struct SpawnSystem {
     pub rng: StdRng,
     pub next_id: u32,
     pub speed_config: SpeedConfig,
+    /// Hard cap on total non-tram vehicles (configurable at runtime)
+    pub max_vehicles: usize,
 }
 
 impl SpawnSystem {
@@ -48,6 +50,7 @@ impl SpawnSystem {
             rng: StdRng::from_entropy(),
             next_id: 1,
             speed_config,
+            max_vehicles: DEFAULT_MAX_VEHICLES,
         }
     }
 
@@ -65,7 +68,7 @@ impl SpawnSystem {
         od_model: &OdModel,
         current_vehicle_count: usize,
     ) -> Vec<Vehicle> {
-        if current_vehicle_count >= MAX_VEHICLES {
+        if current_vehicle_count >= self.max_vehicles {
             return Vec::new();
         }
 
@@ -73,7 +76,7 @@ impl SpawnSystem {
         let to_spawn = self.accumulator.floor() as u32;
         self.accumulator -= to_spawn as f32;
 
-        let cap = (MAX_VEHICLES - current_vehicle_count) as u32;
+        let cap = (self.max_vehicles - current_vehicle_count) as u32;
         let to_spawn = to_spawn.min(cap);
 
         let mut new_vehicles = Vec::with_capacity(to_spawn as usize);
@@ -157,7 +160,7 @@ impl SpawnSystem {
         od_model: &OdModel,
         current_vehicle_count: usize,
     ) -> Vec<Vehicle> {
-        if current_vehicle_count >= MAX_VEHICLES {
+        if current_vehicle_count >= self.max_vehicles {
             return Vec::new();
         }
 
@@ -165,7 +168,7 @@ impl SpawnSystem {
         let to_spawn = self.accumulator.floor() as u32;
         self.accumulator -= to_spawn as f32;
 
-        let cap = (MAX_VEHICLES - current_vehicle_count) as u32;
+        let cap = (self.max_vehicles - current_vehicle_count) as u32;
         let to_spawn = to_spawn.min(cap);
 
         let mut new_vehicles = Vec::with_capacity(to_spawn as usize);

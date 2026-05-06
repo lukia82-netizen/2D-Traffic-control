@@ -122,6 +122,14 @@ export async function setTimeScale(scale: number): Promise<void> {
 }
 
 /**
+ * Set the maximum number of simultaneously active vehicles.
+ * Takes effect on the next spawn tick.
+ */
+export async function setMaxVehicles(count: number): Promise<void> {
+  return invoke<void>('set_max_vehicles', { count });
+}
+
+/**
  * Change the traffic light control mode for an intersection.
  * mode: 'Manual' | 'SemiAuto' | 'Auto' | 'Adaptive'
  *

@@ -27,7 +27,8 @@ export type VehicleToggleCb  = (visible: boolean) => void;
 export type BuildingToggleCb = (visible: boolean) => void;
 export type MapBgToggleCb    = (visible: boolean) => void;
 /** center = [lng, lat], sizeM = metres per side */
-export type ReloadMapCb      = (center: [number, number], sizeM: number) => void;
+export type ReloadMapCb        = (center: [number, number], sizeM: number) => void;
+export type MaxVehiclesCb      = (count: number) => void;
 
 // ─── City & size presets ─────────────────────────────────────────────────────
 
@@ -72,12 +73,13 @@ export class SandboxUI {
   private readonly swatches: Map<string, HTMLElement> = new Map();
 
   // Callbacks wired by game.ts
-  onLayerToggle:    LayerToggleCb    = () => undefined;
-  onOsmModeToggle:  OsmModeCb        = () => undefined;
-  onVehicleToggle:  VehicleToggleCb  = () => undefined;
-  onBuildingToggle: BuildingToggleCb = () => undefined;
-  onMapBgToggle:    MapBgToggleCb    = () => undefined;
-  onReloadMap:      ReloadMapCb      = () => undefined;
+  onLayerToggle:       LayerToggleCb    = () => undefined;
+  onOsmModeToggle:     OsmModeCb        = () => undefined;
+  onVehicleToggle:     VehicleToggleCb  = () => undefined;
+  onBuildingToggle:    BuildingToggleCb = () => undefined;
+  onMapBgToggle:       MapBgToggleCb    = () => undefined;
+  onReloadMap:         ReloadMapCb      = () => undefined;
+  onMaxVehiclesChange: MaxVehiclesCb    = () => undefined;
 
   constructor() {
     this.panel = this.buildPanel();
@@ -111,6 +113,7 @@ export class SandboxUI {
 
     panel.appendChild(this.buildHeader());
     panel.appendChild(this.buildAreaSection());
+    panel.appendChild(this.buildMaxVehiclesSection());
     panel.appendChild(this.buildViewModeSection());
     panel.appendChild(this.buildLayerSection());
     panel.appendChild(this.buildLegendSection());
@@ -180,6 +183,41 @@ export class SandboxUI {
     });
     sec.appendChild(this.reloadBtn);
 
+    return sec;
+  }
+
+  // ── Max vehicles ─────────────────────────────────────────────────────────
+
+  private buildMaxVehiclesSection(): HTMLElement {
+    const sec = this.makeSection('MAKS. POJAZDÓW');
+
+    const row = document.createElement('div');
+    row.className = 'sbx-input-row';
+
+    const input = document.createElement('input');
+    input.type = 'number';
+    input.className = 'sbx-num-input';
+    input.min = '10';
+    input.max = '1000';
+    input.step = '10';
+    input.value = '100';
+
+    const applyBtn = document.createElement('button');
+    applyBtn.className = 'sbx-apply-btn';
+    applyBtn.textContent = 'Ustaw';
+
+    const apply = () => {
+      const val = Math.max(10, Math.min(1000, parseInt(input.value, 10) || 100));
+      input.value = String(val);
+      this.onMaxVehiclesChange(val);
+    };
+
+    applyBtn.addEventListener('click', apply);
+    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') apply(); });
+
+    row.appendChild(input);
+    row.appendChild(applyBtn);
+    sec.appendChild(row);
     return sec;
   }
 

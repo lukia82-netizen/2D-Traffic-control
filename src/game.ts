@@ -6,6 +6,7 @@ import {
   loadMap,
   startSimulation,
   setTimeScale,
+  setMaxVehicles,
 } from './bridge/commands';
 import {
   parseVehicleFrame,
@@ -227,6 +228,12 @@ export class Game {
       this.trafficLightUI.setHiddenNodeIds(hiddenNodes);
     };
 
+    ui.onMaxVehiclesChange = (count) => {
+      if (this.tauriAvailable) {
+        setMaxVehicles(count).catch(console.error);
+      }
+    };
+
     ui.onReloadMap = (center, sizeM) => {
       // Degrees per metre at given latitude
       const lat = center[1];
@@ -402,13 +409,13 @@ export class Game {
   private onVehicleFrame(data: string): void {
     const states = parseVehicleFrame(data);
 
-    // Merge into vehicles map
-    for (const v of states) {
-      this.vehicles.set(v.id, v);
+    // Replace map contents: remove IDs absent from this frame (despawned), add/update the rest.
+    const frameIds = new Set<number>();
+    for (const v of states) frameIds.add(v.id);
+    for (const id of this.vehicles.keys()) {
+      if (!frameIds.has(id)) this.vehicles.delete(id);
     }
-
-    // Advance game time based on real elapsed time × timeScale
-    // (We rely on the ticker's deltaMS in gameLoop; this handler only updates state)
+    for (const v of states) this.vehicles.set(v.id, v);
   }
 
   private onCongestionUpdate(data: CongestionData[]): void {

@@ -944,6 +944,46 @@ html, body {
   color: #9098b8;
 }
 
+/* Max vehicles input */
+.sbx-input-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.sbx-num-input {
+  flex: 1;
+  padding: 4px 6px;
+  background: rgba(255,255,255,0.07);
+  border: 1px solid rgba(255,255,255,0.15);
+  border-radius: 5px;
+  color: #c8d4ff;
+  font-size: 12px;
+  font-weight: 600;
+  text-align: center;
+  outline: none;
+  min-width: 0;
+}
+.sbx-num-input:focus {
+  border-color: rgba(60,100,255,0.5);
+  background: rgba(255,255,255,0.1);
+}
+.sbx-apply-btn {
+  padding: 4px 10px;
+  background: rgba(60,100,255,0.2);
+  border: 1px solid rgba(60,100,255,0.4);
+  border-radius: 5px;
+  color: #a0b8ff;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 0.15s;
+}
+.sbx-apply-btn:hover {
+  background: rgba(60,100,255,0.35);
+  color: #d0e0ff;
+}
+
 /* Area status & reload */
 .sbx-area-status {
   font-size: 10px;
