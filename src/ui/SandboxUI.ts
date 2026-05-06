@@ -29,6 +29,7 @@ export type MapBgToggleCb    = (visible: boolean) => void;
 /** center = [lng, lat], sizeM = metres per side */
 export type ReloadMapCb        = (center: [number, number], sizeM: number) => void;
 export type MaxVehiclesCb      = (count: number) => void;
+export type BboxPickCb         = () => void;
 /**
  * Called when the user changes the map/grid mode.
  * null  = use real OSM map
@@ -102,6 +103,7 @@ export class SandboxUI {
   onMapBgToggle:       MapBgToggleCb    = () => undefined;
   onReloadMap:         ReloadMapCb      = () => undefined;
   onMaxVehiclesChange: MaxVehiclesCb    = () => undefined;
+  onBboxPickRequest:   BboxPickCb       = () => undefined;
   /** Fires when the user changes the map/grid mode. Triggers on selection (not on reload). */
   onMapModeChange:     MapModeCb        = () => undefined;
 
@@ -262,6 +264,12 @@ export class SandboxUI {
       this.onReloadMap(this.selectedCity.center, this.selectedSize);
     });
     sec.appendChild(this.reloadBtn);
+
+    const bboxBtn = document.createElement('button');
+    bboxBtn.className = 'sbx-reload-btn sbx-bbox-btn';
+    bboxBtn.textContent = 'Wybierz obszar (BBOX)';
+    bboxBtn.addEventListener('click', () => this.onBboxPickRequest());
+    sec.appendChild(bboxBtn);
 
     return sec;
   }

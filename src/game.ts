@@ -29,6 +29,7 @@ import { GameClockUI } from './time/GameClockUI';
 import { SandboxUI, CITY_PRESETS } from './ui/SandboxUI';
 import { LESZNO_BBOX } from './map/MapLibreSetup';
 import { ROAD_TYPE_GROUP } from './rendering/RoadRenderer';
+import { MapBboxPicker } from './map/MapBboxPicker';
 
 // ─── Mode: always start in SANDBOX ───────────────────────────────────────────
 // Sandbox uses Leszno, skips building rendering (big perf win), shows
@@ -147,10 +148,12 @@ export class Game {
   private currentBbox: [number, number, number, number] = DEFAULT_BBOX;
   /** null = real OSM data; string = sandbox grid type ('mixed'|'one_lane'|'single_road'|…) */
   private currentGridMode: string | null = 'single_road';
+  private bboxPicker: MapBboxPicker | null = null;
 
   constructor(map: maplibregl.Map, overlay: PixiOverlay) {
     this.map = map;
     this.overlay = overlay;
+    this.bboxPicker = new MapBboxPicker(this.map);
   }
 
   // ─── Initialisation ────────────────────────────────────────────────────────
@@ -251,6 +254,21 @@ export class Game {
       ];
       const cityName = CITY_PRESETS.find(c => c.center[0] === center[0] && c.center[1] === center[1])?.name ?? 'Custom';
       this.reloadMap(bbox, sizeM, cityName, this.currentGridMode);
+    };
+    ui.onBboxPickRequest = () => {
+      this.uiRenderer.showNotification('Zaznacz obszar na mapie przeciągnięciem', 'info');
+      this.bboxPicker?.start(async (bbox) => {
+        const centerLng = (bbox[0] + bbox[2]) / 2;
+        const centerLat = (bbox[1] + bbox[3]) / 2;
+        const latSizeM = (bbox[3] - bbox[1]) * 111320;
+        const lngSizeM = (bbox[2] - bbox[0]) * 111320 * Math.cos(centerLat * Math.PI / 180);
+        const sizeM = Math.max(100, Math.round(Math.max(latSizeM, lngSizeM)));
+        const cityName = CITY_PRESETS.find(c =>
+          Math.abs(c.center[0] - centerLng) < 0.02 &&
+          Math.abs(c.center[1] - centerLat) < 0.02,
+        )?.name ?? 'Custom BBOX';
+        await this.reloadMap(bbox, sizeM, cityName, this.currentGridMode);
+      });
     };
 
     ui.onMapModeChange = (forceSandbox) => {
@@ -532,6 +550,7 @@ export class Game {
     this.unlistenCongestion?.();
     this.unlistenLights?.();
     this.unlistenGameOver?.();
+    this.bboxPicker?.destroy();
     this.sandboxUI?.destroy();
     this.buildingRenderer.destroy();
     this.roadRenderer.destroy();
