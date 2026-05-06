@@ -146,6 +146,14 @@ export async function setDebugVehicle(vehicleId: number | null): Promise<void> {
 }
 
 /**
+ * Converts PascalCase/CamelCase → snake_case for Rust traffic-light mode
+ * (e.g. 'SemiAuto' → 'semi_auto').
+ */
+export function trafficLightModeToRust(mode: string): string {
+  return mode.replace(/([a-z])([A-Z])/g, '$1_$2').toLowerCase();
+}
+
+/**
  * Change the traffic light control mode for an intersection.
  * mode: 'Manual' | 'SemiAuto' | 'Auto' | 'Adaptive'
  *
@@ -156,11 +164,7 @@ export async function setTrafficLightMode(
   intersectionId: number,
   mode: string,
 ): Promise<void> {
-  // Convert PascalCase → snake_case: insert '_' before each uppercase letter
-  // that follows a lowercase letter, then lowercase everything.
-  const rustMode = mode
-    .replace(/([a-z])([A-Z])/g, '$1_$2')
-    .toLowerCase();
+  const rustMode = trafficLightModeToRust(mode);
   return invoke<void>('set_traffic_light_mode', { intersectionId, mode: rustMode });
 }
 
