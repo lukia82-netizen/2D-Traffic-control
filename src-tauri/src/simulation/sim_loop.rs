@@ -26,6 +26,8 @@ use crate::simulation::tram_sim::TramSim;
 
 const TARGET_TICK_S: f32 = 1.0 / 60.0;
 const CONGESTION_INTERVAL_S: f32 = 0.5;
+const STOP_LINE_OFFSET_M: f32 = 8.0;
+const MIN_IDM_GAP_M: f32 = 0.1;
 
 /// Physical length of a vehicle subtracted from the gap so IDM sees bumper-to-bumper distance.
 const VEHICLE_LENGTH_M: f32 = 4.5;
@@ -431,9 +433,8 @@ fn stop_line_debug(
         return None;
     }
 
-    const STOP_LINE_OFFSET_M: f32 = 8.0;
     let dist_to_end = edge.length_m * (1.0 - vehicle.edge_progress);
-    let dist_to_stop_line = (dist_to_end - STOP_LINE_OFFSET_M).max(0.0);
+    let dist_to_stop_line = distance_to_stop_line_from_front_bumper(vehicle, dist_to_end);
     let red_blocking = !intersections.can_vehicle_proceed(tgt_osm_id, vehicle.has_stopped_at_stop_sign);
     Some((dist_to_stop_line, red_blocking))
 }
@@ -596,9 +597,8 @@ fn apply_intersection_effect(
         None    => return (gap, delta_v),
     };
     let dist_to_end = edge.length_m * (1.0 - vehicle.edge_progress);
-    // Stop line is slightly before the node center.
-    const STOP_LINE_OFFSET_M: f32 = 8.0;
-    let dist_to_stop_line = (dist_to_end - STOP_LINE_OFFSET_M).max(0.05);
+    // IDM must see free space from the FRONT BUMPER to the stop line.
+    let dist_to_stop_line = distance_to_stop_line_from_front_bumper(vehicle, dist_to_end);
 
     let (tgt_node_idx, tgt_osm_id) = match map.graph.edge_endpoints(edge_idx) {
         Some((_, tgt)) => (tgt, map.graph[tgt].osm_id),
@@ -618,7 +618,7 @@ fn apply_intersection_effect(
             && !intersections.can_vehicle_proceed(tgt_osm_id, vehicle.has_stopped_at_stop_sign)
         {
             // Virtual leader: standing at stop line.
-            let vgap = dist_to_stop_line;
+            let vgap = dist_to_stop_line.max(MIN_IDM_GAP_M);
             let vdv  = vehicle.speed; // leader speed = 0
             let new_gap = vgap.min(gap);
             let new_dv  = if new_gap < gap { vdv } else { delta_v };
@@ -632,7 +632,7 @@ fn apply_intersection_effect(
     // vehicle reaches speed < 0.3 m/s.  After stopping, the vehicle may proceed.
     if matches!(intersection_type, IntersectionType::Stop) {
         if dist_to_end <= 15.0 && !vehicle.has_stopped_at_stop_sign {
-            let vgap = dist_to_end.max(0.1);
+            let vgap = dist_to_stop_line.max(MIN_IDM_GAP_M);
             let new_gap = vgap.min(gap);
             let new_dv  = vehicle.speed;
             return (new_gap, new_dv);
@@ -645,7 +645,7 @@ fn apply_intersection_effect(
         const YIELD_SPEED: f32 = 1.39; // 5 km/h
         if dist_to_end <= 20.0 && vehicle.speed > YIELD_SPEED {
             // Treat the junction entry as a slow virtual leader.
-            let virtual_gap = dist_to_end.max(0.5);
+            let virtual_gap = dist_to_stop_line.max(0.5);
             let virtual_dv  = vehicle.speed - YIELD_SPEED;
             let new_gap = virtual_gap.min(gap);
             let new_dv  = if new_gap < gap { virtual_dv } else { delta_v };
@@ -654,6 +654,13 @@ fn apply_intersection_effect(
     }
 
     (gap, delta_v)
+}
+
+#[inline]
+fn distance_to_stop_line_from_front_bumper(vehicle: &Vehicle, dist_to_end: f32) -> f32 {
+    let dist_center_to_stop_line = (dist_to_end - STOP_LINE_OFFSET_M).max(0.0);
+    let half_length = vehicle.vehicle_type.params().length_m * 0.5;
+    (dist_center_to_stop_line - half_length).max(MIN_IDM_GAP_M)
 }
 
 /// Check nearby trams as potential IDM obstacles.
