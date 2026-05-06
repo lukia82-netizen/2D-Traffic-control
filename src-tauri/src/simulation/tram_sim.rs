@@ -148,7 +148,8 @@ fn segment_length(stops: &[NodeIndex], from_idx: usize, tram_data: &TramData) ->
 
 pub struct TramSim {
     pub trams: Vec<TramVehicle>,
-    next_id: u32,
+    /// Next tram entity id if trams are spawned dynamically later.
+    _next_id: u32,
 }
 
 impl TramSim {
@@ -171,7 +172,7 @@ impl TramSim {
         }
 
         log::info!("TramSim: spawned {} trams", trams.len());
-        TramSim { trams, next_id }
+        TramSim { trams, _next_id: next_id }
     }
 
     pub fn is_empty(&self) -> bool {
