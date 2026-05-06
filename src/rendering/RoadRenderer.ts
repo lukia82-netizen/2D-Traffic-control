@@ -75,12 +75,28 @@ export const GROUP_LEGEND: Record<string, { label: string; gameColor: string; os
   service:     { label: 'Serwisowe / wewnętrzne',    gameColor: '#585858', osmColor: '#c8c8c8' },
 };
 
+// ─── OSM thin-line widths (total px at zoom 16) ───────────────────────────────
+
+/** Fixed road widths for OSM thin-line mode.  No lane multiplication. */
+const THIN_W: Record<string, number> = {
+  motorway: 5, motorway_link: 4, trunk: 5, trunk_link: 4,
+  primary: 3.5, primary_link: 3,
+  secondary: 2.5, secondary_link: 2,
+  tertiary: 2, tertiary_link: 1.5,
+  residential: 1.5, living_street: 1.2,
+  service: 1, unclassified: 1.5,
+};
+const THIN_DEFAULT = 1.5;
+
 // ─── Internal helpers ─────────────────────────────────────────────────────────
 
 interface EdgeRenderable {
   from:  { x: number; y: number };
   to:    { x: number; y: number };
+  /** Half road width for normal mode. */
   w:     number;
+  /** Total width for OSM thin mode. */
+  thinW: number;
   style: RoadStyle;
   alpha: number;
   dx: number; dy: number; len: number;
@@ -137,6 +153,11 @@ export class RoadRenderer {
     return !this.hiddenGroups.has(group);
   }
 
+  /** Returns a copy of currently hidden groups (for syncing to VehicleRenderer). */
+  getHiddenGroups(): Set<string> {
+    return new Set(this.hiddenGroups);
+  }
+
   // ─── Public API ────────────────────────────────────────────────────────────
 
   /** Call once when mapData first arrives — builds lookup caches. */
@@ -188,12 +209,26 @@ export class RoadRenderer {
       const len = Math.hypot(dx, dy);
       if (len < 0.5) continue;
 
-      const style = this.styleFor(edge);
-      const lanes = Math.max(1, edge.lanes);
-      const w     = Math.max(5, lanes * style.halfPx * zoomScale);
-      const alpha = edge.infraType === 'tunnel' ? 0.5 : 1.0;
+      const style  = this.styleFor(edge);
+      const lanes  = Math.max(1, edge.lanes);
+      const w      = Math.max(5, lanes * style.halfPx * zoomScale);
+      // Thin mode: fixed per-type width that scales gently with zoom
+      const thinW  = (THIN_W[edge.roadType] ?? THIN_DEFAULT) * Math.min(1.5, Math.max(0.5, zoomScale));
+      const alpha  = edge.infraType === 'tunnel' ? 0.5 : 1.0;
 
-      renderables.push({ from, to, w, style, alpha, dx, dy, len, edge });
+      renderables.push({ from, to, w, thinW, style, alpha, dx, dy, len, edge });
+    }
+
+    if (this.osmMode) {
+      // ── OSM thin-line mode: simple coloured lines, round caps, no casings ───
+      // Sorted so thinner roads appear under thicker ones (already sorted by zIndex)
+      for (const r of renderables) {
+        gfx.moveTo(r.from.x, r.from.y).lineTo(r.to.x, r.to.y)
+           .stroke({ width: r.thinW + 0.8, color: 0x555555, alpha: r.alpha * 0.7, cap: 'round' });
+        gfx.moveTo(r.from.x, r.from.y).lineTo(r.to.x, r.to.y)
+           .stroke({ width: r.thinW, color: r.style.color, alpha: r.alpha, cap: 'round' });
+      }
+      return; // skip normal passes and junction circles
     }
 
     // ── Step 2: junction circles (max road width at each node) ────────────

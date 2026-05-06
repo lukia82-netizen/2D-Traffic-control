@@ -85,7 +85,7 @@ export class InfraRenderer {
     // intentionally empty
   }
 
-  // ─── Static markings (bridge shadows) ─────────────────────────────────────
+  // ─── Static markings (bridge shadows + stop lines) ────────────────────────
 
   private rebuildMarkings(mapData: MapData): void {
     const w = this.overlay.width;
@@ -93,15 +93,26 @@ export class InfraRenderer {
     const gfx = new PIXI.Graphics();
 
     for (const edge of mapData.edges) {
-      if (edge.infraType !== 'bridge') continue;
-
       const fromNode = this.nodeMap.get(edge.from);
       const toNode   = this.nodeMap.get(edge.to);
       if (!fromNode || !toNode) continue;
 
       const fromPx = projectPoint(this.map, fromNode.lng, fromNode.lat);
       const toPx   = projectPoint(this.map, toNode.lng,   toNode.lat);
-      this.drawBridgeShadow(gfx, fromPx, toPx, edge);
+
+      if (edge.infraType === 'bridge') {
+        this.drawBridgeShadow(gfx, fromPx, toPx, edge);
+      }
+
+      // Stop line: white bar perpendicular to the road, set back from the
+      // target node when that node is a traffic light or stop sign.
+      const targetNode = toNode;
+      if (
+        targetNode.intersectionType === 'traffic_light' ||
+        targetNode.intersectionType === 'stop'
+      ) {
+        this.drawStopLine(gfx, fromPx, toPx, edge);
+      }
     }
 
     const rt = PIXI.RenderTexture.create({ width: w, height: h });
@@ -130,6 +141,37 @@ export class InfraRenderer {
     gfx.moveTo(from.x + BRIDGE_SHADOW_OFFSET, from.y + BRIDGE_SHADOW_OFFSET);
     gfx.lineTo(to.x   + BRIDGE_SHADOW_OFFSET, to.y   + BRIDGE_SHADOW_OFFSET);
     gfx.stroke();
+  }
+
+  /**
+   * Draw a white stop line perpendicular to the road, set back 12 px from the
+   * intersection node.  Width = road overlay width so it spans the full lane.
+   */
+  private drawStopLine(
+    gfx: PIXI.Graphics,
+    from: { x: number; y: number },
+    to:   { x: number; y: number },
+    edge: EdgeData,
+  ): void {
+    const dx  = to.x - from.x;
+    const dy  = to.y - from.y;
+    const len = Math.hypot(dx, dy);
+    if (len < 20) return; // road segment too short to place a stop line
+
+    const SETBACK = Math.min(14, len * 0.15); // px back from the node
+    const t  = (len - SETBACK) / len;
+    const sx = from.x + dx * t;
+    const sy = from.y + dy * t;
+
+    // Perpendicular unit vector (90° CW)
+    const px = -dy / len;
+    const py =  dx / len;
+
+    const hw = this.camera.getRoadOverlayWidth(edge.lanes) * 0.85; // half-width
+
+    gfx.moveTo(sx + px * hw, sy + py * hw)
+       .lineTo(sx - px * hw, sy - py * hw)
+       .stroke({ width: 2.5, color: 0xffffff, alpha: 0.85, cap: 'round' });
   }
 
   // ─── Static one-way arrows ─────────────────────────────────────────────────

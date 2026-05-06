@@ -1,8 +1,10 @@
 import * as PIXI from 'pixi.js';
 import maplibregl from 'maplibre-gl';
 import type { VehicleState } from '../bridge/events';
+import type { MapData } from '../bridge/commands';
 import type { PixiOverlay } from './PixiOverlay';
 import type { CameraManager } from './CameraManager';
+import { ROAD_TYPE_GROUP } from './RoadRenderer';
 
 // ─── Lerp smoothing factor (0–1 per frame) ───────────────────────────────────
 // 0.45 per frame at 60 fps ≈ ~99% of remaining distance in 5 frames.
@@ -75,6 +77,41 @@ function frustrationDotColor(frustration: number, typeColor: number): number {
   return typeColor;
 }
 
+// ─── Road-group spatial index ─────────────────────────────────────────────────
+
+/** Lat/lng scale factor at ~52°N so lng differences are in the same "metre" units as lat. */
+const LNG_SCALE = Math.cos(51.8 * Math.PI / 180); // ≈ 0.617
+
+/** Minimum movement (degrees) before re-evaluating which road a vehicle is on. */
+const RECHECK_THRESHOLD = 0.00008; // ≈ 9 m
+
+interface EdgeLine {
+  aLat: number; aLng: number;
+  bLat: number; bLng: number;
+  group: string;
+}
+
+/** Squared distance from point P to segment AB (in scaled lat/lng space). */
+function ptSegDist2(
+  pLat: number, pLng: number,
+  aLat: number, aLng: number,
+  bLat: number, bLng: number,
+): number {
+  const dLat = bLat - aLat;
+  const dLng = (bLng - aLng) * LNG_SCALE;
+  const len2 = dLat * dLat + dLng * dLng;
+  if (len2 === 0) {
+    const eLat = pLat - aLat, eLng = (pLng - aLng) * LNG_SCALE;
+    return eLat * eLat + eLng * eLng;
+  }
+  const pLat2 = pLat - aLat;
+  const pLng2 = (pLng - aLng) * LNG_SCALE;
+  const t = Math.max(0, Math.min(1, (pLat2 * dLat + pLng2 * dLng) / len2));
+  const rLat = pLat2 - t * dLat;
+  const rLng = pLng2 - t * dLng;
+  return rLat * rLat + rLng * rLng;
+}
+
 // ─── VehicleRenderer ─────────────────────────────────────────────────────────
 
 /**
@@ -111,10 +148,53 @@ export class VehicleRenderer {
   /** Smoothed geographic positions to eliminate flicker from IPC burst delivery */
   private readonly geoSmoothed: Map<number, { lat: number; lng: number }> = new Map();
 
+  // ── Road-group filtering (sandbox layer visibility) ───────────────────────
+  /** Edges indexed for fast vehicle → road-group matching. */
+  private edgeIndex: EdgeLine[] = [];
+  /** Cache: vehicle id → road group string (e.g. 'residential'). */
+  private readonly vehicleGroupCache: Map<number, string> = new Map();
+  /** Previous positions used to detect when re-checking is needed. */
+  private readonly prevVehiclePos: Map<number, { lat: number; lng: number }> = new Map();
+  /** Groups that are currently hidden (synced from RoadRenderer via game.ts). */
+  private hiddenGroups: Set<string> = new Set();
+
   constructor(overlay: PixiOverlay, map: maplibregl.Map, camera: CameraManager) {
     this.overlay = overlay;
     this.map = map;
     this.camera = camera;
+  }
+
+  // ─── Road-group filtering API ──────────────────────────────────────────────
+
+  /**
+   * Build the edge spatial index from map data.
+   * Call once after map data loads.
+   */
+  setEdgeIndex(mapData: MapData): void {
+    const nodeMap = new Map(mapData.nodes.map(n => [n.id, n]));
+    this.edgeIndex = [];
+    for (const edge of mapData.edges) {
+      const a = nodeMap.get(edge.from);
+      const b = nodeMap.get(edge.to);
+      if (!a || !b) continue;
+      this.edgeIndex.push({
+        aLat: a.lat, aLng: a.lng,
+        bLat: b.lat, bLng: b.lng,
+        group: ROAD_TYPE_GROUP[edge.roadType] ?? 'residential',
+      });
+    }
+    // Invalidate group caches when map data changes
+    this.vehicleGroupCache.clear();
+    this.prevVehiclePos.clear();
+  }
+
+  /**
+   * Update hidden road groups.  Invalidates the group cache so every
+   * vehicle is re-evaluated against the new visibility state.
+   */
+  setHiddenGroups(groups: Set<string>): void {
+    this.hiddenGroups = groups;
+    this.vehicleGroupCache.clear(); // force re-check on next frame
   }
 
   // ─── Initialisation ────────────────────────────────────────────────────────
@@ -182,6 +262,8 @@ export class VehicleRenderer {
     gfx.clear();
 
     for (const v of vehicles.values()) {
+      if (this.isVehicleHidden(v)) continue;
+
       const smooth = this.smoothGeo(v);
 
       // Frustum cull
@@ -273,6 +355,8 @@ export class VehicleRenderer {
     const renderedIds = new Set<number>();
 
     for (const [id, v] of vehicles) {
+      if (this.isVehicleHidden(v)) continue;
+
       const smooth = this.smoothGeo(v);
 
       // Frustum cull
@@ -332,6 +416,8 @@ export class VehicleRenderer {
         this.releaseSprite(id, sprite);
         this.activeSprites.delete(id);
         this.geoSmoothed.delete(id);
+        this.vehicleGroupCache.delete(id);
+        this.prevVehiclePos.delete(id);
       }
     }
   }
@@ -341,6 +427,42 @@ export class VehicleRenderer {
       sprite.visible = false;
     }
     // Don't return to pool – they'll be reused when zooming back in
+  }
+
+  // ─── Road-group lookup ─────────────────────────────────────────────────────
+
+  /**
+   * Returns true if the vehicle's current road group is hidden.
+   * Uses a lazy cache: re-evaluates only when the vehicle has moved ≥9 m
+   * since last check.  O(edges) per re-check, O(1) otherwise.
+   */
+  private isVehicleHidden(v: VehicleState): boolean {
+    if (this.hiddenGroups.size === 0 || this.edgeIndex.length === 0) return false;
+
+    const prev = this.prevVehiclePos.get(v.id);
+    const moved = !prev ||
+      Math.abs(v.lat - prev.lat) > RECHECK_THRESHOLD ||
+      Math.abs(v.lng - prev.lng) > RECHECK_THRESHOLD;
+
+    if (moved) {
+      const group = this.resolveVehicleGroup(v.lat, v.lng);
+      this.vehicleGroupCache.set(v.id, group);
+      this.prevVehiclePos.set(v.id, { lat: v.lat, lng: v.lng });
+    }
+
+    const group = this.vehicleGroupCache.get(v.id) ?? 'residential';
+    return this.hiddenGroups.has(group);
+  }
+
+  /** Find the road group of the nearest edge to (lat, lng). */
+  private resolveVehicleGroup(lat: number, lng: number): string {
+    let bestDist2 = Infinity;
+    let bestGroup = 'residential';
+    for (const e of this.edgeIndex) {
+      const d2 = ptSegDist2(lat, lng, e.aLat, e.aLng, e.bLat, e.bLng);
+      if (d2 < bestDist2) { bestDist2 = d2; bestGroup = e.group; }
+    }
+    return bestGroup;
   }
 
   // ─── Geo smoothing (lerp) ──────────────────────────────────────────────────

@@ -21,10 +21,11 @@ const ROAD_LAYERS: LayerDef[] = [
 
 // ─── Callbacks ────────────────────────────────────────────────────────────────
 
-export type LayerToggleCb   = (group: string, visible: boolean) => void;
-export type OsmModeCb       = (enabled: boolean) => void;
-export type VehicleToggleCb = (visible: boolean) => void;
+export type LayerToggleCb    = (group: string, visible: boolean) => void;
+export type OsmModeCb        = (enabled: boolean) => void;
+export type VehicleToggleCb  = (visible: boolean) => void;
 export type BuildingToggleCb = (visible: boolean) => void;
+export type MapBgToggleCb    = (visible: boolean) => void;
 
 // ─── SandboxUI ────────────────────────────────────────────────────────────────
 
@@ -49,10 +50,11 @@ export class SandboxUI {
   private readonly swatches: Map<string, HTMLElement> = new Map();
 
   // Callbacks wired by game.ts
-  onLayerToggle: LayerToggleCb = () => undefined;
-  onOsmModeToggle: OsmModeCb = () => undefined;
-  onVehicleToggle: VehicleToggleCb = () => undefined;
+  onLayerToggle:    LayerToggleCb    = () => undefined;
+  onOsmModeToggle:  OsmModeCb        = () => undefined;
+  onVehicleToggle:  VehicleToggleCb  = () => undefined;
   onBuildingToggle: BuildingToggleCb = () => undefined;
+  onMapBgToggle:    MapBgToggleCb    = () => undefined;
 
   constructor() {
     this.panel = this.buildPanel();
@@ -150,6 +152,12 @@ export class SandboxUI {
     sep.className = 'sbx-sep';
     sec.appendChild(sep);
 
+    // Map background
+    sec.appendChild(this.buildCheckRow(
+      'mapbg', 'Mapa w tle', '#2244aa', true,
+      (checked) => this.onMapBgToggle(checked),
+    ));
+
     // Vehicles
     sec.appendChild(this.buildCheckRow(
       'vehicles', 'Pojazdy', '#4488ff', true,
@@ -158,7 +166,7 @@ export class SandboxUI {
 
     // Buildings (off by default – performance)
     sec.appendChild(this.buildCheckRow(
-      'buildings', 'Budynki (wolniej)', '#334466', false,
+      'buildings', 'Budynki (wolniej)', '#6688aa', false,
       (checked) => this.onBuildingToggle(checked),
     ));
 

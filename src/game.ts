@@ -212,12 +212,22 @@ export class Game {
   private wireSandboxUI(): void {
     const ui = this.sandboxUI!;
 
+    // In sandbox, buildings layer starts empty and hidden
+    this.overlay.buildings.visible = false;
+
     ui.onLayerToggle = (group, visible) => {
       this.roadRenderer.setGroupVisible(group, visible);
+      // Sync to VehicleRenderer so vehicles on hidden roads also disappear
+      this.vehicleRenderer.setHiddenGroups(this.roadRenderer.getHiddenGroups());
     };
 
     ui.onOsmModeToggle = (enabled) => {
       this.roadRenderer.setOsmMode(enabled);
+    };
+
+    ui.onMapBgToggle = (visible) => {
+      const mapEl = document.getElementById('map-container');
+      if (mapEl) mapEl.style.opacity = visible ? '1' : '0';
     };
 
     ui.onVehicleToggle = (visible) => {
@@ -230,6 +240,7 @@ export class Game {
     ui.onBuildingToggle = (visible) => {
       this.overlay.buildings.visible = visible;
       if (visible && this.mapData) {
+        // Build only on first enable; subsequent toggles just show/hide
         this.buildingRenderer.build(this.mapData);
       }
     };
@@ -256,6 +267,12 @@ export class Game {
     if (!SANDBOX_MODE) this.buildingRenderer.build(this.mapData);
     this.roadRenderer.build(this.mapData);
     this.infraRenderer.buildStaticLayer(this.mapData);
+    // Give VehicleRenderer the edge spatial index for road-group filtering
+    this.vehicleRenderer.setEdgeIndex(this.mapData);
+    // Sync initial hidden groups (sandbox defaults service=hidden)
+    if (SANDBOX_MODE) {
+      this.vehicleRenderer.setHiddenGroups(this.roadRenderer.getHiddenGroups());
+    }
     this.trafficLightUI.init(this.mapData.nodes);
     this.trafficLightRenderer.init(this.mapData.nodes);
   }
