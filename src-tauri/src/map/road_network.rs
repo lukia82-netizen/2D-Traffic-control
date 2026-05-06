@@ -10,6 +10,9 @@ use crate::map::tram_network::TramData;
 pub enum IntersectionType {
     Plain,
     TrafficLight,
+    /// Mid-road pedestrian crossing with traffic signals.
+    /// Vehicles treat it like a TrafficLight; the frontend renders a zebra + pedestrian signal.
+    PedestrianCrossing,
     Stop,
     Yield,
     /// Roundabout node (junction=roundabout) – always one-way.
@@ -290,36 +293,45 @@ pub fn build_single_road_network(bbox: [f64; 4]) -> MapData {
         lng:    cx - half_lng,
         intersection_type: IntersectionType::Plain,
     });
+    // Middle node — pedestrian crossing with traffic signals
+    let mid_node = graph.add_node(RoadNode {
+        osm_id: 100,
+        lat:    cy,
+        lng:    cx,
+        intersection_type: IntersectionType::PedestrianCrossing,
+    });
     let end_node = graph.add_node(RoadNode {
         osm_id: 1,
         lat:    cy,
         lng:    cx + half_lng,
         intersection_type: IntersectionType::Plain,
     });
-    node_index_map.insert(0, start_node);
-    node_index_map.insert(1, end_node);
+    node_index_map.insert(0,   start_node);
+    node_index_map.insert(100, mid_node);
+    node_index_map.insert(1,   end_node);
 
-    let length_m = haversine_distance_m(cy, cx - half_lng, cy, cx + half_lng);
-    let edge = RoadEdge {
+    let half_m = haversine_distance_m(cy, cx - half_lng, cy, cx);
+    let make_edge = |len: f32| RoadEdge {
         osm_id: 0,
         lanes:  1,
         max_speed: 13.89, // 50 km/h
         oneway: true,
         infra_type: InfraType::Normal,
         layer: 0,
-        length_m,
+        length_m: len,
         lane_directions: vec![LaneDirection::Straight],
-        decision_points: [length_m * 0.25, length_m * 0.5, length_m * 0.75],
+        decision_points: [len * 0.25, len * 0.5, len * 0.75],
         road_type: "secondary".to_string(),
         has_tram_track: false,
     };
-    graph.add_edge(start_node, end_node, edge);
+    graph.add_edge(start_node, mid_node, make_edge(half_m));
+    graph.add_edge(mid_node,   end_node, make_edge(half_m));
 
     let bbox = compute_bbox(&graph);
     let spawn_points   = vec![start_node];
     let boundary_nodes = vec![end_node];
 
-    log::info!("Built SINGLE-ROAD test: 2 nodes, 1 edge ({:.0} m)", length_m);
+    log::info!("Built SINGLE-ROAD test: 3 nodes, 2 edges, pedestrian crossing at centre ({:.0} m each)", half_m);
 
     let tram_data = TramData {
         graph: crate::map::tram_network::TramGraph::new(),

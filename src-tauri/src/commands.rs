@@ -262,11 +262,12 @@ fn build_map_response(map_data: &MapData) -> MapDataResponse {
             lat: node.lat,
             lng: node.lng,
             intersection_type: match node.intersection_type {
-                IntersectionType::Plain        => "plain",
-                IntersectionType::TrafficLight => "traffic_light",
-                IntersectionType::Stop         => "stop",
-                IntersectionType::Yield        => "yield",
-                IntersectionType::Roundabout   => "roundabout",
+                IntersectionType::Plain              => "plain",
+                IntersectionType::TrafficLight       => "traffic_light",
+                IntersectionType::PedestrianCrossing => "pedestrian_crossing",
+                IntersectionType::Stop               => "stop",
+                IntersectionType::Yield              => "yield",
+                IntersectionType::Roundabout         => "roundabout",
             }.to_string(),
         });
     }

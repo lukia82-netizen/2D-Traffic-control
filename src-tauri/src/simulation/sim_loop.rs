@@ -86,13 +86,21 @@ pub fn run_simulation(
     // Key: (EdgeIndex, lane_number), Value: Vec of indices into `vehicles` sorted by edge_progress ascending.
     let mut edge_lane_vehicles: HashMap<(EdgeIndex, u8), Vec<usize>> = HashMap::new();
 
+    // Fixed-step physics accumulator.
+    // Physics always steps by exactly PHYSICS_DT regardless of wall-clock variance.
+    // This eliminates IDM instability caused by OS scheduling jitter.
+    const PHYSICS_DT: f32 = 1.0 / 60.0; // 16.667 ms — never changes
+    let mut physics_accumulator = 0.0f32;
+
     let mut last_tick = Instant::now();
-    log::info!("Simulation loop started");
+    log::info!("Simulation loop started (fixed-step dt = {:.4} s)", PHYSICS_DT);
 
     loop {
-        let now        = Instant::now();
-        let real_dt_s  = now.duration_since(last_tick).as_secs_f32().min(0.1);
-        last_tick      = now;
+        // ── Wall-clock time measurement ──────────────────────────────────────
+        let now          = Instant::now();
+        // Cap at 250 ms to prevent "spiral of death" on very slow machines
+        let real_elapsed = now.duration_since(last_tick).as_secs_f32().min(0.25);
+        last_tick        = now;
 
         // ── Commands ─────────────────────────────────────────────────────────
         loop {
@@ -112,196 +120,217 @@ pub fn run_simulation(
             continue;
         }
 
-        let game_dt_s = clock.tick(real_dt_s);
-        let game_hour = clock.game_hour();
-        let spawn_multiplier = DayCycle::spawn_multiplier(game_hour);
+        physics_accumulator += real_elapsed;
 
-        // ── Traffic lights ────────────────────────────────────────────────────
-        let light_updates = intersections.update(real_dt_s);
-        if !light_updates.is_empty() {
-            let _ = app_handle.emit("light_state_change", &light_updates);
-        }
+        // ── Fixed physics steps ───────────────────────────────────────────────
+        // Each iteration advances the simulation by exactly PHYSICS_DT seconds.
+        while physics_accumulator >= PHYSICS_DT {
+            physics_accumulator -= PHYSICS_DT;
 
-        // ── Tram simulation ───────────────────────────────────────────────────
-        {
-            let guard = graph_lock.read();
-            if let Some(map) = guard.as_ref() {
-                if !tram_sim.is_empty() {
-                    tram_sim.tick(real_dt_s, game_dt_s, &map.tram_data);
-                }
+            let game_dt_s       = clock.tick(PHYSICS_DT);
+            let game_hour       = clock.game_hour();
+            let spawn_multiplier = DayCycle::spawn_multiplier(game_hour);
+
+            // Traffic lights advance by fixed dt
+            let light_updates = intersections.update(PHYSICS_DT);
+            if !light_updates.is_empty() {
+                let _ = app_handle.emit("light_state_change", &light_updates);
             }
-        }
 
-        // ── Spawn vehicles ────────────────────────────────────────────────────
-        {
-            let guard = graph_lock.read();
-            if let Some(map) = guard.as_ref() {
-                let new_vehicles = spawn_system.tick_with_hour(
-                    real_dt_s,
-                    spawn_multiplier,
-                    game_hour,
-                    map,
-                    &od_model,
-                    vehicles.len(),
-                );
-                vehicles.extend(new_vehicles);
-            }
-        }
-
-        // ── Build per-(edge, lane) sorted buckets for O(1) leader lookup ────
-        edge_lane_vehicles.clear();
-        for (i, v) in vehicles.iter().enumerate() {
-            if v.route_pos < v.route.len() {
-                let key = (v.route[v.route_pos], v.current_lane);
-                edge_lane_vehicles.entry(key).or_default().push(i);
-            }
-        }
-        for bucket in edge_lane_vehicles.values_mut() {
-            // Sort ascending by edge_progress: vehicle closest to edge start is first.
-            // Tiebreaker: lower vehicle ID is considered ahead (older = spawned earlier
-            // = had more time to advance). This prevents newly spawned vehicles
-            // from being treated as the leader over vehicles that are actually ahead.
-            bucket.sort_unstable_by(|&a, &b| {
-                vehicles[a].edge_progress
-                    .partial_cmp(&vehicles[b].edge_progress)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| vehicles[a].id.cmp(&vehicles[b].id))
-            });
-        }
-
-        // ── Parallel IDM ─────────────────────────────────────────────────────
-        // Snapshot tram positions once so the parallel IDM can read them.
-        let tram_snapshot: Vec<(f64, f64, f32)> = tram_sim.trams.iter()
-            .map(|t| (t.lat, t.lng, t.speed))
-            .collect();
-
-        let accel_inputs: Vec<f32> = {
-            let guard = graph_lock.read();
-            if let Some(map) = guard.as_ref() {
-                vehicles
-                    .par_iter()
-                    .enumerate()
-                    .map(|(i, v)| {
-                        // Arc-length gap via per-edge sorted bucket
-                        let (gap, delta_v) =
-                            find_leader_arc(i, v, &vehicles, &edge_lane_vehicles, map);
-
-                        // Tram as potential obstacle
-                        let (gap, delta_v) =
-                            apply_tram_leader_effect(v, gap, delta_v, &tram_snapshot);
-
-                        let desired = compute_desired_speed(v, map);
-                        let (gap, delta_v) =
-                            apply_intersection_effect(v, gap, delta_v, &intersections, map);
-
-                        let params = v.driver_profile.params();
-                        let vtype  = v.vehicle_type.params();
-                        idm_acceleration(v.speed, desired, gap, delta_v, &params, &vtype)
-                    })
-                    .collect()
-            } else {
-                vec![0.0; vehicles.len()]
-            }
-        };
-
-        // ── Apply physics ─────────────────────────────────────────────────────
-        {
-            let guard = graph_lock.read();
-            if let Some(map) = guard.as_ref() {
-                for (i, vehicle) in vehicles.iter_mut().enumerate() {
-                    apply_vehicle_physics(
-                        vehicle,
-                        accel_inputs[i],
-                        real_dt_s,
-                        map,
-                        &intersections,
-                        &spawn_system.speed_config,
-                    );
-                }
-            }
-        }
-
-        // ── Lane changes ──────────────────────────────────────────────────────
-        {
-            let guard = graph_lock.read();
-            if let Some(map) = guard.as_ref() {
-                let snapshot: Vec<&Vehicle> = vehicles.iter().collect();
-                let changes: Vec<(u32, u8)> = vehicles
-                    .iter()
-                    .filter_map(|v| {
-                        if v.route_pos >= v.route.len() { return None; }
-                        let edge_idx = v.route[v.route_pos];
-                        let edge = map.graph.edge_weight(edge_idx)?;
-                        let same_edge: Vec<&Vehicle> = snapshot
-                            .iter()
-                            .filter(|o| {
-                                o.route_pos < o.route.len()
-                                    && o.route[o.route_pos] == edge_idx
-                            })
-                            .copied()
-                            .collect();
-                        decide_lane_change(v, edge, &same_edge).map(|lane| (v.id, lane))
-                    })
-                    .collect();
-
-                for (vid, new_lane) in changes {
-                    if let Some(v) = vehicles.iter_mut().find(|v| v.id == vid) {
-                        v.current_lane = new_lane;
-                        v.lane_change_cooldown = 3.0;
+            // Tram simulation
+            {
+                let guard = graph_lock.read();
+                if let Some(map) = guard.as_ref() {
+                    if !tram_sim.is_empty() {
+                        tram_sim.tick(PHYSICS_DT, game_dt_s, &map.tram_data);
                     }
                 }
             }
-        }
 
-        // ── Despawn ───────────────────────────────────────────────────────────
-        vehicles.retain(|v| !v.despawned);
+            // Spawn vehicles — with clearance check at spawn point.
+            // If the first edge already has a vehicle within SPAWN_CLEARANCE_M
+            // of the spawn node, the spawn is skipped (accumulator retries later).
+            {
+                let guard = graph_lock.read();
+                if let Some(map) = guard.as_ref() {
+                    let new_vehicles = spawn_system.tick_with_hour(
+                        PHYSICS_DT,
+                        spawn_multiplier,
+                        game_hour,
+                        map,
+                        &od_model,
+                        vehicles.len(),
+                    );
+                    for nv in new_vehicles {
+                        if let Some(&first_edge) = nv.route.first() {
+                            let edge_len = map.graph.edge_weight(first_edge)
+                                .map(|e| e.length_m)
+                                .unwrap_or(100.0);
+                            // Minimum headway: 2 vehicle lengths + s0
+                            const SPAWN_CLEARANCE_M: f32 = VEHICLE_LENGTH_M * 2.5 + 2.0;
+                            let clearance_t = SPAWN_CLEARANCE_M / edge_len.max(1.0);
+                            let blocked = vehicles.iter().any(|v| {
+                                v.route_pos < v.route.len()
+                                    && v.route[v.route_pos] == first_edge
+                                    && v.current_lane == nv.current_lane
+                                    && v.edge_progress < clearance_t
+                            });
+                            if blocked { continue; } // no room, skip this tick
+                        }
+                        vehicles.push(nv);
+                    }
+                }
+            }
 
-        // ── Check game-over conditions ────────────────────────────────────────
-        if !vehicles.is_empty() {
-            let avg_frustration: f32 =
-                vehicles.iter().map(|v| v.frustration).sum::<f32>() / vehicles.len() as f32;
-            let rage_count = vehicles.iter().filter(|v| v.frustration >= 100.0).count();
-            let mass_rage_fraction = rage_count as f32 / vehicles.len() as f32;
+            // Build per-(edge, lane) sorted buckets for O(1) leader lookup.
+            // Must be rebuilt each physics step so IDM sees up-to-date positions.
+            edge_lane_vehicles.clear();
+            for (i, v) in vehicles.iter().enumerate() {
+                if v.route_pos < v.route.len() {
+                    let key = (v.route[v.route_pos], v.current_lane);
+                    edge_lane_vehicles.entry(key).or_default().push(i);
+                }
+            }
+            for bucket in edge_lane_vehicles.values_mut() {
+                // Sort ascending by edge_progress; tiebreak by ID (lower = older = ahead).
+                bucket.sort_unstable_by(|&a, &b| {
+                    vehicles[a].edge_progress
+                        .partial_cmp(&vehicles[b].edge_progress)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| vehicles[a].id.cmp(&vehicles[b].id))
+                });
+            }
 
-            let cfg = &spawn_system.speed_config.rage;
-            if avg_frustration > cfg.global_loss_threshold {
-                high_frustration_timer += real_dt_s;
-                if high_frustration_timer >= cfg.global_loss_duration_s {
+            // Parallel IDM acceleration computation (read-only, safe to parallelise)
+            let tram_snapshot: Vec<(f64, f64, f32)> = tram_sim.trams.iter()
+                .map(|t| (t.lat, t.lng, t.speed))
+                .collect();
+
+            let accel_inputs: Vec<f32> = {
+                let guard = graph_lock.read();
+                if let Some(map) = guard.as_ref() {
+                    vehicles
+                        .par_iter()
+                        .enumerate()
+                        .map(|(i, v)| {
+                            let (gap, delta_v) =
+                                find_leader_arc(i, v, &vehicles, &edge_lane_vehicles, map);
+                            let (gap, delta_v) =
+                                apply_tram_leader_effect(v, gap, delta_v, &tram_snapshot);
+                            let desired = compute_desired_speed(v, map);
+                            let (gap, delta_v) =
+                                apply_intersection_effect(v, gap, delta_v, &intersections, map);
+                            let params = v.driver_profile.params();
+                            let vtype  = v.vehicle_type.params();
+                            idm_acceleration(v.speed, desired, gap, delta_v, &params, &vtype)
+                        })
+                        .collect()
+                } else {
+                    vec![0.0; vehicles.len()]
+                }
+            };
+
+            // Apply physics — always uses PHYSICS_DT (fixed step)
+            {
+                let guard = graph_lock.read();
+                if let Some(map) = guard.as_ref() {
+                    for (i, vehicle) in vehicles.iter_mut().enumerate() {
+                        apply_vehicle_physics(
+                            vehicle,
+                            accel_inputs[i],
+                            PHYSICS_DT,
+                            map,
+                            &intersections,
+                            &spawn_system.speed_config,
+                        );
+                    }
+                }
+            }
+
+            // Lane changes
+            {
+                let guard = graph_lock.read();
+                if let Some(map) = guard.as_ref() {
+                    let snapshot: Vec<&Vehicle> = vehicles.iter().collect();
+                    let changes: Vec<(u32, u8)> = vehicles
+                        .iter()
+                        .filter_map(|v| {
+                            if v.route_pos >= v.route.len() { return None; }
+                            let edge_idx = v.route[v.route_pos];
+                            let edge = map.graph.edge_weight(edge_idx)?;
+                            let same_edge: Vec<&Vehicle> = snapshot
+                                .iter()
+                                .filter(|o| {
+                                    o.route_pos < o.route.len()
+                                        && o.route[o.route_pos] == edge_idx
+                                })
+                                .copied()
+                                .collect();
+                            decide_lane_change(v, edge, &same_edge).map(|lane| (v.id, lane))
+                        })
+                        .collect();
+
+                    for (vid, new_lane) in changes {
+                        if let Some(v) = vehicles.iter_mut().find(|v| v.id == vid) {
+                            v.current_lane = new_lane;
+                            v.lane_change_cooldown = 3.0;
+                        }
+                    }
+                }
+            }
+
+            // Despawn vehicles that have finished their route
+            vehicles.retain(|v| !v.despawned);
+
+            // Game-over frustration checks (use PHYSICS_DT for consistent timing)
+            if !vehicles.is_empty() {
+                let avg_frustration: f32 =
+                    vehicles.iter().map(|v| v.frustration).sum::<f32>() / vehicles.len() as f32;
+                let rage_count = vehicles.iter().filter(|v| v.frustration >= 100.0).count();
+                let mass_rage_fraction = rage_count as f32 / vehicles.len() as f32;
+
+                let cfg = &spawn_system.speed_config.rage;
+                if avg_frustration > cfg.global_loss_threshold {
+                    high_frustration_timer += PHYSICS_DT;
+                    if high_frustration_timer >= cfg.global_loss_duration_s {
+                        log::warn!(
+                            "GAME OVER: avg frustration {:.1} held for {:.0}s",
+                            avg_frustration, high_frustration_timer
+                        );
+                        let _ = app_handle.emit("game_over", GameOverPayload {
+                            reason: "avg_frustration".to_string(),
+                            value: avg_frustration,
+                            timestamp_game: clock.game_time_s as f32,
+                        });
+                        high_frustration_timer = 0.0;
+                    }
+                } else if mass_rage_fraction >= cfg.mass_rage_fraction {
                     log::warn!(
-                        "GAME OVER: avg frustration {:.1} held for {:.0}s",
-                        avg_frustration, high_frustration_timer
+                        "GAME OVER: mass rage – {:.0}% vehicles at 100 frustration",
+                        mass_rage_fraction * 100.0
                     );
                     let _ = app_handle.emit("game_over", GameOverPayload {
-                        reason: "avg_frustration".to_string(),
-                        value: avg_frustration,
+                        reason: "mass_rage".to_string(),
+                        value: mass_rage_fraction * 100.0,
                         timestamp_game: clock.game_time_s as f32,
                     });
+                } else {
                     high_frustration_timer = 0.0;
                 }
-            } else if mass_rage_fraction >= cfg.mass_rage_fraction {
-                log::warn!(
-                    "GAME OVER: mass rage – {:.0}% vehicles at 100 frustration",
-                    mass_rage_fraction * 100.0
-                );
-                let _ = app_handle.emit("game_over", GameOverPayload {
-                    reason: "mass_rage".to_string(),
-                    value: mass_rage_fraction * 100.0,
-                    timestamp_game: clock.game_time_s as f32,
-                });
-            } else {
-                high_frustration_timer = 0.0;
             }
-        }
+        } // end while physics_accumulator >= PHYSICS_DT
 
-        // ── Serialise and send vehicle frame ─────────────────────────────────
+        // ── Render: serialise once per outer loop iteration ──────────────────
+        // Decoupled from physics steps: the render fires at wall-clock rate
+        // (~60 Hz target) even if physics ran 0 or 2 steps this iteration.
         if !vehicles.is_empty() || !tram_sim.is_empty() {
-            let frame = serialize_vehicles(&vehicles, &tram_sim);
+            let frame   = serialize_vehicles(&vehicles, &tram_sim);
             let encoded = base64::engine::general_purpose::STANDARD.encode(&frame);
             let _ = vehicle_channel.send(encoded);
         }
 
-        // ── Congestion update ─────────────────────────────────────────────────
-        congestion_timer += real_dt_s;
+        // ── Congestion update (real-time interval, not per physics step) ──────
+        congestion_timer += real_elapsed;
         if congestion_timer >= CONGESTION_INTERVAL_S {
             congestion_timer = 0.0;
             let guard = graph_lock.read();
@@ -311,8 +340,8 @@ pub fn run_simulation(
             }
         }
 
-        // ── Sleep to maintain tick rate ───────────────────────────────────────
-        let elapsed = last_tick.elapsed().as_secs_f32();
+        // ── Sleep to target ~60 FPS outer loop ────────────────────────────────
+        let elapsed   = last_tick.elapsed().as_secs_f32();
         let remaining = TARGET_TICK_S - elapsed;
         if remaining > 0.001 {
             std::thread::sleep(Duration::from_secs_f32(remaining));
@@ -473,9 +502,13 @@ fn apply_intersection_effect(
     };
     let intersection_type = &map.graph[tgt_node_idx].intersection_type;
 
-    // ── Traffic light ──────────────────────────────────────────────────────
-    if matches!(intersection_type, IntersectionType::TrafficLight) {
+    // ── Traffic light OR pedestrian crossing ───────────────────────────────
+    if matches!(
+        intersection_type,
+        IntersectionType::TrafficLight | IntersectionType::PedestrianCrossing
+    ) {
         if dist_to_end <= 30.0 && !intersections.can_proceed(tgt_osm_id) {
+            // Treat the stop-line as a stationary obstacle at the node.
             let vgap = dist_to_end.max(0.1);
             let vdv  = vehicle.speed;
             let new_gap = vgap.min(gap);

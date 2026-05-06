@@ -14,7 +14,8 @@ use crate::vehicles::types::VehicleType;
 use crate::vehicles::driver::DriverProfile;
 
 /// Default hard cap on total non-tram vehicles in the simulation.
-const DEFAULT_MAX_VEHICLES: usize = 100;
+/// A conservative start value; the frontend sends SetMaxVehicles to override.
+const DEFAULT_MAX_VEHICLES: usize = 30;
 
 /// Fraction of spawns that are pure-transit (boundary → boundary).
 const TRANSIT_FRACTION: f32 = 0.25;

@@ -30,6 +30,12 @@ impl IntersectionManager {
                 IntersectionType::Yield => {
                     yield_nodes.insert(node.osm_id);
                 }
+                IntersectionType::PedestrianCrossing => {
+                    traffic_lights.insert(
+                        node.osm_id,
+                        TrafficLight::new_pedestrian(node.osm_id),
+                    );
+                }
                 IntersectionType::Plain | IntersectionType::Roundabout => {}
             }
         }

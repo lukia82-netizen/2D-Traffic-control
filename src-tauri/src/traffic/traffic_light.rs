@@ -55,12 +55,22 @@ pub struct TrafficLight {
 }
 
 impl TrafficLight {
+    /// Create a traffic light for a **pedestrian crossing**.
+    /// Shorter cycle: 25 s green for cars → 3 s yellow → 15 s red (green for pedestrians).
+    pub fn new_pedestrian(intersection_id: u64) -> Self {
+        let mut tl = Self::new_with_durations(intersection_id, 25.0, 3.0, 15.0);
+        tl.current_phase = LightPhase::Red; // start with pedestrian phase so cars see it immediately
+        tl.phase_timer   = 0.0;
+        tl
+    }
+
     pub fn new(intersection_id: u64) -> Self {
+        Self::new_with_durations(intersection_id, 30.0, 3.0, 30.0)
+    }
+
+    fn new_with_durations(intersection_id: u64, green_duration: f32, yellow_duration: f32, red_duration: f32) -> Self {
         // Stagger initial phase so not all lights are red simultaneously.
         // Use intersection_id as a deterministic seed (no rand crate needed).
-        let green_duration  = 30.0_f32;
-        let yellow_duration = 3.0_f32;
-        let red_duration    = 30.0_f32;
         let cycle           = green_duration + yellow_duration + red_duration; // 63 s
         // Cheap hash: mix bits of the id
         let seed = intersection_id
