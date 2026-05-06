@@ -1014,6 +1014,21 @@ html, body {
   cursor: not-allowed;
 }
 
+.sbx-bbox-btn {
+  margin-top: 6px;
+  background: rgba(90, 120, 255, 0.2);
+  border-color: rgba(90, 120, 255, 0.45);
+  color: #b8c7ff;
+}
+
+.bbox-picker-overlay {
+  position: absolute;
+  border: 1px dashed #a8c0ff;
+  background: rgba(76, 115, 255, 0.16);
+  pointer-events: none;
+  z-index: 40;
+}
+
 /* Stats */
 .sbx-stat-row {
   display: flex;
