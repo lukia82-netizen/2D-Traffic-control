@@ -27,6 +27,7 @@ import { TrafficLightUI } from './traffic/TrafficLightUI';
 import { TrafficLightRenderer } from './rendering/TrafficLightRenderer';
 import { GameClockUI } from './time/GameClockUI';
 import { SandboxUI, CITY_PRESETS } from './ui/SandboxUI';
+import { MapScenarioEditorUI, type ScenarioData } from './ui/MapScenarioEditorUI';
 import { LESZNO_BBOX } from './map/MapLibreSetup';
 import { ROAD_TYPE_GROUP } from './rendering/RoadRenderer';
 
@@ -143,6 +144,7 @@ export class Game {
 
   // Sandbox mode
   private sandboxUI: SandboxUI | null = null;
+  private mapScenarioEditorUI: MapScenarioEditorUI | null = null;
   private vehiclesVisible = true;
   private currentBbox: [number, number, number, number] = DEFAULT_BBOX;
   /** null = real OSM data; string = sandbox grid type ('mixed'|'one_lane'|'single_road'|…) */
@@ -185,6 +187,8 @@ export class Game {
     if (SANDBOX_MODE) {
       this.sandboxUI = new SandboxUI();
       this.wireSandboxUI();
+      this.mapScenarioEditorUI = new MapScenarioEditorUI();
+      this.wireMapScenarioEditorUI();
     }
 
     if (this.tauriAvailable) {
@@ -282,6 +286,22 @@ export class Game {
     };
   }
 
+  private wireMapScenarioEditorUI(): void {
+    const editor = this.mapScenarioEditorUI;
+    if (!editor) return;
+    editor.onApplyMap = (mapData) => {
+      this.applyCustomMapData(mapData);
+      this.uiRenderer.showNotification('Wczytano mapę z edytora', 'info');
+    };
+    editor.onApplyScenario = (scenario) => {
+      this.applyScenario(scenario);
+      this.uiRenderer.showNotification(`Scenariusz uruchomiony: ${scenario.name}`, 'info');
+    };
+    if (this.mapData) {
+      editor.setMapData(this.mapData);
+    }
+  }
+
   // ─── Map loading ───────────────────────────────────────────────────────────
 
   private async loadMapData(): Promise<void> {
@@ -313,6 +333,7 @@ export class Game {
     }
     this.trafficLightUI.init(this.mapData.nodes);
     this.trafficLightRenderer.init(this.mapData.nodes, this.mapData.edges);
+    this.mapScenarioEditorUI?.setMapData(this.mapData);
   }
 
   // ─── Map reload (sandbox dynamic area) ────────────────────────────────────
@@ -359,8 +380,36 @@ export class Game {
     this.trafficLightUI.setHiddenNodeIds(hiddenNodes);
     this.trafficLightUI.init(this.mapData.nodes);
     this.trafficLightRenderer.init(this.mapData.nodes, this.mapData.edges);
+    this.mapScenarioEditorUI?.setMapData(this.mapData);
 
     this.sandboxUI?.setLoadingDone(cityName, sizeM);
+  }
+
+  private applyCustomMapData(mapData: MapData): void {
+    this.mapData = mapData;
+    this.vehicles.clear();
+    this.gameOver = false;
+    this.roadRenderer.build(mapData);
+    this.infraRenderer.buildStaticLayer(mapData);
+    this.vehicleRenderer.setEdgeIndex(mapData);
+    if (this.overlay.buildings.visible) {
+      this.buildingRenderer.build(mapData);
+    }
+    const hiddenNodes = this.computeHiddenNodeIds();
+    this.trafficLightRenderer.setHiddenNodeIds(hiddenNodes);
+    this.trafficLightUI.setHiddenNodeIds(hiddenNodes);
+    this.trafficLightUI.init(mapData.nodes);
+    this.trafficLightRenderer.init(mapData.nodes, mapData.edges);
+  }
+
+  private applyScenario(scenario: ScenarioData): void {
+    this.applyCustomMapData(scenario.mapData);
+    this.gameTimeS = scenario.startTimeS;
+    this.gameClockUI.updateClock(this.gameTimeS);
+    this.gameClockUI.setTimeScaleValue(scenario.timeScale);
+    if (this.tauriAvailable) {
+      setMaxVehicles(scenario.maxVehicles).catch(console.error);
+    }
   }
 
   // ─── Hidden-node helper ────────────────────────────────────────────────────
@@ -533,6 +582,7 @@ export class Game {
     this.unlistenLights?.();
     this.unlistenGameOver?.();
     this.sandboxUI?.destroy();
+    this.mapScenarioEditorUI?.destroy();
     this.buildingRenderer.destroy();
     this.roadRenderer.destroy();
     this.vehicleRenderer.destroy();
