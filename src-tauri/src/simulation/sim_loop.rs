@@ -16,7 +16,7 @@ use crate::time::game_clock::GameClock;
 use crate::time::day_cycle::DayCycle;
 use crate::traffic::intersection::IntersectionManager;
 use crate::vehicles::vehicle::Vehicle;
-use crate::simulation::idm::idm_acceleration;
+use crate::simulation::idm::{idm_acceleration, idm_debug_snapshot};
 use crate::simulation::spawn::SpawnSystem;
 use crate::simulation::lane_change::{decide_lane_change, compute_vehicle_target_lane};
 use crate::simulation::congestion::compute_congestion;
@@ -29,8 +29,12 @@ const CONGESTION_INTERVAL_S: f32 = 0.5;
 const STOP_LINE_OFFSET_M: f32 = 8.0;
 const MIN_IDM_GAP_M: f32 = 0.1;
 
-/// Physical length of a vehicle subtracted from the gap so IDM sees bumper-to-bumper distance.
-const VEHICLE_LENGTH_M: f32 = 4.5;
+/// Smallest admissible IDM free gap to avoid divide-by-zero and explosive braking.
+const MIN_IDM_GAP_M: f32 = 0.1;
+/// Additional spawn breathing room after bumper gap has been computed.
+const SPAWN_BUFFER_M: f32 = 2.0;
+const DEFAULT_DEBUG_VEHICLE_ID: u32 = 2;
+const DEFAULT_DEBUG_LOG_INTERVAL_S: f32 = 0.5;
 
 /// Only consider cross-traffic IDM within this distance to the node (meters).
 const CROSS_TRAFFIC_MAX_DIST_M: f32 = 70.0;
@@ -61,6 +65,16 @@ pub fn run_simulation(
     vehicle_channel: Channel<String>,
     app_handle: AppHandle,
 ) {
+    let debug_vehicle_id = std::env::var("IDM_DEBUG_ID")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(DEFAULT_DEBUG_VEHICLE_ID);
+    let debug_log_interval_s = std::env::var("IDM_DEBUG_INTERVAL_S")
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .filter(|v| *v > 0.0)
+        .unwrap_or(DEFAULT_DEBUG_LOG_INTERVAL_S);
+
     let mut clock = GameClock::new();
     let mut vehicles: Vec<Vehicle> = Vec::with_capacity(512);
     let mut congestion_timer = 0.0f32;
@@ -180,6 +194,7 @@ pub fn run_simulation(
             let game_dt_s       = clock.tick(PHYSICS_DT);
             let game_hour       = clock.game_hour();
             let spawn_multiplier = DayCycle::spawn_multiplier(game_hour);
+            idm_debug_timer += PHYSICS_DT;
 
             // Traffic lights advance by fixed dt
             let light_updates = intersections.update(PHYSICS_DT);
@@ -216,14 +231,17 @@ pub fn run_simulation(
                             let edge_len = map.graph.edge_weight(first_edge)
                                 .map(|e| e.length_m)
                                 .unwrap_or(100.0);
-                            // Minimum headway: 2 vehicle lengths + s0
-                            const SPAWN_CLEARANCE_M: f32 = VEHICLE_LENGTH_M * 2.5 + 2.0;
-                            let clearance_t = SPAWN_CLEARANCE_M / edge_len.max(1.0);
                             let blocked = vehicles.iter().any(|v| {
+                                let new_len = nv.vehicle_type.params().length_m;
+                                let existing_len = v.vehicle_type.params().length_m;
+                                let center_dist_m = v.edge_progress * edge_len;
+                                let bumper_gap_m =
+                                    center_dist_m - 0.5 * (new_len + existing_len);
+                                let min_spawn_gap_m = new_len.max(existing_len) + SPAWN_BUFFER_M;
                                 v.route_pos < v.route.len()
                                     && v.route[v.route_pos] == first_edge
                                     && v.current_lane == nv.current_lane
-                                    && v.edge_progress < clearance_t
+                                    && bumper_gap_m < min_spawn_gap_m
                             });
                             if blocked { continue; } // no room, skip this tick
                         }
@@ -297,6 +315,45 @@ pub fn run_simulation(
                     vec![0.0; vehicles.len()]
                 }
             };
+
+            if idm_debug_timer >= debug_log_interval_s {
+                let guard = graph_lock.read();
+                if let Some(map) = guard.as_ref() {
+                    if let Some((ego_idx, ego)) = vehicles
+                        .iter()
+                        .enumerate()
+                        .find(|(_, v)| v.id == debug_vehicle_id && !v.despawned)
+                    {
+                        let (base_gap, base_dv) =
+                            find_leader_arc(ego_idx, ego, &vehicles, &edge_lane_vehicles, map);
+                        let (gap, delta_v) =
+                            apply_tram_leader_effect(ego, base_gap, base_dv, &tram_snapshot);
+                        let desired = compute_desired_speed(ego, map);
+                        let (gap, delta_v) =
+                            apply_intersection_effect(ego, gap, delta_v, &intersections, map);
+                        let params = ego.driver_profile.params();
+                        let vtype = ego.vehicle_type.params();
+                        let (s_clamped, s_star, accel_raw, accel_clamped) =
+                            idm_debug_snapshot(ego.speed, desired, gap, delta_v, &params, &vtype);
+                        let s_ratio = s_star / s_clamped;
+                        let leader_speed = (ego.speed - delta_v).max(0.0);
+                        log::info!(
+                            "IDM_DEBUG id={} v={:.2} v0={:.2} v_leader={:.2} dv={:.2} s={:.2} s*={:.2} s_ratio={:.2} accel_raw={:.2} accel={:.2}",
+                            ego.id,
+                            ego.speed,
+                            desired,
+                            leader_speed,
+                            delta_v,
+                            s_clamped,
+                            s_star,
+                            s_ratio,
+                            accel_raw,
+                            accel_clamped,
+                        );
+                    }
+                }
+                idm_debug_timer = 0.0;
+            }
 
             // Apply physics — always uses PHYSICS_DT (fixed step)
             {
@@ -565,9 +622,9 @@ fn find_leader_arc(
         if let Some(pos) = bucket.iter().position(|&idx| idx == ego_idx) {
             if let Some(&leader_idx) = bucket.get(pos + 1) {
                 let leader = &vehicles[leader_idx];
-                let gap = (leader.edge_progress - ego.edge_progress) * ego_edge_len
-                    - VEHICLE_LENGTH_M;
-                return (gap.max(0.01), ego.speed - leader.speed);
+                let center_dist_m = (leader.edge_progress - ego.edge_progress) * ego_edge_len;
+                let gap = bumper_gap(center_dist_m, ego, leader);
+                return (gap.max(MIN_IDM_GAP_M), ego.speed - leader.speed);
             }
         }
     }
@@ -594,8 +651,8 @@ fn find_leader_arc(
                 if let Some(&leader_idx) = bucket.first() {
                     let leader = &vehicles[leader_idx];
                     let leader_from_start = leader.edge_progress * next_edge_len;
-                    let gap = dist_to_end + leader_from_start - VEHICLE_LENGTH_M;
-                    let gap = gap.max(0.01);
+                    let center_dist_m = dist_to_end + leader_from_start;
+                    let gap = bumper_gap(center_dist_m, ego, leader).max(MIN_IDM_GAP_M);
                     if gap < best_gap {
                         best_gap = gap;
                         best_dv  = ego.speed - leader.speed;
@@ -610,6 +667,13 @@ fn find_leader_arc(
     }
 
     (1000.0, 0.0) // free road ahead
+}
+
+#[inline]
+fn bumper_gap(center_dist_m: f32, ego: &Vehicle, leader: &Vehicle) -> f32 {
+    let ego_len = ego.vehicle_type.params().length_m;
+    let leader_len = leader.vehicle_type.params().length_m;
+    center_dist_m - 0.5 * (ego_len + leader_len)
 }
 
 #[inline]
