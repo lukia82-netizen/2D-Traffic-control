@@ -36,11 +36,13 @@ const ZEBRA_STRIPES = 5;
 
 /** One road approach leading into a traffic-light intersection. */
 interface Approach {
-  nodeId: number;   // intersection osm_id (for phase lookup)
+  nodeId: number; // intersection osm_id (for phase lookup)
   fromLat: number; fromLng: number;
-  toLat: number;   toLng: number;
+  toLat: number; toLng: number;
   lanes: number;
   isPedestrian: boolean;
+  /** Matches Rust `JunctionLayout` clockwise inbound sort (bearing = atan2(Δlng, Δlat)). */
+  armIndex: number;
 }
 
 // ─── TrafficLightRenderer ─────────────────────────────────────────────────────
@@ -51,7 +53,7 @@ interface Approach {
  * For each incoming edge at a TrafficLight node:
  *   • A white stop line is drawn perpendicular to the road at ~88 % along the edge.
  *   • A coloured signal head (housing + bulb) is drawn at ~82 %.
- *   • All approaches at the same intersection share the same phase.
+ *   • Vehicle junctions: per-arm bulbs when the backend sends `junctionArmPhases` (opposing greens).
  *
  * Layer: `overlay.trafficLights`.
  */
@@ -67,8 +69,10 @@ export class TrafficLightRenderer {
   /** Precomputed approach list, rebuilt on init. */
   private approaches: Approach[] = [];
 
-  /** Latest known phase (0=Red, 1=Yellow, 2=Green) per intersection id. */
+  /** Latest known coarse phase (0=Red, 1=Yellow, 2=Green) per intersection id. */
   private lightPhases: Map<number, number> = new Map();
+  /** Per-arm phases when the backend sends [`junctionArmPhases`]; `null` = use `lightPhases` only. */
+  private junctionArmSignals: Map<number, number[] | null> = new Map();
 
   /**
    * Graphics objects per intersection id.
@@ -102,21 +106,79 @@ export class TrafficLightRenderer {
     // Build node lookup for quick position access
     const nodeMap = new Map(nodes.map((n) => [n.id, n]));
 
-    // An "approach" is every edge whose target is a TL node.
-    this.approaches = [];
+    type RawAp = {
+      fromN: number;
+      toN: number;
+      nodeId: number;
+      fromLat: number;
+      fromLng: number;
+      toLat: number;
+      toLng: number;
+      lanes: number;
+      isPedestrian: boolean;
+    };
+
+    /** Match Rust phased layout: atan2(deltaLng, deltaLat) clocksorted. */
+    const bearingIn = (
+      fl: number,
+      flg: number,
+      tl: number,
+      tlg: number,
+    ): number => Math.atan2(tlg - flg, tl - fl);
+
+    const raw: RawAp[] = [];
     for (const edge of edges) {
       if (!this.lightNodeIds.has(edge.to)) continue;
       const fromNode = nodeMap.get(edge.from);
-      const toNode   = nodeMap.get(edge.to);
+      const toNode = nodeMap.get(edge.to);
       if (!fromNode || !toNode) continue;
-      this.approaches.push({
-        nodeId:      edge.to,
-        fromLat:     fromNode.lat, fromLng: fromNode.lng,
-        toLat:       toNode.lat,   toLng:   toNode.lng,
-        lanes:       edge.lanes,
+      raw.push({
+        fromN: edge.from,
+        toN: edge.to,
+        nodeId: edge.to,
+        fromLat: fromNode.lat,
+        fromLng: fromNode.lng,
+        toLat: toNode.lat,
+        toLng: toNode.lng,
+        lanes: edge.lanes,
         isPedestrian: this.pedestrianNodeIds.has(edge.to),
       });
     }
+
+    const byDest = new Map<number, RawAp[]>();
+    for (const r of raw) {
+      const list = byDest.get(r.nodeId) ?? [];
+      list.push(r);
+      byDest.set(r.nodeId, list);
+    }
+
+    // Per intersection: sort inbound arms clockwise (same rule as Rust `JunctionLayout`).
+    this.approaches = [];
+    for (const [, group] of byDest) {
+      group.sort((a, b) => {
+        const ba = bearingIn(a.fromLat, a.fromLng, a.toLat, a.toLng);
+        const bb = bearingIn(b.fromLat, b.fromLng, b.toLat, b.toLng);
+        const dba = ba - bb;
+        if (Math.abs(dba) > 1e-9) return dba;
+        return a.fromN - b.fromN || a.toN - b.toN;
+      });
+
+      group.forEach((r, armIndex) => {
+        this.approaches.push({
+          nodeId: r.nodeId,
+          fromLat: r.fromLat,
+          fromLng: r.fromLng,
+          toLat: r.toLat,
+          toLng: r.toLng,
+          lanes: r.lanes,
+          isPedestrian: r.isPedestrian,
+          armIndex,
+        });
+      });
+    }
+
+    // Deterministic traversal for graphics list index ↔ approach order.
+    this.approaches.sort((a, b) => a.nodeId - b.nodeId || a.armIndex - b.armIndex);
 
     this.rebuild();
   }
@@ -125,23 +187,39 @@ export class TrafficLightRenderer {
   updateStates(updates: LightStateUpdate[]): void {
     for (const upd of updates) {
       this.lightPhases.set(upd.intersectionId, upd.phase);
+      this.junctionArmSignals.set(
+        upd.intersectionId,
+        upd.junctionArmPhases !== undefined ? upd.junctionArmPhases : null,
+      );
+
       const gfxList = this.spritesByNode.get(upd.intersectionId);
       if (!gfxList) continue;
 
-      const zoom  = this.map.getZoom();
+      const zoom = this.map.getZoom();
       const scale = this.scaleForZoom(zoom);
       const hr = HOUSING_R_REF * scale;
       const br = BULB_R_REF * scale;
 
-      const isPed = this.pedestrianNodeIds.has(upd.intersectionId);
-      if (isPed && gfxList.length >= 2) {
-        // index 0 = car signal, index 1 = pedestrian signal
-        this.redrawSignalHead(gfxList[0], hr, br, upd.phase);
-        const pedPhase = upd.phase === 2 ? 0 : (upd.phase === 0 ? 2 : 1);
-        this.redrawPedestrianSignal(gfxList[1], hr * 1.2, br * 1.2, pedPhase);
-      } else {
-        for (const gfx of gfxList) {
-          this.redrawSignalHead(gfx, hr, br, upd.phase);
+      const armSignals = this.junctionArmSignals.get(upd.intersectionId);
+      let gfxPos = 0;
+      for (const ap of this.approaches) {
+        if (ap.nodeId !== upd.intersectionId) continue;
+
+        if (ap.isPedestrian) {
+          if (gfxPos + 1 >= gfxList.length) break;
+          const carPhase = upd.phase;
+          this.redrawSignalHead(gfxList[gfxPos], hr, br, carPhase);
+          const pedPhase = carPhase === 2 ? 0 : carPhase === 0 ? 2 : 1;
+          this.redrawPedestrianSignal(gfxList[gfxPos + 1], hr * 1.2, br * 1.2, pedPhase);
+          gfxPos += 2;
+        } else {
+          if (gfxPos >= gfxList.length) break;
+          const bulbPhase =
+            armSignals && armSignals[ap.armIndex] !== undefined
+              ? armSignals[ap.armIndex]!
+              : upd.phase;
+          this.redrawSignalHead(gfxList[gfxPos], hr, br, bulbPhase);
+          gfxPos += 1;
         }
       }
     }
@@ -177,7 +255,11 @@ export class TrafficLightRenderer {
     for (const ap of this.approaches) {
       if (this.hiddenNodeIds.has(ap.nodeId)) continue;
 
-      const phase = this.lightPhases.get(ap.nodeId) ?? 0;
+      const arms = this.junctionArmSignals.get(ap.nodeId);
+      const phase =
+        !ap.isPedestrian && arms && arms[ap.armIndex] !== undefined
+          ? arms[ap.armIndex]!
+          : (this.lightPhases.get(ap.nodeId) ?? 0);
 
       // Project from/to
       const from = projectPoint(this.map, ap.fromLng, ap.fromLat);

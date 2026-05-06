@@ -476,7 +476,20 @@ html, body {
 #light-manual-controls {
   display: flex;
   flex-direction: column;
+  gap: 8px;
+}
+
+#light-manual-controls .manual-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
   gap: 6px;
+}
+
+#light-manual-controls .manual-hint {
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.5);
+  min-width: 9em;
 }
 
 #light-manual-controls.hidden {

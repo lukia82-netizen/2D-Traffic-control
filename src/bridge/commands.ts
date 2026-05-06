@@ -164,9 +164,16 @@ export async function setTrafficLightMode(
   return invoke<void>('set_traffic_light_mode', { intersectionId, mode: rustMode });
 }
 
+/** Manual “next step” for multi-phase vehicle junctions (must match Rust `TL_CMD_ADVANCE_STEP`). */
+export const TRAFFIC_LIGHT_PHASE_ADVANCE_PROGRAM = 250;
+
 /**
- * Force a specific phase for a traffic light (used in Manual mode).
- * phase: 0 = Red, 1 = Yellow, 2 = Green
+ * Manual traffic-light command.
+ *
+ * Pedestrian crossings: 0=R, 1=Y, 2=G for the car-facing lamp.
+ *
+ * Signalised intersections (movement programs): advance to the **next timed step**
+ * (green → yellow → all-red cycle, etc.) with `phase = TRAFFIC_LIGHT_PHASE_ADVANCE_PROGRAM` (250).
  */
 export async function setTrafficLightPhase(
   intersectionId: number,

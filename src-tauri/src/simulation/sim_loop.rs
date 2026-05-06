@@ -472,7 +472,8 @@ fn stop_line_debug(
     const STOP_LINE_OFFSET_M: f32 = 8.0;
     let dist_to_end = edge.length_m * (1.0 - vehicle.edge_progress);
     let dist_to_stop_line = (dist_to_end - STOP_LINE_OFFSET_M).max(0.0);
-    let red_blocking = !intersections.can_vehicle_proceed(tgt_osm_id, vehicle.has_stopped_at_stop_sign);
+    let red_blocking =
+        !intersections.can_vehicle_proceed(tgt_osm_id, vehicle.has_stopped_at_stop_sign, vehicle, map);
     Some((dist_to_stop_line, red_blocking))
 }
 
@@ -672,7 +673,12 @@ fn apply_intersection_effect(
         // This makes red lights visible to IDM early enough on longer approaches.
         let braking_lookahead_m = (vehicle.speed * vehicle.speed) / (2.0 * 3.5) + 15.0;
         if dist_to_stop_line <= braking_lookahead_m.max(25.0)
-            && !intersections.can_vehicle_proceed(tgt_osm_id, vehicle.has_stopped_at_stop_sign)
+            && !intersections.can_vehicle_proceed(
+                tgt_osm_id,
+                vehicle.has_stopped_at_stop_sign,
+                vehicle,
+                map,
+            )
         {
             // Virtual leader: standing at stop line.
             let vgap = dist_to_stop_line;
@@ -837,7 +843,7 @@ fn apply_cross_traffic_leader_effect(
     }
 
     let tgt_osm_id = map.graph[tgt_node].osm_id;
-    if !intersections.can_vehicle_proceed(tgt_osm_id, ego.has_stopped_at_stop_sign) {
+    if !intersections.can_vehicle_proceed(tgt_osm_id, ego.has_stopped_at_stop_sign, ego, map) {
         return (gap, delta_v);
     }
 
@@ -883,7 +889,12 @@ fn apply_cross_traffic_leader_effect(
         if !edges_are_conflicting_approaches(map, ego_edge, other_edge, tgt_node) {
             continue;
         }
-        if !intersections.can_vehicle_proceed(tgt_osm_id, other.has_stopped_at_stop_sign) {
+        if !intersections.can_vehicle_proceed(
+            tgt_osm_id,
+            other.has_stopped_at_stop_sign,
+            other,
+            map,
+        ) {
             continue;
         }
 
@@ -1042,7 +1053,12 @@ fn apply_vehicle_physics(
         let tgt_osm_id = map.graph[tgt].osm_id;
         let itype = &map.graph[tgt].intersection_type;
         if matches!(itype, IntersectionType::TrafficLight | IntersectionType::PedestrianCrossing)
-            && !intersections.can_vehicle_proceed(tgt_osm_id, vehicle.has_stopped_at_stop_sign)
+            && !intersections.can_vehicle_proceed(
+                tgt_osm_id,
+                vehicle.has_stopped_at_stop_sign,
+                vehicle,
+                map,
+            )
         {
             const STOP_LINE_OFFSET_M: f32 = 8.0;
             let stop_t = (1.0 - STOP_LINE_OFFSET_M / edge_len.max(1.0)).clamp(0.0, 1.0);

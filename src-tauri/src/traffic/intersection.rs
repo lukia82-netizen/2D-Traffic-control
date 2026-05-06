@@ -1,7 +1,12 @@
 use std::collections::{HashMap, HashSet};
+
+use petgraph::visit::IntoNodeIdentifiers;
+
+use crate::map::road_network::{IntersectionType, MapData, RoadGraph};
 use crate::state::LightControlMode;
-use crate::traffic::traffic_light::{TrafficLight, LightPhase, LightStateUpdate};
-use crate::map::road_network::{RoadGraph, IntersectionType};
+use crate::traffic::phased_traffic_light::JunctionLayout;
+use crate::traffic::traffic_light::{LightStateUpdate, TrafficLight};
+use crate::vehicles::vehicle::Vehicle;
 
 pub struct IntersectionManager {
     pub traffic_lights: HashMap<u64, TrafficLight>,
@@ -9,6 +14,7 @@ pub struct IntersectionManager {
     pub stop_nodes: HashSet<u64>,
     /// OSM node IDs that carry a yield/give-way sign.
     pub yield_nodes: HashSet<u64>,
+    last_light_broadcast_sig: HashMap<u64, u64>,
 }
 
 impl IntersectionManager {
@@ -22,7 +28,14 @@ impl IntersectionManager {
             let node = &graph[node_idx];
             match node.intersection_type {
                 IntersectionType::TrafficLight => {
-                    traffic_lights.insert(node.osm_id, TrafficLight::new(node.osm_id));
+                    if let Some(layout) = JunctionLayout::build(graph, node_idx) {
+                        if !layout.arms.is_empty() {
+                            traffic_lights.insert(
+                                node.osm_id,
+                                TrafficLight::new_vehicle_multiphase(node.osm_id, layout),
+                            );
+                        }
+                    }
                 }
                 IntersectionType::Stop => {
                     stop_nodes.insert(node.osm_id);
@@ -40,17 +53,25 @@ impl IntersectionManager {
             }
         }
 
-        IntersectionManager { traffic_lights, stop_nodes, yield_nodes }
+        IntersectionManager {
+            traffic_lights,
+            stop_nodes,
+            yield_nodes,
+            last_light_broadcast_sig: HashMap::new(),
+        }
     }
 
-    /// Advance all traffic lights and collect phase-change events.
+    /// Advance all traffic lights and collect state broadcasts when timers or bulbs change.
     pub fn update(&mut self, dt_real_s: f32) -> Vec<LightStateUpdate> {
-        let mut updates = Vec::new();
-
         for tl in self.traffic_lights.values_mut() {
-            let phase_before = tl.current_phase;
             tl.update(dt_real_s);
-            if tl.current_phase != phase_before {
+        }
+
+        let mut updates = Vec::new();
+        for (id, tl) in self.traffic_lights.iter() {
+            let sig = tl.broadcast_signature();
+            if self.last_light_broadcast_sig.get(id).copied() != Some(sig) {
+                self.last_light_broadcast_sig.insert(*id, sig);
                 updates.push(tl.to_state_update());
             }
         }
@@ -58,36 +79,24 @@ impl IntersectionManager {
         updates
     }
 
-    /// Returns `true` if there is no controlling signal at `intersection_id`
-    /// (plain node or roundabout) or the traffic light is currently green.
-    ///
-    /// **Stop signs and yield signs require per-vehicle state – use
-    /// `can_vehicle_proceed` instead.**
-    pub fn can_proceed(&self, intersection_id: u64) -> bool {
-        if let Some(tl) = self.traffic_lights.get(&intersection_id) {
-            return tl.is_green();
-        }
-        true
-    }
-
     /// Vehicle-aware right-of-way check.
     ///
-    /// * **Traffic light** – blocked unless the light is green.
-    /// * **Stop sign** – blocked until the vehicle has come to a full stop at the
-    ///   sign (tracked via `vehicle_has_stopped_at_sign`).
-    /// * **Yield sign** – never hard-blocked; IDM naturally slows vehicles when
-    ///   crossing traffic is nearby (handled in `apply_intersection_effect`).
+    /// * **Traffic light** – lane / movement-aware (vehicle junctions share opposing greens across arms).
+    /// * **Stop sign** – blocked until fully stopped (`vehicle_has_stopped_at_stop_sign`).
+    /// * **Yield sign** – always `true` (yield handled in simulation).
     /// * **Plain / Roundabout** – always `true`.
     pub fn can_vehicle_proceed(
         &self,
         osm_id: u64,
-        vehicle_has_stopped_at_sign: bool,
+        vehicle_has_stopped_at_stop_sign: bool,
+        vehicle: &Vehicle,
+        map: &MapData,
     ) -> bool {
         if let Some(tl) = self.traffic_lights.get(&osm_id) {
-            return tl.is_green();
+            return tl.allows_vehicle(vehicle, map);
         }
         if self.stop_nodes.contains(&osm_id) {
-            return vehicle_has_stopped_at_sign;
+            return vehicle_has_stopped_at_stop_sign;
         }
         true
     }
@@ -110,7 +119,7 @@ impl IntersectionManager {
 
     pub fn set_phase(&mut self, intersection_id: u64, phase_byte: u8) {
         if let Some(tl) = self.traffic_lights.get_mut(&intersection_id) {
-            tl.force_phase(LightPhase::from_u8(phase_byte));
+            tl.force_phase_cmd(phase_byte);
         }
     }
 
@@ -123,14 +132,13 @@ impl IntersectionManager {
     /// Update queue count for adaptive mode (called from congestion monitor).
     pub fn update_queue(&mut self, intersection_id: u64, count: u32) {
         if let Some(tl) = self.traffic_lights.get_mut(&intersection_id) {
-            tl.queue_count = count;
+            if let Some(q) = tl.queue_count_mut() {
+                *q = count;
+            }
         }
     }
 
     pub fn all_state_updates(&self) -> Vec<LightStateUpdate> {
-        self.traffic_lights
-            .values()
-            .map(|tl| tl.to_state_update())
-            .collect()
+        self.traffic_lights.values().map(TrafficLight::to_state_update).collect()
     }
 }
