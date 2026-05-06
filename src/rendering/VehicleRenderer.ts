@@ -136,8 +136,8 @@ export class VehicleRenderer {
       const color = DOT_COLORS[typeId] ?? 0x4488ff;
       const px = this.map.project([v.lng, v.lat]);
 
-      // Right-hand traffic offset (small at dot scale, but keeps roads clean)
-      const offsetPx = Math.max(1, radius * 0.8);
+      // Right-hand traffic offset — keep dots in their lane
+      const offsetPx = this.camera.getLaneOffset();
       const cx = px.x + (-Math.sin(v.angle)) * offsetPx;
       const cy = px.y + ( Math.cos(v.angle)) * offsetPx;
 
@@ -188,9 +188,10 @@ export class VehicleRenderer {
         }
       }
 
-      // Right-hand traffic: offset vehicle to the right of its heading direction
-      // so vehicles on opposite sides of the same road don't overlap.
-      const laneOffset = Math.max(2, dims.w * spriteScale * 0.6);
+      // Right-hand traffic: offset vehicle to the right of its heading direction.
+      // getLaneOffset() returns the pixel distance from road center to the right
+      // lane center at the current zoom, matching RoadRenderer's lane halfPx.
+      const laneOffset = this.camera.getLaneOffset();
       const offsetX = -Math.sin(v.angle) * laneOffset;
       const offsetY =  Math.cos(v.angle) * laneOffset;
 

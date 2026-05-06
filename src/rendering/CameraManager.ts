@@ -121,6 +121,16 @@ export class CameraManager {
   }
 
   /**
+   * Returns the pixel offset from road centerline to the center of the right
+   * lane at the current zoom.  Matches the halfPx=9 residential road standard
+   * used in RoadRenderer so cars sit visually inside their lane.
+   */
+  getLaneOffset(): number {
+    // halfPx=9 is the residential reference; half of that is one lane center
+    return Math.max(4, 9 * Math.pow(2, this.zoom - 16));
+  }
+
+  /**
    * Returns pixel spacing between oneway arrows (larger gap at high zoom).
    */
   getArrowSpacing(): number {
