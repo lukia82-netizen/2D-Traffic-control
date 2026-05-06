@@ -1,37 +1,79 @@
+use rand::Rng;
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{SeedableRng};
+use rand_distr::{Normal, Distribution};
 use petgraph::graph::NodeIndex;
 
 use crate::map::road_network::MapData;
+use crate::simulation::od_model::{OdModel, TripKind};
+use crate::simulation::pathfinding::{find_path, random_destination, REF_SPEED_MS};
+use crate::simulation::speed_config::SpeedConfig;
+use crate::simulation::lane_change::compute_vehicle_target_lane;
 use crate::vehicles::vehicle::Vehicle;
 use crate::vehicles::types::VehicleType;
 use crate::vehicles::driver::DriverProfile;
-use crate::simulation::pathfinding::{find_path, random_destination};
+
+/// Default hard cap on total non-tram vehicles in the simulation.
+/// A conservative start value; the frontend sends SetMaxVehicles to override.
+const DEFAULT_MAX_VEHICLES: usize = 30;
+
+/// Fraction of spawns that are pure-transit (boundary → boundary).
+const TRANSIT_FRACTION: f32 = 0.25;
+/// Fraction of spawns that are external in/out (boundary ↔ building).
+const EXTERNAL_FRACTION: f32 = 0.15;
+// Remaining 0.60 are local OD between buildings.
 
 pub struct SpawnSystem {
     pub spawn_points: Vec<NodeIndex>,
+    pub boundary_nodes: Vec<NodeIndex>,
     /// Vehicles per real second at spawn multiplier = 1.0
     pub base_rate: f32,
     /// Fractional vehicle accumulator
     pub accumulator: f32,
     pub rng: StdRng,
     pub next_id: u32,
+    pub speed_config: SpeedConfig,
+    /// Hard cap on total non-tram vehicles (configurable at runtime)
+    pub max_vehicles: usize,
+    /// When true, always spawn `Car` (one size for sandbox/demo maps).
+    pub sandbox_mode: bool,
 }
 
 impl SpawnSystem {
-    pub fn new(spawn_points: Vec<NodeIndex>) -> Self {
+    pub fn new(
+        spawn_points: Vec<NodeIndex>,
+        boundary_nodes: Vec<NodeIndex>,
+        speed_config: SpeedConfig,
+        sandbox_mode: bool,
+    ) -> Self {
         SpawnSystem {
             spawn_points,
-            base_rate: 2.0, // vehicles/real_second at multiplier=1.0
+            boundary_nodes,
+            base_rate: 1.0,
             accumulator: 0.0,
             rng: StdRng::from_entropy(),
             next_id: 1,
+            speed_config,
+            max_vehicles: DEFAULT_MAX_VEHICLES,
+            sandbox_mode,
         }
     }
 
-    /// Tick the spawn system and return any new vehicles to add this frame.
-    pub fn tick(&mut self, dt_real_s: f32, multiplier: f32, map: &MapData) -> Vec<Vehicle> {
-        if self.spawn_points.is_empty() {
+    /// Update the speed config (called when `SimCommand::SetSpeedConfig` arrives).
+    pub fn set_speed_config(&mut self, cfg: SpeedConfig) {
+        self.speed_config = cfg;
+    }
+
+    /// Tick the spawn system and return any new vehicles for this frame.
+    pub fn tick(
+        &mut self,
+        dt_real_s: f32,
+        multiplier: f32,
+        map: &MapData,
+        od_model: &OdModel,
+        current_vehicle_count: usize,
+    ) -> Vec<Vehicle> {
+        if current_vehicle_count >= self.max_vehicles {
             return Vec::new();
         }
 
@@ -39,74 +81,284 @@ impl SpawnSystem {
         let to_spawn = self.accumulator.floor() as u32;
         self.accumulator -= to_spawn as f32;
 
+        let cap = (self.max_vehicles - current_vehicle_count) as u32;
+        let to_spawn = to_spawn.min(cap);
+
         let mut new_vehicles = Vec::with_capacity(to_spawn as usize);
 
         for _ in 0..to_spawn {
-            if let Some(vehicle) = self.spawn_one(map) {
-                new_vehicles.push(vehicle);
+            if let Some(v) = self.spawn_one(map, od_model) {
+                new_vehicles.push(v);
             }
         }
 
         new_vehicles
     }
 
-    fn spawn_one(&mut self, map: &MapData) -> Option<Vehicle> {
-        let spawn_count = self.spawn_points.len();
-        let spawn_idx = self.rng.gen_range(0..spawn_count);
-        let from = self.spawn_points[spawn_idx];
+    fn spawn_one(&mut self, map: &MapData, od_model: &OdModel) -> Option<Vehicle> {
+        let driver_profile = self.random_driver_profile();
+        let vehicle_type   = self.random_vehicle_type();
 
-        let to = random_destination(&map.graph, from, &mut self.rng);
-        if to == from {
+        // Sample personal_compliance and route_alpha from speed_config
+        let personal_compliance = sample_compliance(driver_profile, &self.speed_config, &mut self.rng);
+        let route_alpha         = sample_route_alpha(driver_profile, &self.speed_config, &mut self.rng);
+
+        // Decide spawn strategy
+        let roll: f32 = self.rng.gen();
+        let (from, to, trip_kind) = if roll < TRANSIT_FRACTION {
+            // Pure transit: boundary → boundary
+            self.transit_od(map)?
+        } else if roll < TRANSIT_FRACTION + EXTERNAL_FRACTION {
+            // External: boundary ↔ building
+            self.external_od(map, od_model)?
+        } else {
+            // Local OD from OD model
+            if od_model.is_empty() {
+                // Fall back to random if no buildings
+                self.random_od(map)?
+            } else {
+                let game_hour = 8.0f32; // Will be overridden by caller; default to morning rush
+                od_model.generate_od_pair(game_hour, &mut self.rng)
+                    .or_else(|| self.random_od(map))?
+            }
+        };
+
+        if from == to {
             return None;
         }
 
-        let route = find_path(&map.graph, from, to)?;
+        let route = find_path(&map.graph, from, to, route_alpha, REF_SPEED_MS)?;
         if route.is_empty() {
             return None;
         }
 
-        let node = &map.graph[from];
-        let vehicle_type = self.random_vehicle_type();
-        let driver_profile = self.random_driver_profile();
-
-        let id = self.next_id;
+        let node  = &map.graph[from];
+        let id    = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
 
-        Some(Vehicle::new(
+        let mut vehicle = Vehicle::new(
             id,
             node.lat,
             node.lng,
             vehicle_type,
             driver_profile,
             route,
-        ))
+            personal_compliance,
+            route_alpha,
+            trip_kind as u8,
+        );
+        // Set the initial target lane based on the first planned turn.
+        let initial_target = compute_vehicle_target_lane(&vehicle, map);
+        vehicle.target_lane  = initial_target;
+        vehicle.current_lane = initial_target;
+        vehicle.current_lateral_offset = initial_target as f32;
+        vehicle.target_lateral_offset  = initial_target as f32;
+
+        // Give new vehicles a tiny initial speed so they are not all stuck
+        // at edge_progress=0.0 simultaneously.  This ensures a non-zero gap
+        // in the IDM leader bucket from the very first frame.
+        vehicle.speed = 2.0; // 2 m/s ≈ 7 km/h — slow start
+
+        Some(vehicle)
     }
 
-    fn random_vehicle_type(&mut self) -> VehicleType {
-        // 70% Car, 15% Van, 10% Bus, 5% Truck
-        let roll: f32 = self.rng.gen();
-        if roll < 0.70 {
-            VehicleType::Car
-        } else if roll < 0.85 {
-            VehicleType::Van
-        } else if roll < 0.95 {
-            VehicleType::Bus
-        } else {
-            VehicleType::Truck
+    /// Tick with explicit game hour for OD model trip-type selection.
+    pub fn tick_with_hour(
+        &mut self,
+        dt_real_s: f32,
+        multiplier: f32,
+        game_hour: f32,
+        map: &MapData,
+        od_model: &OdModel,
+        current_vehicle_count: usize,
+    ) -> Vec<Vehicle> {
+        if current_vehicle_count >= self.max_vehicles {
+            return Vec::new();
         }
+
+        self.accumulator += self.base_rate * multiplier * dt_real_s;
+        let to_spawn = self.accumulator.floor() as u32;
+        self.accumulator -= to_spawn as f32;
+
+        let cap = (self.max_vehicles - current_vehicle_count) as u32;
+        let to_spawn = to_spawn.min(cap);
+
+        let mut new_vehicles = Vec::with_capacity(to_spawn as usize);
+
+        for _ in 0..to_spawn {
+            if let Some(v) = self.spawn_one_with_hour(map, od_model, game_hour) {
+                new_vehicles.push(v);
+            }
+        }
+
+        new_vehicles
+    }
+
+    fn spawn_one_with_hour(
+        &mut self,
+        map: &MapData,
+        od_model: &OdModel,
+        game_hour: f32,
+    ) -> Option<Vehicle> {
+        let driver_profile     = self.random_driver_profile();
+        let vehicle_type       = self.random_vehicle_type();
+        let personal_compliance = sample_compliance(driver_profile, &self.speed_config, &mut self.rng);
+        let route_alpha         = sample_route_alpha(driver_profile, &self.speed_config, &mut self.rng);
+
+        let roll: f32 = self.rng.gen();
+        let (from, to, trip_kind) = if roll < TRANSIT_FRACTION {
+            self.transit_od(map)?
+        } else if roll < TRANSIT_FRACTION + EXTERNAL_FRACTION {
+            self.external_od(map, od_model)?
+        } else if !od_model.is_empty() {
+            od_model
+                .generate_od_pair(game_hour, &mut self.rng)
+                .or_else(|| self.random_od(map))?
+        } else {
+            self.random_od(map)?
+        };
+
+        if from == to {
+            return None;
+        }
+
+        let route = find_path(&map.graph, from, to, route_alpha, REF_SPEED_MS)?;
+        if route.is_empty() {
+            return None;
+        }
+
+        let node = &map.graph[from];
+        let id   = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+
+        let mut vehicle = Vehicle::new(
+            id,
+            node.lat,
+            node.lng,
+            vehicle_type,
+            driver_profile,
+            route,
+            personal_compliance,
+            route_alpha,
+            trip_kind as u8,
+        );
+        let initial_target = compute_vehicle_target_lane(&vehicle, map);
+        vehicle.target_lane  = initial_target;
+        vehicle.current_lane = initial_target;
+        vehicle.current_lateral_offset = initial_target as f32;
+        vehicle.target_lateral_offset  = initial_target as f32;
+        vehicle.speed = 2.0; // slow start — prevents all spawned cars sharing edge_progress=0
+
+        Some(vehicle)
+    }
+
+    // ── OD strategies ─────────────────────────────────────────────────────────
+
+    fn transit_od(&mut self, map: &MapData) -> Option<(NodeIndex, NodeIndex, TripKind)> {
+        if self.boundary_nodes.len() < 2 {
+            return self.random_od(map).map(|(f, t, _)| (f, t, TripKind::Transit));
+        }
+        let n = self.boundary_nodes.len();
+        let fi = self.rng.gen_range(0..n);
+        let mut ti = self.rng.gen_range(0..n);
+        if ti == fi { ti = (ti + 1) % n; }
+        Some((self.boundary_nodes[fi], self.boundary_nodes[ti], TripKind::Transit))
+    }
+
+    fn external_od(
+        &mut self,
+        map: &MapData,
+        od_model: &OdModel,
+    ) -> Option<(NodeIndex, NodeIndex, TripKind)> {
+        if self.boundary_nodes.is_empty() {
+            return self.random_od(map).map(|(f, t, _)| (f, t, TripKind::ExternalInbound));
+        }
+        let boundary_idx = self.boundary_nodes[self.rng.gen_range(0..self.boundary_nodes.len())];
+
+        if !od_model.is_empty() && self.rng.gen_bool(0.5) {
+            // Inbound: boundary → building
+            let building_node = od_model
+                .buildings
+                .iter()
+                .filter(|b| b.access_node.is_some())
+                .nth(self.rng.gen_range(0..od_model.buildings.len().max(1)))
+                .and_then(|b| b.access_node)?;
+            Some((boundary_idx, building_node, TripKind::ExternalInbound))
+        } else {
+            // Outbound: building → boundary  (or random → boundary when no OD model)
+            let origin = if !od_model.is_empty() {
+                od_model
+                    .buildings
+                    .iter()
+                    .filter(|b| b.access_node.is_some())
+                    .nth(self.rng.gen_range(0..od_model.buildings.len().max(1)))
+                    .and_then(|b| b.access_node)
+                    .unwrap_or(boundary_idx)
+            } else {
+                let n = self.spawn_points.len();
+                if n == 0 { return None; }
+                self.spawn_points[self.rng.gen_range(0..n)]
+            };
+            Some((origin, boundary_idx, TripKind::ExternalOutbound))
+        }
+    }
+
+    fn random_od(&mut self, map: &MapData) -> Option<(NodeIndex, NodeIndex, TripKind)> {
+        if self.spawn_points.is_empty() {
+            return None;
+        }
+        let n = self.spawn_points.len();
+        let from = self.spawn_points[self.rng.gen_range(0..n)];
+        let to   = random_destination(&map.graph, from, &mut self.rng);
+        if from == to { return None; }
+        Some((from, to, TripKind::LocalOD))
+    }
+
+    // ── Randomisers ───────────────────────────────────────────────────────────
+
+    fn random_vehicle_type(&mut self) -> VehicleType {
+        if self.sandbox_mode {
+            return VehicleType::Car;
+        }
+        let roll: f32 = self.rng.gen();
+        if roll < 0.70      { VehicleType::Car   }
+        else if roll < 0.85 { VehicleType::Van   }
+        else if roll < 0.95 { VehicleType::Bus   }
+        else                { VehicleType::Truck }
     }
 
     fn random_driver_profile(&mut self) -> DriverProfile {
-        // 70% Normal, 15% Sunday, 10% Pirat, 5% Cautious
         let roll: f32 = self.rng.gen();
-        if roll < 0.70 {
-            DriverProfile::Normal
-        } else if roll < 0.85 {
-            DriverProfile::Sunday
-        } else if roll < 0.95 {
-            DriverProfile::Pirat
-        } else {
-            DriverProfile::Cautious
-        }
+        if roll < 0.70      { DriverProfile::Normal   }
+        else if roll < 0.85 { DriverProfile::Sunday   }
+        else if roll < 0.95 { DriverProfile::Pirat    }
+        else                { DriverProfile::Cautious }
     }
+}
+
+// ── Sampling helpers ─────────────────────────────────────────────────────────
+
+/// Sample a personal compliance multiplier for `profile` from `SpeedConfig`.
+pub fn sample_compliance(
+    profile: DriverProfile,
+    config: &SpeedConfig,
+    rng: &mut impl Rng,
+) -> f32 {
+    let range  = config.compliance_for(profile);
+    let normal = Normal::new(0.0f32, config.noise_sigma).unwrap_or(Normal::new(0.0, 0.001).unwrap());
+    let noise: f32 = normal.sample(rng);
+    (range.base + noise).clamp(range.min, range.max)
+}
+
+/// Sample a route-alpha value for `profile` from `SpeedConfig`.
+pub fn sample_route_alpha(
+    profile: DriverProfile,
+    config: &SpeedConfig,
+    rng: &mut impl Rng,
+) -> f32 {
+    let (lo, hi) = config.route_alpha_range(profile);
+    let base: f32 = rng.gen_range(lo..=hi);
+    let normal = Normal::new(0.0f32, config.route.noise_sigma).unwrap_or(Normal::new(0.0, 0.001).unwrap());
+    let noise: f32 = normal.sample(rng);
+    (base + noise).clamp(0.0, 1.0)
 }

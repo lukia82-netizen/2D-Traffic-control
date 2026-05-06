@@ -3,7 +3,8 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Traffic Control</title>
+    <title>Traffic Control 2D</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='4' fill='%231a1a2e'/><rect x='6' y='13' width='20' height='6' rx='2' fill='%234a9eff'/><circle cx='10' cy='19' r='3' fill='%23222'/><circle cx='22' cy='19' r='3' fill='%23222'/></svg>" />
     <link rel="stylesheet" href="/src/styles/main.css" />
   </head>
   <body>
@@ -20,13 +21,19 @@
         </div>
       </div>
 
-      <!-- Top-right: Satisfaction -->
+      <!-- Top-right: Frustration / Rage Meter -->
       <div id="satisfaction-bar">
-        <div id="satisfaction-label">Satisfaction</div>
+        <div id="satisfaction-label">🚗 Frustration</div>
         <div id="satisfaction-track">
           <div id="satisfaction-fill"></div>
         </div>
-        <div id="satisfaction-value">100%</div>
+        <div id="satisfaction-value">0%</div>
+      </div>
+
+      <!-- Top-right (below): Score display -->
+      <div id="score-display">
+        <div id="score-label">SCORE</div>
+        <div id="score-value">0</div>
       </div>
 
       <!-- Bottom-left: Control panel -->
@@ -39,8 +46,8 @@
           <button id="pause-btn" class="ctrl-btn" title="Pause/Resume">⏸</button>
           <div id="speed-control">
             <label for="speed-slider">Speed ×</label>
-            <input type="range" id="speed-slider" min="1" max="360" value="60" step="1" />
-            <span id="speed-value">60</span>
+            <input type="range" id="speed-slider" min="1" max="360" value="15" step="1" />
+            <span id="speed-value">15</span>
           </div>
         </div>
       </div>
@@ -66,6 +73,34 @@
             <option value="Adaptive">Adaptive</option>
           </select>
         </div>
+        <!-- SemiAuto: duration sliders -->
+        <div id="light-semiauto-controls" class="hidden">
+          <div class="duration-row">
+            <span class="duration-dot green-dot"></span>
+            <label>Green</label>
+            <input type="number" id="green-duration" min="5" max="120" value="30" />
+            <span class="duration-unit">s</span>
+          </div>
+          <div class="duration-row">
+            <span class="duration-dot red-dot"></span>
+            <label>Red</label>
+            <input type="number" id="red-duration" min="5" max="120" value="30" />
+            <span class="duration-unit">s</span>
+          </div>
+          <button id="apply-durations-btn" class="apply-btn">Apply</button>
+        </div>
+        <!-- Adaptive: queue sensor readout -->
+        <div id="light-adaptive-info" class="hidden">
+          <div class="adaptive-row">
+            <span class="adaptive-icon">📡</span>
+            <span>Queue: <strong id="adaptive-queue-count">0</strong> vehicles</span>
+          </div>
+          <div class="adaptive-row">
+            <span class="adaptive-icon">⏱</span>
+            <span>Effective green: <strong id="adaptive-effective-green">--</strong>s</span>
+          </div>
+        </div>
+        <!-- Manual: phase buttons -->
         <div id="light-manual-controls" class="hidden">
           <button class="phase-btn" data-phase="0">🔴 Red</button>
           <button class="phase-btn" data-phase="1">🟡 Yellow</button>
@@ -75,6 +110,31 @@
 
       <!-- Notification area -->
       <div id="notification-area"></div>
+
+      <!-- Game Over overlay (hidden by default) -->
+      <div id="game-over-overlay" class="hidden">
+        <div id="game-over-card">
+          <div id="game-over-icon">💢</div>
+          <h1 id="game-over-title">GAME OVER</h1>
+          <p id="game-over-reason">Traffic collapsed</p>
+          <div id="game-over-stats">
+            <div class="stat-row">
+              <span class="stat-label">Final Score</span>
+              <span class="stat-value" id="final-score">0</span>
+            </div>
+            <div class="stat-row">
+              <span class="stat-label">Avg Frustration</span>
+              <span class="stat-value" id="final-frustration">0%</span>
+            </div>
+            <div class="stat-row">
+              <span class="stat-label">Game Time</span>
+              <span class="stat-value" id="final-game-time">--:--</span>
+            </div>
+          </div>
+          <button id="game-over-restart" class="restart-btn">Try Again</button>
+        </div>
+      </div>
+
     </div>
 
     <script type="module" src="/src/main.ts"></script>

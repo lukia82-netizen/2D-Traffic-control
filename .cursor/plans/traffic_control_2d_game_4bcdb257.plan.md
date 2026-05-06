@@ -4,22 +4,22 @@ overview: Aplikacja desktopowa Tauri z silnikiem symulacji w Rust (osmpbf + petg
 todos:
   - id: phase1-setup
     content: "Faza 1: Scaffold Tauri + Vite/TS, wczytanie PBF w Rust (osmpbf), budowa grafu (petgraph), ekstrakcja budynków OSM, eksport do frontendu, MapLibre + PixiJS overlay"
-    status: in_progress
+    status: completed
   - id: phase2-simulation
     content: "Faza 2: Pętla symulacji IDM w Rust (osobny thread), streaming pozycji do PixiJS, spawning OD-based + tranzyt, DayCycle, pathfinding A* (petgraph)"
-    status: pending
+    status: completed
   - id: phase3-intersections
     content: "Faza 3: Skrzyżowania (FSM świateł), znaki, pierwszeństwo, strzałki pasów - logika Rust + rendering PixiJS"
-    status: pending
+    status: completed
   - id: phase4-ai
     content: "Faza 4: AI kierowców - profile, lane change model (25/50/75%), respektowanie przepisów - Rust"
-    status: pending
+    status: completed
   - id: phase5-lights-control
     content: "Faza 5: Tryby sterowania światłami (ręczny, półauto, auto, adaptacyjny) - Tauri commands + UI"
-    status: pending
+    status: completed
   - id: phase6-gamemode
     content: "Faza 6: System zadowolenia/frustracji, scoring, alerty korków, kompletny HUD"
-    status: pending
+    status: completed
 isProject: false
 ---
 
@@ -109,7 +109,7 @@ ai-tests-5-traf/
 │       ├── commands.rs                # #[tauri::command] handlers
 │       ├── map/
 │       │   ├── osm_loader.rs          # osmpbf → raw nodes/ways/relations
-│       │   ├── road_network.rs        # petgraph DiGraph, RoadEdge (pasy, oneway, bridge, tunnel, layer)
+│       │   ├── road_network.rs        # petgraph DiGraph, RoadEdge; parse_oneway(tags) obsługuje oneway/roundabout/motorway/no
 │       │   ├── building_loader.rs     # osmpbf building=* → Building{id,polygon,type,access_node}
 │       │   ├── building_network.rs   # rstar R-tree: centroid → nearest road NodeIndex, O(log n)
 │       │   └── tram_network.rs       # railway=tram → TramGraph + TramStop, shared track detection
@@ -140,7 +140,7 @@ ai-tests-5-traf/
 │   │   ├── PixiOverlay.ts             # Canvas abs. positioned nad MapLibre, sync rozmiaru
 │   │   ├── VehicleRenderer.ts         # ParticleContainer, project() lat/lng→px, frustum cull
 │   │   ├── BuildingRenderer.ts        # Kontury budynków → RenderTexture (1 draw call), color by type
-│   │   ├── InfraRenderer.ts           # Strzałki oneway, wiadukty (cień), tunele (dashed)
+│   │   ├── InfraRenderer.ts           # Oznakowania: linie segregacyjne, strzałki pasów, ronda; RenderTexture rebuild on zoom floor change
 │   │   ├── CongestionRenderer.ts      # Czerwone/żółte linie + edge indicators na ramce
 │   │   └── UIRenderer.ts             # HUD: satisfaction, zegar gry, panel świateł
 │   ├── traffic/
@@ -178,6 +178,11 @@ Kluczowy problem: MapLibre i PixiJS mają osobne systemy współrzędnych.
 Symulacja w Rust emituje zdarzenia przez Tauri:
 
 ```
+road_network_data (raz przy starcie):
+  JSON: [{ id: u64, from: [lng,lat], to: [lng,lat], lanes: u8, oneway: bool,
+           highway_type: str, junction: str|null, layer: i8 }]
+  → InfraRenderer buduje oznakowania (linie, strzałki, ronda)
+
 buildings_data (raz przy starcie):
   JSON: [{ id: u64, polygon: [[lng,lat],...], type: "residential"|"commercial"|"office"|"other" }]
 
@@ -234,7 +239,7 @@ enum IntersectionType { TrafficLight, Stop, Yield, Equal }
 type RoadGraph = petgraph::Graph<RoadNode, RoadEdge, Directed>;
 ```
 
-- Overpass API pobiera `way[highway]`, `node[traffic_signals]`, `node[stop]`, `node[give_way]`, tagi `oneway`, `bridge`, `tunnel`, `layer`, `lanes`, `maxspeed`, `maxspeed:urban`, `zone:traffic`
+- Overpass API pobiera `way[highway]`, `node[traffic_signals]`, `node[stop]`, `node[give_way]`, tagi `oneway`, `junction`, `bridge`, `tunnel`, `layer`, `lanes`, `maxspeed`, `maxspeed:urban`, `zone:traffic`
 - `RoadEdge.max_speed` wyznaczana wg priorytetu: (1) tag `maxspeed` → (2) `zone:traffic=urban/rural` + typ drogi → (3) heurystyka urban/rural z gęstości węzłów - patrz sekcja "Prędkości"
 - `RoadEdge` rozszerzone o pole `urban: bool` - wpływa na default speed limit gdy brak tagu `maxspeed`
 - A* przez `petgraph::algo::astar` z wagą = czas przejazdu (`length / max_speed`)
@@ -870,9 +875,73 @@ Pan/zoom obsługuje **wyłącznie MapLibre** (brak dodatkowych bibliotek):
 ### Drogi jednokierunkowe, wiadukty, tunele
 
 **Drogi jednokierunkowe:**
-- OSM tag `oneway=yes/−1` → krawędź w grafie tylko w jednym kierunku
-- Renderowane ze strzałką na asfalcie wskazującą kierunek jazdy (co ~80px wzdłuż drogi)
-- Pojazdy nie mogą jechać pod prąd (walidacja przy pathfinding)
+
+`parse_oneway` w `road_network.rs` musi obsługiwać **5 przypadków** (aktualny kod obsługuje tylko pierwsze 3):
+
+| Warunek OSM | Wynik | Status w kodzie |
+|---|---|---|
+| `oneway=yes` / `oneway=true` / `oneway=1` | → 1 (zgodnie z węzłami) | **jest** |
+| `oneway=-1` / `oneway=reverse` | → -1 (pod prąd węzłów) | **jest** |
+| brak tagu `oneway` (i żaden z poniższych) | → 0 (dwukierunkowa) | **jest** |
+| `oneway=no` (explicit override) | → 0 (wymuś dwukierunkową) | **brak - do dodania** |
+| `junction=roundabout` | → 1 (rondo zawsze jednokierunkowe) | **brak - do dodania** |
+| `highway=motorway` lub `motorway_link` | → 1 (każda jezdnia osobna w OSM) | **brak - do dodania** |
+
+Poprawiona logika `parse_oneway` pobiera cały `tags: &HashMap`:
+
+```rust
+// road_network.rs
+fn parse_oneway(tags: &HashMap<String, String>) -> i8 {
+    // explicit oneway=no → override wszystkiego
+    if tags.get("oneway").map(|s| s.as_str()) == Some("no") {
+        return 0;
+    }
+    // explicit oneway tag
+    match tags.get("oneway").map(|s| s.as_str()) {
+        Some("yes") | Some("true") | Some("1") => return 1,
+        Some("-1") | Some("reverse")            => return -1,
+        _ => {}
+    }
+    // rondo - domyślnie jednokierunkowe (brak tagu oneway w OSM)
+    if tags.get("junction").map(|s| s.as_str()) == Some("roundabout") {
+        return 1;
+    }
+    // autostrada - każda jezdnia rysowana osobno jako jednokierunkowa
+    match tags.get("highway").map(|s| s.as_str()) {
+        Some("motorway") | Some("motorway_link") => return 1,
+        _ => {}
+    }
+    0  // domyślnie dwukierunkowa
+}
+```
+
+**Zmiana sygnatury:** `parse_oneway` teraz bierze `&HashMap<String, String>` zamiast `Option<&str>` - wywołanie staje się `parse_oneway(&way.tags)`.
+
+**Implikacje dla rend renderowania rond:**
+- Węzły wchodzące w skład ronda (`junction=roundabout`) dostaną `intersection_type` = nowy wariant `Roundabout` zamiast `Plain`
+- PixiJS renderuje okrągłą strzałkę kierunkową na rondzie (zamiast prostych strzałek oneway)
+- Logika pathfinding: wjazd na rondo = krawędź jednokierunkowa, pojazd musi objechać do właściwego zjazdu
+
+**Nowy wariant `IntersectionType`:**
+
+```rust
+pub enum IntersectionType {
+    Plain,
+    TrafficLight,
+    Stop,
+    Yield,
+    Roundabout,   // ← nowy: junction=roundabout
+}
+```
+
+`determine_intersection_type` rozszerzone o:
+```rust
+if tags.get("junction").map(|s| s.as_str()) == Some("roundabout") {
+    return IntersectionType::Roundabout;
+}
+```
+
+Renderowane ze strzałką na asfalcie wskazującą kierunek jazdy (co ~80px wzdłuż drogi). Pojazdy nie mogą jechać pod prąd (walidacja przez petgraph - krawędź po prostu nie istnieje w tym kierunku).
 
 **Wiadukty (mosty):**
 - OSM tag `bridge=yes` + `layer > 0` → droga renderowana wyżej wizualnie
@@ -886,6 +955,141 @@ Pan/zoom obsługuje **wyłącznie MapLibre** (brak dodatkowych bibliotek):
 - Wejście/wyjście tunelu oznaczone łukiem/ciemnym prostokątem
 
 Pole `infra: InfraType` i `layer: i8` są już częścią `RoadEdge` w `road_network.rs` (Rust) - patrz definicja wyżej.
+
+### Oznakowanie poziome dróg (`InfraRenderer.ts`)
+
+Wszystkie oznakowania renderowane **jednorazowo** do jednej `RenderTexture` przy ładowaniu mapy (`InfraRenderer.buildMarkingsTexture()`). Wyświetlane co klatkę jako jeden `Sprite` (1 draw call). Przebudowywane tylko gdy zmienia się zoom poziom dyskretny (np. co 2 stopnie) - nie co klatkę.
+
+#### Dane z Rust potrzebne do rysowania oznakowań
+
+`road_network_data` event (jednorazowy przy starcie) zawiera per krawędź:
+
+```typescript
+interface RoadEdgeData {
+  id: number;
+  from: [number, number];   // [lng, lat] węzła startowego
+  to:   [number, number];   // [lng, lat] węzła końcowego
+  lanes: number;
+  oneway: boolean;
+  highway_type: string;     // "motorway"|"primary"|"residential"...
+  junction: string|null;    // "roundabout" lub null
+}
+```
+
+#### Trzy typy linii segregacyjnych
+
+```
+Widok z lotu ptaka (droga jedzie poziomo →):
+
+JEDNOKIERUNKOWA (oneway=true, lanes=3):
+  ┌────────────────────────────────┐
+  │  →  →  →  →  →  →  →  →  →  │  pas 1
+  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌  ← przerywana biała (między pasami tego samego kierunku)
+  │  →  →  →  →  →  →  →  →  →  │  pas 2
+  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+  │  →  →  →  →  →  →  →  →  →  │  pas 3
+  └────────────────────────────────┘
+
+DWUKIERUNKOWA (oneway=false, lanes=2):
+  ┌────────────────────────────────┐
+  │  →  →  →  →  →  →  →  →  →  │
+  ══════════════════════════════════  ← podwójna ciągła żółta (centrum, zakaz przejeżdżania)
+  │  ←  ←  ←  ←  ←  ←  ←  ←  ←  │
+  └────────────────────────────────┘
+
+DWUKIERUNKOWA wielopasowa (lanes=4, po 2 w każdym kierunku):
+  ┌────────────────────────────────┐
+  │  →  →  →  →  →  │  pas 1
+  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌  przerywana biała
+  │  →  →  →  →  →  │  pas 2
+  ══════════════════════════════════  podwójna ciągła żółta (środek)
+  │  ←  ←  ←  ←  ←  │  pas 3
+  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌  przerywana biała
+  │  ←  ←  ←  ←  ←  │  pas 4
+  └────────────────────────────────┘
+```
+
+#### Reguły rysowania linii per typ drogi
+
+| Sytuacja | Linia środkowa | Linie między pasami |
+|---|---|---|
+| Jednokierunkowa, 1 pas | brak | brak |
+| Jednokierunkowa, ≥2 pasy | brak | przerywana biała (dash 6px, gap 10px) |
+| Dwukierunkowa, 2 pasy (1+1) | podwójna ciągła żółta | brak |
+| Dwukierunkowa, 4 pasy (2+2) | podwójna ciągła żółta | przerywana biała per kierunek |
+| `highway=motorway` | brak (osobne jezdnie w OSM) | przerywana biała |
+| `junction=roundabout` | brak | brak (linia krzywoliniowa = zbyt złożona) |
+
+Szerokość pasa w pikselach PixiJS = `lane_width_px` przeliczana ze zoom MapLibre:
+- zoom 14 → ~5px/pas, zoom 16 → ~12px/pas, zoom 18 → ~25px/pas
+
+**Progi widoczności** (nie rysuj gdy zoom zbyt mały - czytelność):
+- Linie między pasami: zoom ≥ 15
+- Linia środkowa: zoom ≥ 14
+- Strzałki kierunkowe: zoom ≥ 16
+
+#### Strzałki kierunkowe na asfalcie
+
+Trzy warianty strzałek, prerenderedowane jako małe `RenderTexture` (~24×24px każda):
+
+```
+↑   strzałka prosto (LaneDirection::Straight)
+↖   strzałka lewo    (LaneDirection::Left)
+↗   strzałka prawo   (LaneDirection::Right)
+↑↖  kombinowana lewo+prosto (gdy pas obsługuje oba)
+↑↗  kombinowana prawo+prosto
+```
+
+**Pozycjonowanie strzałek:**
+- Na krawędziach z drogą jednokierunkową: co ~80px wzdłuż krawędzi (w przestrzeni ekranowej)
+- Tuż przed skrzyżowaniem (~20m): strzałki z `lane_directions` z `RoadEdge` - informują kierowcę o kierunkach pasów
+
+Strzałki rysowane wzdłuż wektora krawędzi (`angle = atan2(to.y - from.y, to.x - from.x)`) przez `Graphics.drawPolygon` → `RenderTexture`.
+
+#### Rondo - okrągła strzałka
+
+Węzły `junction=roundabout` tworzą w grafie cykl krawędzi. `InfraRenderer` rysuje okrągłą strzałkę wskazującą kierunek ruchu (zgodnie z ruchem wskazówek zegara lub przeciwnie, wykrywane z kolejności węzłów w OSM):
+
+```typescript
+// InfraRenderer.ts
+function drawRoundaboutArrow(center: Point, radius: number, clockwise: boolean) {
+  // Arc (~270° łuku) z grotem strzałki na końcu
+  // radius = haversine centroidu węzłów ronda * scale
+}
+```
+
+#### Implementacja w `InfraRenderer.ts`
+
+```typescript
+// InfraRenderer.ts
+export class InfraRenderer {
+  private markingsTexture: RenderTexture | null = null;
+
+  buildMarkingsTexture(edges: RoadEdgeData[], map: maplibregl.Map): void {
+    const g = new Graphics();
+    const zoom = map.getZoom();
+
+    for (const edge of edges) {
+      const from = map.project(edge.from);
+      const to   = map.project(edge.to);
+      this.drawCenterLine(g, from, to, edge, zoom);
+      if (zoom >= 15) this.drawLaneDividers(g, from, to, edge, zoom);
+      if (zoom >= 16) this.drawDirectionArrows(g, from, to, edge, zoom);
+    }
+
+    // Przebuduj RenderTexture
+    this.markingsTexture = RenderTexture.create({ width: screen.w, height: screen.h });
+    renderer.render(g, { renderTexture: this.markingsTexture });
+  }
+
+  // Odbuduj gdy zoom przekroczy próg dyskretny (zoom floor zmienił się)
+  onZoomChange(newZoom: number, prevZoom: number): void {
+    const prevFloor = Math.floor(prevZoom);
+    const newFloor  = Math.floor(newZoom);
+    if (prevFloor !== newFloor) this.buildMarkingsTexture(...);
+  }
+}
+```
 
 ### Tramwaje i torowiska
 
@@ -1026,7 +1230,12 @@ Okno Tauri (WebView)
 ├── PixiJS canvas (middle, position:absolute, pointer-events:none)
 │   │   [Statyczne warstwy cache'owane do RenderTexture przy starcie]
 │   ├── Layer 0: Static sprite: tunele overlay (dashed, RenderTexture - 1 draw call)
-│   ├── Layer 1: Static sprite: strzałki oneway + lane markings (RenderTexture - 1 draw call)
+│   ├── Layer 1: Static sprite: oznakowania poziome (RenderTexture - 1 draw call)
+│   │             • linia środkowa: podwójna ciągła żółta (drogi 2-kier.) / brak (1-kier.)
+│   │             • linie między pasami: przerywana biała (zoom≥15)
+│   │             • strzałki kierunkowe na asfalcie (zoom≥16, co ~80px wzdłuż krawędzi)
+│   │             • okrągła strzałka ronda (zoom≥14)
+│   │             przebudowywana gdy floor(zoom) się zmienia (nie co klatkę)
 │   ├── Layer 2: Dynamic: highlight podświetlonego budynku (Graphics ring, rebuild on click)
 │   ├── Layer 3: Pojazdy w tunelach (alpha 0.25, ParticleContainer - 1 draw call)
 │   ├── Layer 4: Pojazdy naziemne + tramwaje (ParticleContainer - 1 draw call)

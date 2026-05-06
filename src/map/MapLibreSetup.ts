@@ -1,9 +1,25 @@
 import maplibregl from 'maplibre-gl';
 
-// Default map center: Kraków Śródmieście
-const DEFAULT_CENTER: [number, number] = [19.940, 50.060];
-const DEFAULT_ZOOM = 16;
-const KRAKOW_BBOX: [number, number, number, number] = [19.925, 50.052, 19.955, 50.068];
+// ─── City presets ─────────────────────────────────────────────────────────────
+
+/** Kraków – Rynek Główny, ~1 km × 1 km */
+export const KRAKOW_CENTER: [number, number] = [19.9368, 50.0614];
+export const KRAKOW_BBOX: [number, number, number, number] = [19.930, 50.057, 19.944, 50.066];
+
+/** Leszno – centrum, ~500 m × 500 m (sandbox default) */
+export const LESZNO_CENTER: [number, number] = [16.575, 51.845];
+export const LESZNO_BBOX: [number, number, number, number] = [16.571, 51.843, 16.579, 51.847];
+
+// Active defaults (sandbox starts with Leszno)
+const DEFAULT_CENTER = LESZNO_CENTER;
+const DEFAULT_ZOOM = 15;
+// legacy alias kept for Rust commands.ts
+const DEFAULT_CENTER_KRAKOW = KRAKOW_CENTER;
+void DEFAULT_CENTER_KRAKOW;
+
+// OpenFreeMap – free vector tiles, no API key required
+// https://openfreemap.org
+const ONLINE_STYLE_URL = 'https://tiles.openfreemap.org/styles/liberty';
 
 // Offline fallback style — dark background, no network required
 const OFFLINE_STYLE: maplibregl.StyleSpecification = {
@@ -19,70 +35,84 @@ const OFFLINE_STYLE: maplibregl.StyleSpecification = {
   ],
 };
 
-// Online tile style URL
-const ONLINE_STYLE_URL = 'https://tiles.openfreemap.org/styles/bright';
-// Timeout before giving up on online tiles
-const STYLE_LOAD_TIMEOUT_MS = 6000;
-
 // ─── Factory ──────────────────────────────────────────────────────────────────
 
 /**
- * Creates a MapLibre map that always loads quickly.
- * Tries the online tile style first (6s timeout), then falls back to a
- * dark offline background so the app never hangs waiting for the network.
+ * Try to load OpenFreeMap tiles.  If the style URL is unreachable (corporate
+ * firewall, offline dev mode) fall back to a plain dark canvas.
+ *
+ * MapLibre provides pan/zoom and coordinate projection; PixiJS renders the
+ * simulation overlay (vehicles, congestion, traffic-light sprites, etc.).
  */
 export async function createMap(containerId: string): Promise<maplibregl.Map> {
+  // First attempt – try online style, timeout after 5 s
+  const onlineAvailable = await tryFetchStyle(ONLINE_STYLE_URL, 5000);
+  const styleUrl: string | maplibregl.StyleSpecification = onlineAvailable
+    ? ONLINE_STYLE_URL
+    : OFFLINE_STYLE;
+
   return new Promise((resolve) => {
+    let settled = false;
+
     const map = new maplibregl.Map({
       container: containerId,
-      style: ONLINE_STYLE_URL,
+      style: styleUrl,
       center: DEFAULT_CENTER,
       zoom: DEFAULT_ZOOM,
       maxZoom: 19,
-      minZoom: 10,
+      minZoom: 12,
       attributionControl: false,
     });
 
-    let settled = false;
-
-    const settle = (): void => {
+    const onLoad = (): void => {
       if (settled) return;
       settled = true;
+      // Make tram rails visible if the layer exists in the online style
+      try {
+        if (map.getLayer('railway')) {
+          map.setLayoutProperty('railway', 'visibility', 'visible');
+        }
+      } catch (_) {
+        // Layer not present in this style variant — no-op
+      }
       resolve(map);
     };
 
-    // Happy path – online tiles loaded in time
-    map.once('load', () => settle());
+    const onError = (): void => {
+      if (settled) return;
+      settled = true;
+      map.remove();
+      const fallback = new maplibregl.Map({
+        container: containerId,
+        style: OFFLINE_STYLE,
+        center: DEFAULT_CENTER,
+        zoom: DEFAULT_ZOOM,
+        maxZoom: 19,
+        minZoom: 12,
+        attributionControl: false,
+      });
+      fallback.once('load', () => resolve(fallback));
+    };
 
-    // If the style fails to load at all, fall back immediately
-    map.once('error', () => {
-      if (!settled) {
-        console.warn('[MapLibre] Style load error – switching to offline mode');
-        map.setStyle(OFFLINE_STYLE);
-        map.once('styledata', () => settle());
-      }
-    });
-
-    // Timeout fallback – corporate firewalls may silently drop the request
-    setTimeout(() => {
-      if (!settled) {
-        console.warn('[MapLibre] Style load timed out – switching to offline mode');
-        settled = true; // prevent double-resolve
-        // Load a new map instance with offline style (setStyle mid-flight can glitch)
-        map.remove();
-        const offlineMap = new maplibregl.Map({
-          container: containerId,
-          style: OFFLINE_STYLE,
-          center: DEFAULT_CENTER,
-          zoom: DEFAULT_ZOOM,
-          maxZoom: 19,
-          minZoom: 10,
-          attributionControl: false,
-        });
-        offlineMap.once('load', () => resolve(offlineMap));
-      }
-    }, STYLE_LOAD_TIMEOUT_MS);
+    map.once('load', onLoad);
+    map.once('error', onError);
   });
+}
+
+/**
+ * Quick connectivity check: fetch only the HTTP HEAD of the style URL.
+ * Returns `true` if the server responds within `timeoutMs`.
+ */
+async function tryFetchStyle(url: string, timeoutMs: number): Promise<boolean> {
+  try {
+    const controller = new AbortController();
+    const tid = setTimeout(() => controller.abort(), timeoutMs);
+    const resp = await fetch(url, { method: 'HEAD', signal: controller.signal });
+    clearTimeout(tid);
+    return resp.ok;
+  } catch {
+    return false;
+  }
 }
 
 // ─── Projection helpers ───────────────────────────────────────────────────────

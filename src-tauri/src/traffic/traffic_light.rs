@@ -24,10 +24,19 @@ impl LightPhase {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct LightStateUpdate {
     pub intersection_id: u64,
     pub phase: u8,
     pub time_remaining: f32,
+    /// Number of vehicles queued (relevant for Adaptive mode display).
+    pub queue_count: u32,
+    /// Current control mode as a string: "manual" | "semi_auto" | "auto" | "adaptive"
+    pub mode: String,
+    /// Configured green duration in seconds
+    pub green_duration: f32,
+    /// Configured red duration in seconds
+    pub red_duration: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -46,15 +55,46 @@ pub struct TrafficLight {
 }
 
 impl TrafficLight {
+    /// Create a traffic light for a **pedestrian crossing**.
+    /// Shorter cycle: 25 s green for cars → 3 s yellow → 15 s red (green for pedestrians).
+    pub fn new_pedestrian(intersection_id: u64) -> Self {
+        let mut tl = Self::new_with_durations(intersection_id, 25.0, 3.0, 15.0);
+        tl.current_phase = LightPhase::Red; // start with pedestrian phase so cars see it immediately
+        tl.phase_timer   = 0.0;
+        tl
+    }
+
     pub fn new(intersection_id: u64) -> Self {
+        Self::new_with_durations(intersection_id, 30.0, 3.0, 30.0)
+    }
+
+    fn new_with_durations(intersection_id: u64, green_duration: f32, yellow_duration: f32, red_duration: f32) -> Self {
+        // Stagger initial phase so not all lights are red simultaneously.
+        // Use intersection_id as a deterministic seed (no rand crate needed).
+        let cycle           = green_duration + yellow_duration + red_duration; // 63 s
+        // Cheap hash: mix bits of the id
+        let seed = intersection_id
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let offset = (seed % 1_000_000) as f32 / 1_000_000.0 * cycle;
+
+        // Determine which phase we start in
+        let (current_phase, phase_timer) = if offset < green_duration {
+            (LightPhase::Green, offset)
+        } else if offset < green_duration + yellow_duration {
+            (LightPhase::Yellow, offset - green_duration)
+        } else {
+            (LightPhase::Red, offset - green_duration - yellow_duration)
+        };
+
         TrafficLight {
             intersection_id,
             mode: LightControlMode::Auto,
-            current_phase: LightPhase::Red,
-            phase_timer: 0.0,
-            green_duration: 30.0,
-            yellow_duration: 3.0,
-            red_duration: 30.0,
+            current_phase,
+            phase_timer,
+            green_duration,
+            yellow_duration,
+            red_duration,
             queue_count: 0,
         }
     }
@@ -151,10 +191,26 @@ impl TrafficLight {
     }
 
     pub fn to_state_update(&self) -> LightStateUpdate {
+        let mode_str = match self.mode {
+            LightControlMode::Manual   => "manual",
+            LightControlMode::SemiAuto => "semi_auto",
+            LightControlMode::Auto     => "auto",
+            LightControlMode::Adaptive => "adaptive",
+        };
         LightStateUpdate {
             intersection_id: self.intersection_id,
             phase: self.current_phase.to_u8(),
             time_remaining: self.time_remaining(),
+            queue_count: self.queue_count,
+            mode: mode_str.to_string(),
+            green_duration: self.green_duration,
+            red_duration: self.red_duration,
         }
+    }
+
+    /// Set fixed phase durations (used by SemiAuto mode).
+    pub fn set_durations(&mut self, green_s: f32, red_s: f32) {
+        self.green_duration = green_s.max(5.0);
+        self.red_duration = red_s.max(5.0);
     }
 }
