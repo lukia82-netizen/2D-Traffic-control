@@ -4,7 +4,7 @@ overview: Aplikacja desktopowa Tauri z silnikiem symulacji w Rust (osmpbf + petg
 todos:
   - id: phase1-setup
     content: "Faza 1: Scaffold Tauri + Vite/TS, wczytanie PBF w Rust (osmpbf), budowa grafu (petgraph), ekstrakcja budynków OSM, eksport do frontendu, MapLibre + PixiJS overlay"
-    status: in_progress
+    status: completed
   - id: phase2-simulation
     content: "Faza 2: Pętla symulacji IDM w Rust (osobny thread), streaming pozycji do PixiJS, spawning OD-based + tranzyt, DayCycle, pathfinding A* (petgraph)"
     status: completed

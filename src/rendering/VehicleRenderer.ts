@@ -45,8 +45,8 @@ const FRUSTRATION_ANNOYED  = 65;
 const FRUSTRATION_ANGRY    = 85;
 const FRUSTRATION_RAGE     = 99;
 
-/** Bubble labels per threshold */
-const BUBBLE_LABELS = ['!', '!!', '!!!', '💢'] as const;
+/** Bubble labels per threshold (annoyed, angry, raging, rage-quit) */
+export const BUBBLE_LABELS = ['!', '!!', '!!!', '💢'] as const;
 /** Bubble colors per tier: annoyed, angry, raging, rage-quit */
 const BUBBLE_COLORS = [0xffdd00, 0xff8800, 0xff3300, 0xff0000] as const;
 /** Bubble vertical offset above the sprite (px) */

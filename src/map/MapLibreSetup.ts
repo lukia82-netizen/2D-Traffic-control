@@ -5,6 +5,10 @@ const DEFAULT_CENTER: [number, number] = [19.9368, 50.0614];
 const DEFAULT_ZOOM = 16;
 const KRAKOW_BBOX: [number, number, number, number] = [19.930, 50.057, 19.944, 50.066];
 
+// OpenFreeMap – free vector tiles, no API key required
+// https://openfreemap.org
+const ONLINE_STYLE_URL = 'https://tiles.openfreemap.org/styles/liberty';
+
 // Offline fallback style — dark background, no network required
 const OFFLINE_STYLE: maplibregl.StyleSpecification = {
   version: 8,
@@ -22,24 +26,81 @@ const OFFLINE_STYLE: maplibregl.StyleSpecification = {
 // ─── Factory ──────────────────────────────────────────────────────────────────
 
 /**
- * Creates a MapLibre map in "sketch" mode — pure offline dark canvas.
- * Roads and buildings are drawn by PixiJS from OSM data, so we don't need
- * map tiles at all. MapLibre is kept only for its camera (pan/zoom) and
- * coordinate projection system.
+ * Try to load OpenFreeMap tiles.  If the style URL is unreachable (corporate
+ * firewall, offline dev mode) fall back to a plain dark canvas.
+ *
+ * MapLibre provides pan/zoom and coordinate projection; PixiJS renders the
+ * simulation overlay (vehicles, congestion, traffic-light sprites, etc.).
  */
 export async function createMap(containerId: string): Promise<maplibregl.Map> {
+  // First attempt – try online style, timeout after 5 s
+  const onlineAvailable = await tryFetchStyle(ONLINE_STYLE_URL, 5000);
+  const styleUrl: string | maplibregl.StyleSpecification = onlineAvailable
+    ? ONLINE_STYLE_URL
+    : OFFLINE_STYLE;
+
   return new Promise((resolve) => {
+    let settled = false;
+
     const map = new maplibregl.Map({
       container: containerId,
-      style: OFFLINE_STYLE,   // always offline – PixiJS draws the map
+      style: styleUrl,
       center: DEFAULT_CENTER,
       zoom: DEFAULT_ZOOM,
       maxZoom: 19,
       minZoom: 12,
       attributionControl: false,
     });
-    map.once('load', () => resolve(map));
+
+    const onLoad = (): void => {
+      if (settled) return;
+      settled = true;
+      // Make tram rails visible if the layer exists in the online style
+      try {
+        if (map.getLayer('railway')) {
+          map.setLayoutProperty('railway', 'visibility', 'visible');
+        }
+      } catch (_) {
+        // Layer not present in this style variant — no-op
+      }
+      resolve(map);
+    };
+
+    const onError = (): void => {
+      if (settled) return;
+      settled = true;
+      map.remove();
+      const fallback = new maplibregl.Map({
+        container: containerId,
+        style: OFFLINE_STYLE,
+        center: DEFAULT_CENTER,
+        zoom: DEFAULT_ZOOM,
+        maxZoom: 19,
+        minZoom: 12,
+        attributionControl: false,
+      });
+      fallback.once('load', () => resolve(fallback));
+    };
+
+    map.once('load', onLoad);
+    map.once('error', onError);
   });
+}
+
+/**
+ * Quick connectivity check: fetch only the HTTP HEAD of the style URL.
+ * Returns `true` if the server responds within `timeoutMs`.
+ */
+async function tryFetchStyle(url: string, timeoutMs: number): Promise<boolean> {
+  try {
+    const controller = new AbortController();
+    const tid = setTimeout(() => controller.abort(), timeoutMs);
+    const resp = await fetch(url, { method: 'HEAD', signal: controller.signal });
+    clearTimeout(tid);
+    return resp.ok;
+  } catch {
+    return false;
+  }
 }
 
 // ─── Projection helpers ───────────────────────────────────────────────────────
