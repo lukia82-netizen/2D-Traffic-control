@@ -17,7 +17,9 @@ pub struct IntersectionManager {
 
 impl IntersectionManager {
     /// Build the manager by scanning all nodes with intersection-type tags.
-    pub fn from_graph(graph: &RoadGraph) -> Self {
+    ///
+    /// `sandbox_simple_cross_tl`: single-intersection sandbox — one TL, manual 2-phase (N–S / E–W, no lefts).
+    pub fn from_graph(graph: &RoadGraph, sandbox_simple_cross_tl: bool) -> Self {
         let mut traffic_lights = HashMap::new();
         let mut stop_nodes     = HashSet::new();
         let mut yield_nodes    = HashSet::new();
@@ -30,7 +32,13 @@ impl IntersectionManager {
                         if !layout.arms.is_empty() {
                             traffic_lights.insert(
                                 node.osm_id,
-                                TrafficLight::new_vehicle_multiphase(node.osm_id, layout),
+                                TrafficLight::new_vehicle_multiphase(
+                                    node.osm_id,
+                                    layout,
+                                    graph,
+                                    node_idx,
+                                    sandbox_simple_cross_tl,
+                                ),
                             );
                         }
                     }

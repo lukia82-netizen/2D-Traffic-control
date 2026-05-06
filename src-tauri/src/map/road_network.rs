@@ -107,6 +107,8 @@ pub struct MapData {
     /// True when this is the built-in sandbox demo map (3×3 grid).
     /// The spawn system uses this to restrict vehicles to a single type.
     pub is_sandbox: bool,
+    /// Single-intersection sandbox (+ cross): 2-phase manual TL (N–S / E–W, no lefts) at init.
+    pub sandbox_simple_cross_tl: bool,
 }
 
 // ── Demo network ─────────────────────────────────────────────────────────────
@@ -265,6 +267,7 @@ pub fn build_demo_road_network(grid_type: &str, bbox: [f64; 4]) -> MapData {
         restrictions: Vec::new(),
         tram_data,
         is_sandbox: true,
+        sandbox_simple_cross_tl: false,
     }
 }
 
@@ -350,6 +353,7 @@ pub fn build_single_road_network(bbox: [f64; 4]) -> MapData {
         restrictions: Vec::new(),
         tram_data,
         is_sandbox: true,
+        sandbox_simple_cross_tl: false,
     }
 }
 
@@ -462,6 +466,7 @@ pub fn build_single_intersection_network(bbox: [f64; 4]) -> MapData {
         restrictions: Vec::new(),
         tram_data,
         is_sandbox: true,
+        sandbox_simple_cross_tl: true,
     }
 }
 
@@ -628,6 +633,7 @@ pub fn build_road_network(osm_data: OsmData) -> MapData {
         restrictions,
         tram_data,
         is_sandbox: false,
+        sandbox_simple_cross_tl: false,
     }
 }
 

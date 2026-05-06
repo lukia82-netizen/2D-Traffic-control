@@ -90,7 +90,7 @@ pub fn run_simulation(
         let map   = guard.as_ref().expect("map must be loaded before starting simulation");
 
         (
-            IntersectionManager::from_graph(&map.graph),
+            IntersectionManager::from_graph(&map.graph, map.sandbox_simple_cross_tl),
             SpawnSystem::new(
                 map.spawn_points.clone(),
                 map.boundary_nodes.clone(),
@@ -155,7 +155,7 @@ pub fn run_simulation(
         if latest_signature != map_signature {
             let guard = graph_lock.read();
             if let Some(map) = guard.as_ref() {
-                intersections = IntersectionManager::from_graph(&map.graph);
+                intersections = IntersectionManager::from_graph(&map.graph, map.sandbox_simple_cross_tl);
                 let mut refreshed_spawn = SpawnSystem::new(
                     map.spawn_points.clone(),
                     map.boundary_nodes.clone(),

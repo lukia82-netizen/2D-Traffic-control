@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
-use petgraph::graph::EdgeIndex;
+use petgraph::graph::{EdgeIndex, NodeIndex};
 
-use crate::map::road_network::{LaneDirection, MapData};
+use crate::map::road_network::{LaneDirection, MapData, RoadGraph};
 use crate::state::LightControlMode;
 use crate::traffic::phased_traffic_light::{JunctionLayout, PhasedVehicleLight};
 use crate::vehicles::vehicle::Vehicle;
@@ -232,10 +232,22 @@ impl TrafficLight {
         }
     }
 
-    pub fn new_vehicle_multiphase(intersection_id: u64, layout: JunctionLayout) -> Self {
+    pub fn new_vehicle_multiphase(
+        intersection_id: u64,
+        layout: JunctionLayout,
+        graph: &RoadGraph,
+        junction: NodeIndex,
+        sandbox_simple_cross_tl: bool,
+    ) -> Self {
         TrafficLight {
             intersection_id,
-            kind: TrafficLightKind::VehiclePhased(PhasedVehicleLight::new(intersection_id, layout)),
+            kind: TrafficLightKind::VehiclePhased(PhasedVehicleLight::new(
+                intersection_id,
+                layout,
+                graph,
+                junction,
+                sandbox_simple_cross_tl,
+            )),
         }
     }
 

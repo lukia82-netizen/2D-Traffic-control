@@ -124,28 +124,101 @@ pub struct PhasedVehicleLight {
     pub all_red_duration: f32,
     pub green_straight: f32,
     pub green_left: f32,
+    /// Sandbox + test cross: two phases only — ((N,S),(E,W)) arm indices, straight+right only.
+    simple_cross_arm_pairs: Option<((u8, u8), (u8, u8))>,
+}
+
+/// Map each compass approach to its `JunctionLayout` arm index (0…3) for a symmetric + junction.
+fn classify_plus_cross_arm_pairs(
+    graph: &RoadGraph,
+    layout: &JunctionLayout,
+    junction: NodeIndex,
+) -> Option<((u8, u8), (u8, u8))> {
+    #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+    enum Compass {
+        N,
+        S,
+        E,
+        W,
+    }
+    if layout.arm_count() != 4 {
+        return None;
+    }
+    let j = &graph[junction];
+    let mut m: HashMap<Compass, u8> = HashMap::new();
+    for (i, &eid) in layout.arms.iter().enumerate() {
+        let arm_i = i as u8;
+        let (src, tgt) = graph.edge_endpoints(eid)?;
+        if tgt != junction {
+            return None;
+        }
+        let s = &graph[src];
+        let dlat = s.lat - j.lat;
+        let dlng = s.lng - j.lng;
+        let c = if dlat.abs() >= dlng.abs() {
+            if dlat >= 0.0 {
+                Compass::N
+            } else {
+                Compass::S
+            }
+        } else if dlng >= 0.0 {
+            Compass::E
+        } else {
+            Compass::W
+        };
+        m.insert(c, arm_i);
+    }
+    if m.len() != 4 {
+        return None;
+    }
+    Some((
+        (*m.get(&Compass::N)?, *m.get(&Compass::S)?),
+        (*m.get(&Compass::E)?, *m.get(&Compass::W)?),
+    ))
 }
 
 impl PhasedVehicleLight {
-    pub fn new(intersection_id: u64, layout: JunctionLayout) -> Self {
+    pub fn new(
+        intersection_id: u64,
+        layout: JunctionLayout,
+        graph: &RoadGraph,
+        junction: NodeIndex,
+        sandbox_simple_cross_tl: bool,
+    ) -> Self {
         let green_straight = 10.0_f32;
         let green_left = 8.0_f32;
         let yellow_duration = 3.0_f32;
         let all_red_duration = 2.5_f32;
-        let steps = build_steps_for_layout(
-            layout.arm_count(),
-            green_straight,
-            green_left,
-            yellow_duration,
-            all_red_duration,
-        );
 
-        let (step_index, timer) = stagger_start(&steps, intersection_id);
+        let simple_cross_arm_pairs = if sandbox_simple_cross_tl {
+            classify_plus_cross_arm_pairs(graph, &layout, junction)
+        } else {
+            None
+        };
+
+        let (steps, mode, step_index, timer) = if let Some(((n, s), (e, w))) = simple_cross_arm_pairs {
+            let dur = green_straight.max(5.0);
+            let steps = vec![
+                go(pair_through(n, s), dur),
+                go(pair_through(e, w), dur),
+            ];
+            (steps, LightControlMode::Manual, 0, 0.0)
+        } else {
+            let steps = build_steps_for_layout(
+                layout.arm_count(),
+                green_straight,
+                green_left,
+                yellow_duration,
+                all_red_duration,
+            );
+            let (step_index, timer) = stagger_start(&steps, intersection_id);
+            (steps, LightControlMode::Auto, step_index, timer)
+        };
 
         Self {
             intersection_id,
             layout,
-            mode: LightControlMode::Auto,
+            mode,
             queue_count: 0,
             steps,
             step_index,
@@ -154,10 +227,26 @@ impl PhasedVehicleLight {
             all_red_duration,
             green_straight,
             green_left,
+            simple_cross_arm_pairs,
         }
     }
 
     pub fn rebuild_steps(&mut self) {
+        if let Some(((n, s), (e, w))) = self.simple_cross_arm_pairs {
+            let dur = self.green_straight.max(5.0);
+            self.steps = vec![
+                go(pair_through(n, s), dur),
+                go(pair_through(e, w), dur),
+            ];
+            if self.steps.is_empty() {
+                self.step_index = 0;
+                self.timer = 0.0;
+            } else {
+                self.step_index = self.step_index.min(self.steps.len() - 1);
+            }
+            return;
+        }
+
         let n = self.layout.arm_count();
         self.steps = build_steps_for_layout(
             n,
