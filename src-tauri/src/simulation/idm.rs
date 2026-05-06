@@ -42,6 +42,30 @@ pub fn idm_acceleration(
         .min(vtype.max_accel)
 }
 
+/// Return IDM internals for debugging / telemetry.
+///
+/// Returns `(s_clamped, s_star, accel_unclamped, accel_clamped)`.
+pub fn idm_debug_snapshot(
+    v: f32,
+    v0: f32,
+    s: f32,
+    delta_v: f32,
+    params: &DriverParams,
+    vtype: &VehicleTypeParams,
+) -> (f32, f32, f32, f32) {
+    let a = params.comfort_accel;
+    let b = params.comfort_decel;
+    let s0 = params.min_gap;
+    let t_head = params.time_headway;
+    let s_star = s0 + v * t_head + (v * delta_v) / (2.0 * (a * b).sqrt());
+    let v_ratio = if v0 > 0.0 { v / v0 } else { 0.0 };
+    let s_clamped = s.max(0.1);
+    let s_ratio = s_star / s_clamped;
+    let accel_raw = a * (1.0 - v_ratio.powi(4) - s_ratio.powi(2));
+    let accel_clamped = accel_raw.max(-vtype.max_decel).min(vtype.max_accel);
+    (s_clamped, s_star, accel_raw, accel_clamped)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

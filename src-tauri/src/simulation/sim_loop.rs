@@ -16,7 +16,7 @@ use crate::time::game_clock::GameClock;
 use crate::time::day_cycle::DayCycle;
 use crate::traffic::intersection::IntersectionManager;
 use crate::vehicles::vehicle::Vehicle;
-use crate::simulation::idm::idm_acceleration;
+use crate::simulation::idm::{idm_acceleration, idm_debug_snapshot};
 use crate::simulation::spawn::SpawnSystem;
 use crate::simulation::lane_change::{decide_lane_change, compute_vehicle_target_lane};
 use crate::simulation::congestion::compute_congestion;
@@ -31,6 +31,8 @@ const CONGESTION_INTERVAL_S: f32 = 0.5;
 const MIN_IDM_GAP_M: f32 = 0.1;
 /// Additional spawn breathing room after bumper gap has been computed.
 const SPAWN_BUFFER_M: f32 = 2.0;
+const DEBUG_VEHICLE_ID: u32 = 2;
+const DEBUG_LOG_INTERVAL_S: f32 = 0.5;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -50,6 +52,7 @@ pub fn run_simulation(
     let mut vehicles: Vec<Vehicle> = Vec::with_capacity(512);
     let mut congestion_timer = 0.0f32;
     let mut high_frustration_timer = 0.0f32;
+    let mut idm_debug_timer = 0.0f32;
 
     // ── Build subsystems from map ────────────────────────────────────────────
     let (mut intersections, mut spawn_system, od_model, mut tram_sim) = {
@@ -132,6 +135,7 @@ pub fn run_simulation(
             let game_dt_s       = clock.tick(PHYSICS_DT);
             let game_hour       = clock.game_hour();
             let spawn_multiplier = DayCycle::spawn_multiplier(game_hour);
+            idm_debug_timer += PHYSICS_DT;
 
             // Traffic lights advance by fixed dt
             let light_updates = intersections.update(PHYSICS_DT);
@@ -234,6 +238,45 @@ pub fn run_simulation(
                     vec![0.0; vehicles.len()]
                 }
             };
+
+            if idm_debug_timer >= DEBUG_LOG_INTERVAL_S {
+                let guard = graph_lock.read();
+                if let Some(map) = guard.as_ref() {
+                    if let Some((ego_idx, ego)) = vehicles
+                        .iter()
+                        .enumerate()
+                        .find(|(_, v)| v.id == DEBUG_VEHICLE_ID && !v.despawned)
+                    {
+                        let (base_gap, base_dv) =
+                            find_leader_arc(ego_idx, ego, &vehicles, &edge_lane_vehicles, map);
+                        let (gap, delta_v) =
+                            apply_tram_leader_effect(ego, base_gap, base_dv, &tram_snapshot);
+                        let desired = compute_desired_speed(ego, map);
+                        let (gap, delta_v) =
+                            apply_intersection_effect(ego, gap, delta_v, &intersections, map);
+                        let params = ego.driver_profile.params();
+                        let vtype = ego.vehicle_type.params();
+                        let (s_clamped, s_star, accel_raw, accel_clamped) =
+                            idm_debug_snapshot(ego.speed, desired, gap, delta_v, &params, &vtype);
+                        let s_ratio = s_star / s_clamped;
+                        let leader_speed = (ego.speed - delta_v).max(0.0);
+                        log::info!(
+                            "IDM_DEBUG id={} v={:.2} v0={:.2} v_leader={:.2} dv={:.2} s={:.2} s*={:.2} s_ratio={:.2} accel_raw={:.2} accel={:.2}",
+                            ego.id,
+                            ego.speed,
+                            desired,
+                            leader_speed,
+                            delta_v,
+                            s_clamped,
+                            s_star,
+                            s_ratio,
+                            accel_raw,
+                            accel_clamped,
+                        );
+                    }
+                }
+                idm_debug_timer = 0.0;
+            }
 
             // Apply physics — always uses PHYSICS_DT (fixed step)
             {
