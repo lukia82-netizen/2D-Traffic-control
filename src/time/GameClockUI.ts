@@ -86,6 +86,14 @@ export class GameClockUI {
     return this.currentTimeScale;
   }
 
+  setTimeScaleValue(scale: number): void {
+    const clamped = Math.max(1, Math.min(360, Math.floor(scale)));
+    this.currentTimeScale = clamped;
+    this.speedSlider.value = String(clamped);
+    this.speedValue.textContent = String(clamped);
+    setTimeScale(clamped).catch(console.error);
+  }
+
   // ─── Helpers ───────────────────────────────────────────────────────────────
 
   private require(id: string): HTMLElement {

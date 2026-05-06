@@ -1045,3 +1045,92 @@ html, body {
   min-width: 32px;
   text-align: right;
 }
+
+/* ============================================================
+   Map / Scenario Editor
+   ============================================================ */
+.editor-panel {
+  position: fixed;
+  top: 12px;
+  left: 12px;
+  width: 340px;
+  max-height: calc(100vh - 24px);
+  overflow-y: auto;
+  padding: 10px;
+  background: rgba(12, 12, 24, 0.94);
+  border: 1px solid rgba(90, 130, 255, 0.3);
+  border-radius: 10px;
+  z-index: 121;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.editor-header {
+  font-size: 11px;
+  letter-spacing: 0.09em;
+  font-weight: 700;
+  color: #9ab5ff;
+}
+
+.editor-label {
+  font-size: 10px;
+  color: #6f82b8;
+}
+
+.editor-textarea {
+  width: 100%;
+  min-height: 180px;
+  resize: vertical;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.06);
+  color: #d8defa;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.35;
+  padding: 8px;
+}
+
+.editor-input {
+  width: 100%;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.06);
+  color: #d8defa;
+  padding: 6px 7px;
+  font-size: 12px;
+}
+
+.editor-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 4px;
+}
+
+.editor-row {
+  display: flex;
+  gap: 6px;
+}
+
+.editor-btn {
+  flex: 1;
+  padding: 6px 7px;
+  border-radius: 6px;
+  border: 1px solid rgba(75, 130, 255, 0.5);
+  background: rgba(75, 130, 255, 0.2);
+  color: #b8cbff;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.editor-btn:hover {
+  background: rgba(75, 130, 255, 0.34);
+}
+
+.editor-divider {
+  margin: 2px 0 4px;
+  height: 1px;
+  background: rgba(255, 255, 255, 0.1);
+}
