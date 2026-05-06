@@ -50,7 +50,7 @@ pub fn run_simulation(
     let mut high_frustration_timer = 0.0f32;
 
     // ── Build subsystems from map ────────────────────────────────────────────
-    let (mut intersections, mut spawn_system, mut od_model, mut tram_sim) = {
+    let (mut intersections, mut spawn_system, od_model, mut tram_sim) = {
         let guard = graph_lock.read();
         let map   = guard.as_ref().expect("map must be loaded before starting simulation");
 

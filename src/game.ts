@@ -145,8 +145,8 @@ export class Game {
   private sandboxUI: SandboxUI | null = null;
   private vehiclesVisible = true;
   private currentBbox: [number, number, number, number] = DEFAULT_BBOX;
-  /** null = OSM map; string = sandbox grid type ('mixed'|'one_lane'|…) */
-  private currentGridMode: string | null = 'mixed';
+  /** null = real OSM data; string = sandbox grid type ('mixed'|'one_lane'|…) */
+  private currentGridMode: string | null = 'one_lane';
 
   constructor(map: maplibregl.Map, overlay: PixiOverlay) {
     this.map = map;
@@ -307,7 +307,7 @@ export class Game {
       this.trafficLightUI.setHiddenNodeIds(hiddenNodes);
     }
     this.trafficLightUI.init(this.mapData.nodes);
-    this.trafficLightRenderer.init(this.mapData.nodes);
+    this.trafficLightRenderer.init(this.mapData.nodes, this.mapData.edges);
   }
 
   // ─── Map reload (sandbox dynamic area) ────────────────────────────────────
@@ -353,7 +353,7 @@ export class Game {
     this.trafficLightRenderer.setHiddenNodeIds(hiddenNodes);
     this.trafficLightUI.setHiddenNodeIds(hiddenNodes);
     this.trafficLightUI.init(this.mapData.nodes);
-    this.trafficLightRenderer.init(this.mapData.nodes);
+    this.trafficLightRenderer.init(this.mapData.nodes, this.mapData.edges);
 
     this.sandboxUI?.setLoadingDone(cityName, sizeM);
   }

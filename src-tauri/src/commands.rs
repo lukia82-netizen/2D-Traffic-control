@@ -81,11 +81,12 @@ pub struct MapDataResponse {
 
 // ── Commands ──────────────────────────────────────────────────────────────────
 
+/// Load a map from Overpass API or build a sandbox grid.
+/// `force_sandbox`: when `Some`, skip Overpass.
+///   Values: `"mixed"` | `"one_lane"` | `"two_lane"` | `"three_lane"`
 #[command]
 pub async fn load_map(
     bbox: [f64; 4],
-    /// When `Some`, skip Overpass and build the sandbox grid directly.
-    /// Values: `"mixed"` | `"one_lane"` | `"two_lane"` | `"three_lane"`
     force_sandbox: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<MapDataResponse, String> {
@@ -93,7 +94,7 @@ pub async fn load_map(
 
     // If the caller explicitly requested a sandbox grid, skip Overpass entirely.
     if let Some(ref grid_type) = force_sandbox {
-        let map_data = build_demo_road_network(grid_type);
+        let map_data = build_demo_road_network(grid_type, bbox);
         let response = build_map_response(&map_data);
         let mut guard = state.road_graph.write();
         *guard = Some(map_data);
@@ -107,7 +108,7 @@ pub async fn load_map(
         }
         Err(e) => {
             log::warn!("Overpass API unavailable ({}), falling back to sandbox mixed grid", e);
-            build_demo_road_network("mixed")
+            build_demo_road_network("mixed", bbox)
         }
     };
 

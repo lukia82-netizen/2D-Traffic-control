@@ -108,27 +108,31 @@ pub struct MapData {
 
 // ── Demo network ─────────────────────────────────────────────────────────────
 
-/// Build a simple 5×5 grid road network centred on Kraków.
-/// Used as a fallback when the Overpass API is not reachable.
-/// Build the **sandbox** 3×3 grid road network centred on Kraków.
+/// Build the **sandbox** 3×3 grid road network centred on the supplied bbox.
 ///
 /// `grid_type` selects the lane layout:
 ///
-/// | value         | horizontal lanes | vertical lanes |
-/// |---|---|---|
-/// | `"mixed"`     | row+1 (1/2/3)    | col+1 (1/2/3)  |
-/// | `"one_lane"`  | 1                | 1              |
-/// | `"two_lane"`  | 2                | 2              |
-/// | `"three_lane"`| 3                | 3              |
+/// | value         | lanes per segment          |
+/// |---|---|
+/// | `"mixed"`     | cycles 1/2/3 per row/col   |
+/// | `"one_lane"`  | 1                          |
+/// | `"two_lane"`  | 2                          |
+/// | `"three_lane"`| 3                          |
 ///
 /// All roads bidirectional, all intersections = TrafficLight.
-pub fn build_demo_road_network(grid_type: &str) -> MapData {
-    const CX: f64 = 19.940;        // centre longitude (Kraków)
-    const CY: f64 = 50.060;        // centre latitude
-    const STEP_LNG: f64 = 0.0055;  // ≈ 400 m east–west at 50°N
-    const STEP_LAT: f64 = 0.0036;  // ≈ 400 m north–south
+pub fn build_demo_road_network(grid_type: &str, bbox: [f64; 4]) -> MapData {
+    // Centre the demo grid on the requested bbox so it's always in view.
+    // bbox = [west, south, east, north]
+    let cx = (bbox[0] + bbox[2]) / 2.0;
+    let cy = (bbox[1] + bbox[3]) / 2.0;
+
     const COLS: usize = 3;
     const ROWS: usize = 3;
+
+    // ~400 m spacing, scaled for latitude
+    let step_lat: f64 = 0.0036;
+    let cos_lat = (cy * std::f64::consts::PI / 180.0).cos().max(0.01);
+    let step_lng: f64 = step_lat / cos_lat;
 
     let mut graph = RoadGraph::new();
     let mut node_index_map: HashMap<u64, NodeIndex> = HashMap::new();
@@ -138,8 +142,8 @@ pub fn build_demo_road_network(grid_type: &str) -> MapData {
     // Create 9 intersection nodes
     for r in 0..ROWS {
         for c in 0..COLS {
-            let lat = CY + (r as f64 - 1.0) * STEP_LAT;
-            let lng = CX + (c as f64 - 1.0) * STEP_LNG;
+            let lat = cy + (r as f64 - 1.0) * step_lat;
+            let lng = cx + (c as f64 - 1.0) * step_lng;
             let idx = graph.add_node(RoadNode {
                 osm_id: nid(r, c),
                 lat,
@@ -190,7 +194,7 @@ pub fn build_demo_road_network(grid_type: &str) -> MapData {
             "one_lane"   => 1,
             "two_lane"   => 2,
             "three_lane" => 3,
-            _            => (idx + 1) as u8, // "mixed": row/col index + 1
+            _            => (idx % 3 + 1) as u8, // "mixed": 1, 2, 3
         }
     };
     let spec = |lanes: u8| -> (f32, &'static str) {
@@ -236,7 +240,7 @@ pub fn build_demo_road_network(grid_type: &str) -> MapData {
         .collect();
 
     log::info!(
-        "Built SANDBOX 3×3 grid: {} nodes, {} directed edges, 1/2/3-lane roads",
+        "Built SANDBOX 3×3 grid: {} nodes, {} directed edges, mixed-lane roads",
         graph.node_count(),
         graph.edge_count(),
     );
