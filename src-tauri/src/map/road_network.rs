@@ -265,6 +265,82 @@ pub fn build_demo_road_network(grid_type: &str, bbox: [f64; 4]) -> MapData {
     }
 }
 
+/// Build the **single-road** test map: one straight 600 m one-way road.
+///
+/// Used to verify IDM fundamentals: vehicles should queue up without
+/// overlapping, accelerate freely, and despawn at the far end.
+///
+/// Layout:  [START] ──────────────────── [END]
+///                      600 m oneway →
+///
+/// START is the only spawn point; END is the only boundary (despawn) node.
+pub fn build_single_road_network(bbox: [f64; 4]) -> MapData {
+    let cx = (bbox[0] + bbox[2]) / 2.0;
+    let cy = (bbox[1] + bbox[3]) / 2.0;
+    // 600 m east along latitude cy
+    let cos_lat = (cy * std::f64::consts::PI / 180.0).cos().max(0.01);
+    let half_lng = 0.003 / cos_lat; // ~300 m east and west of centre
+
+    let mut graph = RoadGraph::new();
+    let mut node_index_map: HashMap<u64, NodeIndex> = HashMap::new();
+
+    let start_node = graph.add_node(RoadNode {
+        osm_id: 0,
+        lat:    cy,
+        lng:    cx - half_lng,
+        intersection_type: IntersectionType::Plain,
+    });
+    let end_node = graph.add_node(RoadNode {
+        osm_id: 1,
+        lat:    cy,
+        lng:    cx + half_lng,
+        intersection_type: IntersectionType::Plain,
+    });
+    node_index_map.insert(0, start_node);
+    node_index_map.insert(1, end_node);
+
+    let length_m = haversine_distance_m(cy, cx - half_lng, cy, cx + half_lng);
+    let edge = RoadEdge {
+        osm_id: 0,
+        lanes:  1,
+        max_speed: 13.89, // 50 km/h
+        oneway: true,
+        infra_type: InfraType::Normal,
+        layer: 0,
+        length_m,
+        lane_directions: vec![LaneDirection::Straight],
+        decision_points: [length_m * 0.25, length_m * 0.5, length_m * 0.75],
+        road_type: "secondary".to_string(),
+        has_tram_track: false,
+    };
+    graph.add_edge(start_node, end_node, edge);
+
+    let bbox = compute_bbox(&graph);
+    let spawn_points   = vec![start_node];
+    let boundary_nodes = vec![end_node];
+
+    log::info!("Built SINGLE-ROAD test: 2 nodes, 1 edge ({:.0} m)", length_m);
+
+    let tram_data = TramData {
+        graph: crate::map::tram_network::TramGraph::new(),
+        node_index_map: HashMap::new(),
+        stops: Vec::new(),
+        lines: Vec::new(),
+    };
+
+    MapData {
+        graph,
+        node_index_map,
+        bbox,
+        spawn_points,
+        boundary_nodes,
+        od_buildings: Vec::new(),
+        restrictions: Vec::new(),
+        tram_data,
+        is_sandbox: true,
+    }
+}
+
 // ── Real OSM network ─────────────────────────────────────────────────────────
 
 pub fn build_road_network(osm_data: OsmData) -> MapData {

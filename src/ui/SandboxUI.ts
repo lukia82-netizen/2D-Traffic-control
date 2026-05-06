@@ -38,10 +38,11 @@ export type MapModeCb = (forceSandbox: string | null) => void;
 
 /** Grid type label, value, and colour hint. */
 const GRID_TYPES = [
-  { label: 'Mieszana',  value: 'mixed',       hint: '1/2/3 pasy' },
-  { label: '1 pas',     value: 'one_lane',    hint: 'tertiary 50' },
-  { label: '2 pasy',    value: 'two_lane',    hint: 'secondary 70' },
-  { label: '3 pasy',    value: 'three_lane',  hint: 'primary 70' },
+  { label: 'Jedna droga',  value: 'single_road',  hint: '1 droga IDM test' },
+  { label: 'Mieszana',     value: 'mixed',         hint: '1/2/3 pasy 3x3' },
+  { label: '1 pas',        value: 'one_lane',      hint: 'tertiary 50' },
+  { label: '2 pasy',       value: 'two_lane',      hint: 'secondary 70' },
+  { label: '3 pasy',       value: 'three_lane',    hint: 'primary 70' },
 ] as const;
 
 // ─── City & size presets ─────────────────────────────────────────────────────
@@ -276,17 +277,17 @@ export class SandboxUI {
     const input = document.createElement('input');
     input.type = 'number';
     input.className = 'sbx-num-input';
-    input.min = '10';
+    input.min = '5';
     input.max = '1000';
-    input.step = '10';
-    input.value = '100';
+    input.step = '5';
+    input.value = '20';
 
     const applyBtn = document.createElement('button');
     applyBtn.className = 'sbx-apply-btn';
     applyBtn.textContent = 'Ustaw';
 
     const apply = () => {
-      const val = Math.max(10, Math.min(1000, parseInt(input.value, 10) || 100));
+      const val = Math.max(5, Math.min(1000, parseInt(input.value, 10) || 20));
       input.value = String(val);
       this.onMaxVehiclesChange(val);
     };

@@ -145,8 +145,8 @@ export class Game {
   private sandboxUI: SandboxUI | null = null;
   private vehiclesVisible = true;
   private currentBbox: [number, number, number, number] = DEFAULT_BBOX;
-  /** null = real OSM data; string = sandbox grid type ('mixed'|'one_lane'|…) */
-  private currentGridMode: string | null = 'one_lane';
+  /** null = real OSM data; string = sandbox grid type ('mixed'|'one_lane'|'single_road'|…) */
+  private currentGridMode: string | null = 'single_road';
 
   constructor(map: maplibregl.Map, overlay: PixiOverlay) {
     this.map = map;
@@ -235,6 +235,10 @@ export class Game {
         setMaxVehicles(count).catch(console.error);
       }
     };
+    // Apply the UI's default immediately so the backend cap matches the displayed value.
+    if (this.tauriAvailable) {
+      setMaxVehicles(20).catch(console.error);
+    }
 
     ui.onReloadMap = (center, sizeM) => {
       // Degrees per metre at given latitude

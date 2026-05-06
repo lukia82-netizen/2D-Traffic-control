@@ -157,11 +157,15 @@ pub fn run_simulation(
             }
         }
         for bucket in edge_lane_vehicles.values_mut() {
-            // Sort ascending: vehicle with lowest edge_progress is at front of bucket (closest to edge start)
+            // Sort ascending by edge_progress: vehicle closest to edge start is first.
+            // Tiebreaker: lower vehicle ID is considered ahead (older = spawned earlier
+            // = had more time to advance). This prevents newly spawned vehicles
+            // from being treated as the leader over vehicles that are actually ahead.
             bucket.sort_unstable_by(|&a, &b| {
                 vehicles[a].edge_progress
                     .partial_cmp(&vehicles[b].edge_progress)
                     .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| vehicles[a].id.cmp(&vehicles[b].id))
             });
         }
 

@@ -153,6 +153,11 @@ impl SpawnSystem {
         vehicle.current_lateral_offset = initial_target as f32;
         vehicle.target_lateral_offset  = initial_target as f32;
 
+        // Give new vehicles a tiny initial speed so they are not all stuck
+        // at edge_progress=0.0 simultaneously.  This ensures a non-zero gap
+        // in the IDM leader bucket from the very first frame.
+        vehicle.speed = 2.0; // 2 m/s ≈ 7 km/h — slow start
+
         Some(vehicle)
     }
 
@@ -241,6 +246,7 @@ impl SpawnSystem {
         vehicle.current_lane = initial_target;
         vehicle.current_lateral_offset = initial_target as f32;
         vehicle.target_lateral_offset  = initial_target as f32;
+        vehicle.speed = 2.0; // slow start — prevents all spawned cars sharing edge_progress=0
 
         Some(vehicle)
     }

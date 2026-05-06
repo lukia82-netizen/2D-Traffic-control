@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::state::{AppState, SimCommand, SimControl, LightControlMode};
 use crate::map::osm_loader::fetch_osm_data;
 use crate::map::road_network::{
-    build_road_network, build_demo_road_network, MapData, IntersectionType, InfraType,
+    build_road_network, build_demo_road_network, build_single_road_network, MapData, IntersectionType, InfraType,
     LaneDirection, RestrictionKind,
 };
 use crate::simulation::sim_loop::run_simulation;
@@ -94,7 +94,11 @@ pub async fn load_map(
 
     // If the caller explicitly requested a sandbox grid, skip Overpass entirely.
     if let Some(ref grid_type) = force_sandbox {
-        let map_data = build_demo_road_network(grid_type, bbox);
+        let map_data = if grid_type == "single_road" {
+            build_single_road_network(bbox)
+        } else {
+            build_demo_road_network(grid_type, bbox)
+        };
         let response = build_map_response(&map_data);
         let mut guard = state.road_graph.write();
         *guard = Some(map_data);
