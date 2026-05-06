@@ -46,6 +46,9 @@ export class TrafficLightRenderer {
   /** Sprite lookup for incremental phase updates. */
   private sprites: Map<number, PIXI.Graphics> = new Map();
 
+  /** Node IDs whose associated road groups are all hidden. */
+  private hiddenNodeIds: Set<number> = new Set();
+
   constructor(overlay: PixiOverlay, map: maplibregl.Map) {
     this.overlay = overlay;
     this.map = map;
@@ -78,6 +81,16 @@ export class TrafficLightRenderer {
     this.rebuild();
   }
 
+  /**
+   * Update the set of node IDs whose traffic lights should be hidden
+   * because all road groups connected to them are invisible.
+   * Triggers a full sprite rebuild.
+   */
+  setHiddenNodeIds(ids: Set<number>): void {
+    this.hiddenNodeIds = ids;
+    this.rebuild();
+  }
+
   destroy(): void {
     this.sprites.clear();
     this.overlay.trafficLights.removeChildren();
@@ -98,6 +111,8 @@ export class TrafficLightRenderer {
     const br    = BULB_RADIUS_REF    * scale;
 
     for (const node of this.lightNodes) {
+      if (this.hiddenNodeIds.has(node.id)) continue;
+
       const px    = projectPoint(this.map, node.lng, node.lat);
       const phase = this.lightPhases.get(node.id) ?? 0; // default Red
 

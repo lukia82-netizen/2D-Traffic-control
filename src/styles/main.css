@@ -944,6 +944,36 @@ html, body {
   color: #9098b8;
 }
 
+/* Area status & reload */
+.sbx-area-status {
+  font-size: 10px;
+  color: #6878a8;
+  text-align: center;
+  margin: 4px 0 3px;
+  font-variant-numeric: tabular-nums;
+}
+.sbx-reload-btn {
+  width: 100%;
+  margin-top: 4px;
+  padding: 5px 0;
+  background: rgba(60,160,100,0.18);
+  border: 1px solid rgba(60,200,120,0.35);
+  border-radius: 5px;
+  color: #70e0a0;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.sbx-reload-btn:hover:not(:disabled) {
+  background: rgba(60,200,120,0.28);
+  color: #a0ffcc;
+}
+.sbx-reload-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 /* Stats */
 .sbx-stat-row {
   display: flex;

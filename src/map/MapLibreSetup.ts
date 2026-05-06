@@ -6,9 +6,9 @@ import maplibregl from 'maplibre-gl';
 export const KRAKOW_CENTER: [number, number] = [19.9368, 50.0614];
 export const KRAKOW_BBOX: [number, number, number, number] = [19.930, 50.057, 19.944, 50.066];
 
-/** Leszno – centrum, ~2 km × 2 km (sandbox default) */
+/** Leszno – centrum, ~500 m × 500 m (sandbox default) */
 export const LESZNO_CENTER: [number, number] = [16.575, 51.845];
-export const LESZNO_BBOX: [number, number, number, number] = [16.555, 51.833, 16.600, 51.858];
+export const LESZNO_BBOX: [number, number, number, number] = [16.571, 51.843, 16.579, 51.847];
 
 // Active defaults (sandbox starts with Leszno)
 const DEFAULT_CENTER = LESZNO_CENTER;

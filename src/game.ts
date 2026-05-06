@@ -25,8 +25,9 @@ import { UIRenderer } from './rendering/UIRenderer';
 import { TrafficLightUI } from './traffic/TrafficLightUI';
 import { TrafficLightRenderer } from './rendering/TrafficLightRenderer';
 import { GameClockUI } from './time/GameClockUI';
-import { SandboxUI } from './ui/SandboxUI';
+import { SandboxUI, CITY_PRESETS } from './ui/SandboxUI';
 import { LESZNO_BBOX } from './map/MapLibreSetup';
+import { ROAD_TYPE_GROUP } from './rendering/RoadRenderer';
 
 // ─── Mode: always start in SANDBOX ───────────────────────────────────────────
 // Sandbox uses Leszno, skips building rendering (big perf win), shows
@@ -142,6 +143,7 @@ export class Game {
   // Sandbox mode
   private sandboxUI: SandboxUI | null = null;
   private vehiclesVisible = true;
+  private currentBbox: [number, number, number, number] = DEFAULT_BBOX;
 
   constructor(map: maplibregl.Map, overlay: PixiOverlay) {
     this.map = map;
@@ -219,6 +221,23 @@ export class Game {
       this.roadRenderer.setGroupVisible(group, visible);
       // Sync to VehicleRenderer so vehicles on hidden roads also disappear
       this.vehicleRenderer.setHiddenGroups(this.roadRenderer.getHiddenGroups());
+      // Sync to TrafficLight renderers so lights on fully-hidden nodes disappear
+      const hiddenNodes = this.computeHiddenNodeIds();
+      this.trafficLightRenderer.setHiddenNodeIds(hiddenNodes);
+      this.trafficLightUI.setHiddenNodeIds(hiddenNodes);
+    };
+
+    ui.onReloadMap = (center, sizeM) => {
+      // Degrees per metre at given latitude
+      const lat = center[1];
+      const dLat = (sizeM / 2) / 111320;
+      const dLng = (sizeM / 2) / (111320 * Math.cos(lat * Math.PI / 180));
+      const bbox: [number, number, number, number] = [
+        center[0] - dLng, lat - dLat,
+        center[0] + dLng, lat + dLat,
+      ];
+      const cityName = CITY_PRESETS.find(c => c.center[0] === center[0] && c.center[1] === center[1])?.name ?? 'Custom';
+      this.reloadMap(bbox, sizeM, cityName);
     };
 
     ui.onOsmModeToggle = (enabled) => {
@@ -251,7 +270,7 @@ export class Game {
   private async loadMapData(): Promise<void> {
     this.uiRenderer.showNotification('Loading map data…', 'info');
     try {
-      this.mapData = await loadMap(DEFAULT_BBOX);
+      this.mapData = await loadMap(this.currentBbox);
       this.uiRenderer.showNotification(
         `Map loaded – ${this.mapData.nodes.length} nodes, ${this.mapData.edges.length} edges`,
         'info',
@@ -267,14 +286,85 @@ export class Game {
     if (!SANDBOX_MODE) this.buildingRenderer.build(this.mapData);
     this.roadRenderer.build(this.mapData);
     this.infraRenderer.buildStaticLayer(this.mapData);
-    // Give VehicleRenderer the edge spatial index for road-group filtering
     this.vehicleRenderer.setEdgeIndex(this.mapData);
-    // Sync initial hidden groups (sandbox defaults service=hidden)
     if (SANDBOX_MODE) {
       this.vehicleRenderer.setHiddenGroups(this.roadRenderer.getHiddenGroups());
+      const hiddenNodes = this.computeHiddenNodeIds();
+      this.trafficLightRenderer.setHiddenNodeIds(hiddenNodes);
+      this.trafficLightUI.setHiddenNodeIds(hiddenNodes);
     }
     this.trafficLightUI.init(this.mapData.nodes);
     this.trafficLightRenderer.init(this.mapData.nodes);
+  }
+
+  // ─── Map reload (sandbox dynamic area) ────────────────────────────────────
+
+  private async reloadMap(
+    bbox: [number, number, number, number],
+    sizeM: number,
+    cityName: string,
+  ): Promise<void> {
+    this.currentBbox = bbox;
+    this.vehicles.clear();
+
+    this.uiRenderer.showNotification(`Reloading map – ${cityName} ${sizeM >= 1000 ? sizeM / 1000 + ' km' : sizeM + ' m'}…`, 'info');
+
+    try {
+      this.mapData = await loadMap(bbox);
+      this.uiRenderer.showNotification(
+        `Map reloaded – ${this.mapData.nodes.length} nodes, ${this.mapData.edges.length} edges`,
+        'info',
+      );
+    } catch (err) {
+      console.warn('Overpass unavailable on reload:', err);
+      this.uiRenderer.showNotification('Reload failed – kept old map', 'error');
+      this.sandboxUI?.setLoadingDone(cityName, sizeM);
+      return; // keep old map
+    }
+
+    // Re-center the camera
+    const cx = (bbox[0] + bbox[2]) / 2;
+    const cy = (bbox[1] + bbox[3]) / 2;
+    this.map.setCenter([cx, cy]);
+
+    this.roadRenderer.build(this.mapData);
+    this.infraRenderer.buildStaticLayer(this.mapData);
+    this.vehicleRenderer.setEdgeIndex(this.mapData);
+    this.vehicleRenderer.setHiddenGroups(this.roadRenderer.getHiddenGroups());
+
+    const hiddenNodes = this.computeHiddenNodeIds();
+    this.trafficLightRenderer.setHiddenNodeIds(hiddenNodes);
+    this.trafficLightUI.setHiddenNodeIds(hiddenNodes);
+    this.trafficLightUI.init(this.mapData.nodes);
+    this.trafficLightRenderer.init(this.mapData.nodes);
+
+    this.sandboxUI?.setLoadingDone(cityName, sizeM);
+  }
+
+  // ─── Hidden-node helper ────────────────────────────────────────────────────
+
+  /**
+   * Returns the set of node IDs where ALL connected road groups are currently
+   * hidden.  Used to sync traffic-light visibility with road layer toggles.
+   */
+  private computeHiddenNodeIds(): Set<number> {
+    if (!this.mapData) return new Set();
+    const hiddenGroups = this.roadRenderer.getHiddenGroups();
+    const nodeGroups = new Map<number, Set<string>>();
+    for (const edge of this.mapData.edges) {
+      const group = (ROAD_TYPE_GROUP as Record<string, string>)[edge.roadType] ?? 'residential';
+      for (const nodeId of [edge.from, edge.to]) {
+        if (!nodeGroups.has(nodeId)) nodeGroups.set(nodeId, new Set());
+        nodeGroups.get(nodeId)!.add(group);
+      }
+    }
+    const hidden = new Set<number>();
+    for (const [nodeId, groups] of nodeGroups) {
+      if ([...groups].every(g => hiddenGroups.has(g))) {
+        hidden.add(nodeId);
+      }
+    }
+    return hidden;
   }
 
   // ─── Event subscriptions ───────────────────────────────────────────────────

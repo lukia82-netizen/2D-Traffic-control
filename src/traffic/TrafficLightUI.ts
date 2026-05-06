@@ -46,6 +46,7 @@ export class TrafficLightUI {
   private selectedIntersectionId: number | null = null;
   private readonly lightStates: Map<number, LightStateUpdate> = new Map();
   private intersectionNodes: NodeData[] = [];
+  private hiddenNodeIds: Set<number> = new Set();
 
   // Click-detect radius in pixels
   private static readonly CLICK_RADIUS_PX = 20;
@@ -156,6 +157,18 @@ export class TrafficLightUI {
     this.selectedIntersectionId = null;
   }
 
+  /**
+   * Update the set of node IDs whose traffic lights are hidden (road groups
+   * invisible). Clicking on hidden nodes is silently ignored; if the currently
+   * open panel belongs to a now-hidden node, close it.
+   */
+  setHiddenNodeIds(ids: Set<number>): void {
+    this.hiddenNodeIds = ids;
+    if (this.selectedIntersectionId !== null && ids.has(this.selectedIntersectionId)) {
+      this.hidePanel();
+    }
+  }
+
   // ─── State updates ─────────────────────────────────────────────────────────
 
   updateLightState(updates: LightStateUpdate[]): void {
@@ -215,6 +228,7 @@ export class TrafficLightUI {
     let bestDist = TrafficLightUI.CLICK_RADIUS_PX;
 
     for (const node of this.intersectionNodes) {
+      if (this.hiddenNodeIds.has(node.id)) continue;
       const nodePx = this.map.project([node.lng, node.lat]);
       const dist = Math.hypot(nodePx.x - px, nodePx.y - py);
       if (dist < bestDist) {

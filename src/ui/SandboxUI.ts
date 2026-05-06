@@ -26,6 +26,20 @@ export type OsmModeCb        = (enabled: boolean) => void;
 export type VehicleToggleCb  = (visible: boolean) => void;
 export type BuildingToggleCb = (visible: boolean) => void;
 export type MapBgToggleCb    = (visible: boolean) => void;
+/** center = [lng, lat], sizeM = metres per side */
+export type ReloadMapCb      = (center: [number, number], sizeM: number) => void;
+
+// ─── City & size presets ─────────────────────────────────────────────────────
+
+export interface CityPreset { name: string; center: [number, number]; }
+
+export const CITY_PRESETS: CityPreset[] = [
+  { name: 'Leszno',  center: [16.575, 51.845] },
+  { name: 'Kraków',  center: [19.937, 50.061] },
+];
+
+export const AREA_SIZES = [500, 1000, 2000] as const;
+export type AreaSize = typeof AREA_SIZES[number];
 
 // ─── SandboxUI ────────────────────────────────────────────────────────────────
 
@@ -43,6 +57,14 @@ export class SandboxUI {
   private readonly panel: HTMLElement;
   private osmMode = false;
 
+  // Area selector state
+  private selectedCity: CityPreset = CITY_PRESETS[0];
+  private selectedSize: AreaSize   = 500;
+  private areaStatusEl!: HTMLElement;
+  private cityBtns: Map<string, HTMLButtonElement> = new Map();
+  private sizeBtns: Map<number, HTMLButtonElement> = new Map();
+  private reloadBtn!: HTMLButtonElement;
+
   // DOM refs for live updates
   private readonly checkboxes: Map<string, HTMLInputElement> = new Map();
   private statVehicles!: HTMLElement;
@@ -55,6 +77,7 @@ export class SandboxUI {
   onVehicleToggle:  VehicleToggleCb  = () => undefined;
   onBuildingToggle: BuildingToggleCb = () => undefined;
   onMapBgToggle:    MapBgToggleCb    = () => undefined;
+  onReloadMap:      ReloadMapCb      = () => undefined;
 
   constructor() {
     this.panel = this.buildPanel();
@@ -66,6 +89,13 @@ export class SandboxUI {
   update(vehicleCount: number, fps: number): void {
     this.statVehicles.textContent = String(vehicleCount);
     this.statFps.textContent = fps.toFixed(0);
+  }
+
+  /** Call after a map reload completes to update status label and reset button. */
+  setLoadingDone(cityName: string, sizeM: number): void {
+    this.areaStatusEl.textContent = `${cityName} · ${sizeM >= 1000 ? sizeM / 1000 + ' km' : sizeM + ' m'}`;
+    this.reloadBtn.disabled = false;
+    this.reloadBtn.textContent = 'Przeładuj';
   }
 
   destroy(): void {
@@ -80,6 +110,7 @@ export class SandboxUI {
     panel.className = 'sandbox-panel';
 
     panel.appendChild(this.buildHeader());
+    panel.appendChild(this.buildAreaSection());
     panel.appendChild(this.buildViewModeSection());
     panel.appendChild(this.buildLayerSection());
     panel.appendChild(this.buildLegendSection());
@@ -91,8 +122,65 @@ export class SandboxUI {
   private buildHeader(): HTMLElement {
     const h = document.createElement('div');
     h.className = 'sbx-header';
-    h.innerHTML = `<span class="sbx-badge">SANDBOX</span><span class="sbx-city">Leszno</span>`;
+    h.innerHTML = `<span class="sbx-badge">SANDBOX</span>`;
     return h;
+  }
+
+  // ── Area / city selector ─────────────────────────────────────────────────
+
+  private buildAreaSection(): HTMLElement {
+    const sec = this.makeSection('OBSZAR MAPY');
+
+    // City buttons
+    const cityRow = document.createElement('div');
+    cityRow.className = 'sbx-toggle-row';
+    for (const city of CITY_PRESETS) {
+      const btn = document.createElement('button');
+      btn.className = 'sbx-view-btn' + (city.name === this.selectedCity.name ? ' active' : '');
+      btn.textContent = city.name;
+      btn.addEventListener('click', () => {
+        this.selectedCity = city;
+        this.cityBtns.forEach((b, n) => b.classList.toggle('active', n === city.name));
+      });
+      this.cityBtns.set(city.name, btn);
+      cityRow.appendChild(btn);
+    }
+    sec.appendChild(cityRow);
+
+    // Size buttons
+    const sizeRow = document.createElement('div');
+    sizeRow.className = 'sbx-toggle-row';
+    for (const sz of AREA_SIZES) {
+      const btn = document.createElement('button');
+      btn.className = 'sbx-view-btn' + (sz === this.selectedSize ? ' active' : '');
+      btn.textContent = sz >= 1000 ? `${sz / 1000} km` : `${sz} m`;
+      btn.addEventListener('click', () => {
+        this.selectedSize = sz as AreaSize;
+        this.sizeBtns.forEach((b, s) => b.classList.toggle('active', s === sz));
+      });
+      this.sizeBtns.set(sz, btn);
+      sizeRow.appendChild(btn);
+    }
+    sec.appendChild(sizeRow);
+
+    // Status label
+    this.areaStatusEl = document.createElement('div');
+    this.areaStatusEl.className = 'sbx-area-status';
+    this.areaStatusEl.textContent = `${this.selectedCity.name} · ${this.selectedSize} m`;
+    sec.appendChild(this.areaStatusEl);
+
+    // Reload button
+    this.reloadBtn = document.createElement('button');
+    this.reloadBtn.className = 'sbx-reload-btn';
+    this.reloadBtn.textContent = 'Przeładuj';
+    this.reloadBtn.addEventListener('click', () => {
+      this.reloadBtn.disabled = true;
+      this.reloadBtn.textContent = 'Ładowanie…';
+      this.onReloadMap(this.selectedCity.center, this.selectedSize);
+    });
+    sec.appendChild(this.reloadBtn);
+
+    return sec;
   }
 
   // ── View mode (Game ↔ OSM) ───────────────────────────────────────────────
