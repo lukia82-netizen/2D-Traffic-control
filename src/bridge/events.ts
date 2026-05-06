@@ -35,10 +35,15 @@ export interface LightStateUpdate {
   queueCount: number;
   /** Current control mode: "manual" | "semi_auto" | "auto" | "adaptive" */
   mode: string;
-  /** Configured green phase duration (seconds). */
+  /** Main through / straight green duration (seconds). */
   greenDuration: number;
-  /** Configured red phase duration (seconds). */
+  /** Secondary protected-left green duration (seconds). */
   redDuration: number;
+  /**
+   * Per inbound-arm bulb colour (phase 0=R, 1=Y, 2=G), clockwise sorted like the simulation.
+   * Omitted at pedestrian crossings.
+   */
+  junctionArmPhases?: number[];
 }
 
 // ─── Binary frame parser ──────────────────────────────────────────────────────
