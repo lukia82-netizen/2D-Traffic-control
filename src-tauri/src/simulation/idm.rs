@@ -30,7 +30,8 @@ pub fn idm_acceleration(
 
     // IDM formula: a_idm = a · [1 − (v/v0)^4 − (s*/s)^2]
     let v_ratio = if v0 > 0.0 { v / v0 } else { 0.0 };
-    let s_clamped = s.max(0.001); // avoid division by zero
+    // IDM expects free space between bumpers; never allow non-positive gap.
+    let s_clamped = s.max(0.1);
     let s_ratio = s_star / s_clamped;
 
     let accel = a * (1.0 - v_ratio.powi(4) - s_ratio.powi(2));

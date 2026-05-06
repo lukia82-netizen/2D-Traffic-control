@@ -27,8 +27,10 @@ use crate::simulation::tram_sim::TramSim;
 const TARGET_TICK_S: f32 = 1.0 / 60.0;
 const CONGESTION_INTERVAL_S: f32 = 0.5;
 
-/// Physical length of a vehicle subtracted from the gap so IDM sees bumper-to-bumper distance.
-const VEHICLE_LENGTH_M: f32 = 4.5;
+/// Smallest admissible IDM free gap to avoid divide-by-zero and explosive braking.
+const MIN_IDM_GAP_M: f32 = 0.1;
+/// Additional spawn breathing room after bumper gap has been computed.
+const SPAWN_BUFFER_M: f32 = 2.0;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -166,14 +168,17 @@ pub fn run_simulation(
                             let edge_len = map.graph.edge_weight(first_edge)
                                 .map(|e| e.length_m)
                                 .unwrap_or(100.0);
-                            // Minimum headway: 2 vehicle lengths + s0
-                            const SPAWN_CLEARANCE_M: f32 = VEHICLE_LENGTH_M * 2.5 + 2.0;
-                            let clearance_t = SPAWN_CLEARANCE_M / edge_len.max(1.0);
                             let blocked = vehicles.iter().any(|v| {
+                                let new_len = nv.vehicle_type.params().length_m;
+                                let existing_len = v.vehicle_type.params().length_m;
+                                let center_dist_m = v.edge_progress * edge_len;
+                                let bumper_gap_m =
+                                    center_dist_m - 0.5 * (new_len + existing_len);
+                                let min_spawn_gap_m = new_len.max(existing_len) + SPAWN_BUFFER_M;
                                 v.route_pos < v.route.len()
                                     && v.route[v.route_pos] == first_edge
                                     && v.current_lane == nv.current_lane
-                                    && v.edge_progress < clearance_t
+                                    && bumper_gap_m < min_spawn_gap_m
                             });
                             if blocked { continue; } // no room, skip this tick
                         }
@@ -406,9 +411,9 @@ fn find_leader_arc(
         if let Some(pos) = bucket.iter().position(|&idx| idx == ego_idx) {
             if let Some(&leader_idx) = bucket.get(pos + 1) {
                 let leader = &vehicles[leader_idx];
-                let gap = (leader.edge_progress - ego.edge_progress) * ego_edge_len
-                    - VEHICLE_LENGTH_M;
-                return (gap.max(0.01), ego.speed - leader.speed);
+                let center_dist_m = (leader.edge_progress - ego.edge_progress) * ego_edge_len;
+                let gap = bumper_gap(center_dist_m, ego, leader);
+                return (gap.max(MIN_IDM_GAP_M), ego.speed - leader.speed);
             }
         }
     }
@@ -435,8 +440,8 @@ fn find_leader_arc(
                 if let Some(&leader_idx) = bucket.first() {
                     let leader = &vehicles[leader_idx];
                     let leader_from_start = leader.edge_progress * next_edge_len;
-                    let gap = dist_to_end + leader_from_start - VEHICLE_LENGTH_M;
-                    let gap = gap.max(0.01);
+                    let center_dist_m = dist_to_end + leader_from_start;
+                    let gap = bumper_gap(center_dist_m, ego, leader).max(MIN_IDM_GAP_M);
                     if gap < best_gap {
                         best_gap = gap;
                         best_dv  = ego.speed - leader.speed;
@@ -451,6 +456,13 @@ fn find_leader_arc(
     }
 
     (1000.0, 0.0) // free road ahead
+}
+
+#[inline]
+fn bumper_gap(center_dist_m: f32, ego: &Vehicle, leader: &Vehicle) -> f32 {
+    let ego_len = ego.vehicle_type.params().length_m;
+    let leader_len = leader.vehicle_type.params().length_m;
+    center_dist_m - 0.5 * (ego_len + leader_len)
 }
 
 #[inline]
