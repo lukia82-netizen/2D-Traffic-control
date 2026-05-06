@@ -27,22 +27,22 @@ export class UIRenderer {
   // ─── Public API ────────────────────────────────────────────────────────────
 
   /**
-   * Update the satisfaction progress bar.
-   * @param avgSatisfaction 0–100
+   * Update the Traffic Rage Meter (frustration bar).
+   * @param avgFrustration 0 (calm) – 100 (full rage)
    */
-  updateSatisfaction(avgSatisfaction: number): void {
-    const clamped = Math.max(0, Math.min(100, avgSatisfaction));
+  updateSatisfaction(avgFrustration: number): void {
+    const clamped = Math.max(0, Math.min(100, avgFrustration));
     const pct = clamped.toFixed(0);
 
     this.satisfactionFill.style.width = `${pct}%`;
     this.satisfactionValue.textContent = `${pct}%`;
 
-    // Colour feedback: green > 70, yellow 40–70, red < 40
-    if (clamped >= 70) {
+    // Colour: green (calm) → yellow → orange → red (rage)
+    if (clamped < 40) {
       this.satisfactionFill.style.background =
         'linear-gradient(90deg, #00d4ff, #00ff88)';
       this.satisfactionValue.style.color = '#00ff88';
-    } else if (clamped >= 40) {
+    } else if (clamped < 65) {
       this.satisfactionFill.style.background =
         'linear-gradient(90deg, #ffd040, #ff8c00)';
       this.satisfactionValue.style.color = '#ffd040';

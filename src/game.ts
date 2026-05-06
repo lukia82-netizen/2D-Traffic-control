@@ -287,10 +287,11 @@ export class Game {
 
     let total = 0;
     for (const v of this.vehicles.values()) {
-      total += v.satisfaction;
+      total += v.frustration;
     }
     const avg = total / this.vehicles.size;
 
+    // UIRenderer.updateSatisfaction now shows frustration (0=calm, 100=rage)
     this.uiRenderer.updateSatisfaction(avg);
     this.uiRenderer.updateVehicleCount(this.vehicles.size);
   }

@@ -188,7 +188,7 @@ export class RoadRenderer {
   private drawDashes(
     gfx: PIXI.Graphics,
     from: { x: number; y: number },
-    to:   { x: number; y: number },
+    _to:   { x: number; y: number },
     ux: number, uy: number, len: number,
   ): void {
     const DASH = 12;

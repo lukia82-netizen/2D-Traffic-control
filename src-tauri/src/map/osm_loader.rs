@@ -1,7 +1,7 @@
 use serde::Deserialize;
 use std::collections::HashMap;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct OsmNode {
     pub id: u64,
     pub lat: f64,
@@ -38,6 +38,10 @@ pub struct OsmData {
     pub nodes: HashMap<u64, OsmNode>,
     pub ways: Vec<OsmWay>,
     pub relations: Vec<OsmRelation>,
+    /// Ways with `railway=tram` tag — used by tram_network.rs
+    pub tram_ways: Vec<OsmWay>,
+    /// Nodes with `railway=tram_stop` tag
+    pub tram_stops: Vec<OsmNode>,
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -107,12 +111,15 @@ pub async fn fetch_osm_data(bbox: [f64; 4]) -> Result<OsmData, String> {
     //     and ways referenced by the collected elements
     //  3. Output everything in one response
     let query = format!(
-        "[out:json][timeout:60];\
+        "[out:json][timeout:90];\
         (\
           way[highway~\"motorway|trunk|primary|secondary|tertiary|residential|service|unclassified|living_street\"]\
           ({south},{west},{north},{east});\
           way[building]({south},{west},{north},{east});\
+          way[railway=tram]({south},{west},{north},{east});\
+          node[railway=tram_stop]({south},{west},{north},{east});\
           relation[type=restriction]({south},{west},{north},{east});\
+          relation[route=tram]({south},{west},{north},{east});\
         );\
         (._;>;);\
         out body qt;",
@@ -160,24 +167,32 @@ fn parse_overpass_json(json_text: &str) -> Result<OsmData, String> {
     for element in overpass.elements {
         match element.element_type.as_str() {
             "node" => {
-                osm_data.nodes.insert(
-                    element.id,
-                    OsmNode {
-                        id: element.id,
-                        lat: element.lat,
-                        lng: element.lon,
-                        tags: element.tags,
-                    },
-                );
+                let node = OsmNode {
+                    id: element.id,
+                    lat: element.lat,
+                    lng: element.lon,
+                    tags: element.tags,
+                };
+                // Tram stops go into both nodes (for coordinate lookup) and tram_stops
+                if node.tags.get("railway").map(|s| s.as_str()) == Some("tram_stop") {
+                    osm_data.tram_stops.push(node.clone());
+                }
+                osm_data.nodes.insert(element.id, node);
             }
             "way" => {
-                // Accept all ways (highway + building); road_network.rs filters by tag
                 if !element.nodes.is_empty() {
-                    osm_data.ways.push(OsmWay {
+                    let way = OsmWay {
                         id: element.id,
                         node_refs: element.nodes,
                         tags: element.tags,
-                    });
+                    };
+                    // Route to appropriate collection based on primary tag
+                    if way.tags.get("railway").map(|s| s.as_str()) == Some("tram") {
+                        osm_data.tram_ways.push(way);
+                    } else {
+                        // highway + building ways
+                        osm_data.ways.push(way);
+                    }
                 }
             }
             "relation" => {
@@ -201,9 +216,11 @@ fn parse_overpass_json(json_text: &str) -> Result<OsmData, String> {
     }
 
     log::info!(
-        "Parsed OSM data: {} nodes, {} ways, {} relations",
+        "Parsed OSM data: {} nodes, {} ways, {} tram ways, {} tram stops, {} relations",
         osm_data.nodes.len(),
         osm_data.ways.len(),
+        osm_data.tram_ways.len(),
+        osm_data.tram_stops.len(),
         osm_data.relations.len(),
     );
 

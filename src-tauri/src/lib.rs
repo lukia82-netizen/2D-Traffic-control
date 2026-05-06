@@ -9,7 +9,7 @@ pub mod vehicles;
 use state::AppState;
 use commands::{
     load_map, start_simulation, pause_simulation, resume_simulation,
-    set_time_scale, set_traffic_light_mode, set_traffic_light_phase,
+    set_time_scale, set_traffic_light_mode, set_traffic_light_phase, set_speed_config,
 };
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -26,6 +26,7 @@ pub fn run() {
             set_time_scale,
             set_traffic_light_mode,
             set_traffic_light_phase,
+            set_speed_config,
         ])
         .setup(|app| {
             log::info!("Traffic Control app started");

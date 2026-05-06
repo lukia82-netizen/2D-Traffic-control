@@ -19,11 +19,6 @@ const OFFLINE_STYLE: maplibregl.StyleSpecification = {
   ],
 };
 
-// Online tile style URL
-const ONLINE_STYLE_URL = 'https://tiles.openfreemap.org/styles/bright';
-// Timeout before giving up on online tiles
-const STYLE_LOAD_TIMEOUT_MS = 6000;
-
 // ─── Factory ──────────────────────────────────────────────────────────────────
 
 /**

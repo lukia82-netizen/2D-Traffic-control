@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex};
 use parking_lot::RwLock;
 use crate::map::road_network::MapData;
+use crate::simulation::speed_config::SpeedConfig;
 
 pub struct AppState {
     pub road_graph: Arc<RwLock<Option<MapData>>>,
@@ -10,7 +11,7 @@ pub struct AppState {
 impl AppState {
     pub fn new() -> Self {
         Self {
-            road_graph: Arc::new(RwLock::new(None)),
+            road_graph:  Arc::new(RwLock::new(None)),
             sim_control: Arc::new(Mutex::new(None)),
         }
     }
@@ -25,6 +26,7 @@ pub enum SimCommand {
     Pause,
     Resume,
     SetTimeScale(f32),
+    SetSpeedConfig(SpeedConfig),
     SetLightMode {
         intersection_id: u64,
         mode: LightControlMode,

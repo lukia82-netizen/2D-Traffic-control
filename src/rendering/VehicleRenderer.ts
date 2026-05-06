@@ -4,6 +4,11 @@ import type { VehicleState } from '../bridge/events';
 import type { PixiOverlay } from './PixiOverlay';
 import type { CameraManager } from './CameraManager';
 
+// ─── Lerp smoothing factor (0–1 per frame) ───────────────────────────────────
+// 0.45 per frame at 60 fps ≈ ~99% of remaining distance in 5 frames.
+// Keeps motion fluid when Tauri IPC delivers frames in bursts.
+const GEO_LERP = 0.45;
+
 // ─── Vehicle visual constants ─────────────────────────────────────────────────
 
 const VEHICLE_COLORS: Record<number, number> = {
@@ -11,13 +16,15 @@ const VEHICLE_COLORS: Record<number, number> = {
   1: 0xffcc44, // Van   – yellow
   2: 0xff8c00, // Bus   – orange
   3: 0x8b2500, // Truck – dark red
+  4: 0xffd700, // Tram  – gold
 };
 
 const DOT_COLORS: Record<number, number> = {
-  0: 0x66aaff, // Car   – lighter for dot visibility
-  1: 0xffdd66,
-  2: 0xffaa33,
-  3: 0xcc4400,
+  0: 0x66aaff, // Car
+  1: 0xffdd66, // Van
+  2: 0xffaa33, // Bus
+  3: 0xcc4400, // Truck
+  4: 0xffe066, // Tram – lighter gold
 };
 
 /**
@@ -29,10 +36,32 @@ const VEHICLE_DIMS: Record<number, { w: number; h: number }> = {
   1: { w: 7,  h: 16 }, // Van
   2: { w: 9,  h: 32 }, // Bus
   3: { w: 10, h: 48 }, // Truck
+  4: { w: 8,  h: 56 }, // Tram  (20 m body)
 };
 
+/** Frustration thresholds for visual bubbles. */
+const FRUSTRATION_CALM     = 40;
+const FRUSTRATION_ANNOYED  = 65;
+const FRUSTRATION_ANGRY    = 85;
+
 const TUNNEL_ALPHA = 0.25;
-const VEHICLE_TYPES = [0, 1, 2, 3];
+const VEHICLE_TYPES = [0, 1, 2, 3, 4];
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/**
+ * Choose a dot colour based on frustration level.
+ * 0–40  → normal type colour
+ * 40–65 → yellow
+ * 65–85 → orange
+ * 85–100→ red
+ */
+function frustrationDotColor(frustration: number, typeColor: number): number {
+  if (frustration >= FRUSTRATION_ANGRY)  return 0xff3300;
+  if (frustration >= FRUSTRATION_ANNOYED) return 0xff8800;
+  if (frustration >= FRUSTRATION_CALM)   return 0xffdd00;
+  return typeColor;
+}
 
 // ─── VehicleRenderer ─────────────────────────────────────────────────────────
 
@@ -61,6 +90,10 @@ export class VehicleRenderer {
   // ── Dot mode ────────────────────────────────────────────────────────────────
   /** Single Graphics object reused every frame to batch-draw all dots */
   private dotGraphics: PIXI.Graphics | null = null;
+
+  // ── Lerp smoothing (geo space) ───────────────────────────────────────────────
+  /** Smoothed geographic positions to eliminate flicker from IPC burst delivery */
+  private readonly geoSmoothed: Map<number, { lat: number; lng: number }> = new Map();
 
   constructor(overlay: PixiOverlay, map: maplibregl.Map, camera: CameraManager) {
     this.overlay = overlay;
@@ -126,20 +159,22 @@ export class VehicleRenderer {
     gfx.clear();
 
     for (const v of vehicles.values()) {
+      const smooth = this.smoothGeo(v);
+
       // Frustum cull
       if (
-        v.lng < bounds.getWest() || v.lng > bounds.getEast() ||
-        v.lat < bounds.getSouth() || v.lat > bounds.getNorth()
+        smooth.lng < bounds.getWest() || smooth.lng > bounds.getEast() ||
+        smooth.lat < bounds.getSouth() || smooth.lat > bounds.getNorth()
       ) continue;
 
       const typeId = v.vehicleType < VEHICLE_TYPES.length ? v.vehicleType : 0;
-      const color = DOT_COLORS[typeId] ?? 0x4488ff;
-      const px = this.map.project([v.lng, v.lat]);
+      // Frustration tinting: calm→type color, annoyed→yellow, angry→orange, rage→red
+      const color = frustrationDotColor(v.frustration, DOT_COLORS[typeId] ?? 0x4488ff);
+      const px = this.map.project([smooth.lng, smooth.lat]);
 
-      // Right-hand traffic offset — keep dots in their lane
       const offsetPx = this.camera.getLaneOffset();
-      const cx = px.x + (-Math.sin(v.angle)) * offsetPx;
-      const cy = px.y + ( Math.cos(v.angle)) * offsetPx;
+      const cx = px.x + Math.cos(v.angle) * offsetPx;
+      const cy = px.y + Math.sin(v.angle) * offsetPx;
 
       gfx.circle(cx, cy, radius).fill({ color, alpha: 0.9 });
     }
@@ -160,10 +195,12 @@ export class VehicleRenderer {
     const renderedIds = new Set<number>();
 
     for (const [id, v] of vehicles) {
+      const smooth = this.smoothGeo(v);
+
       // Frustum cull
       if (
-        v.lng < bounds.getWest() || v.lng > bounds.getEast() ||
-        v.lat < bounds.getSouth() || v.lat > bounds.getNorth()
+        smooth.lng < bounds.getWest() || smooth.lng > bounds.getEast() ||
+        smooth.lat < bounds.getSouth() || smooth.lat > bounds.getNorth()
       ) continue;
 
       const typeId = v.vehicleType < VEHICLE_TYPES.length ? v.vehicleType : 0;
@@ -172,7 +209,7 @@ export class VehicleRenderer {
       const isTunnel = infraType === 'tunnel';
       const isBridge = infraType === 'bridge';
 
-      const px = this.map.project([v.lng, v.lat]);
+      const px = this.map.project([smooth.lng, smooth.lat]);
 
       // Acquire or create sprite
       let sprite = this.activeSprites.get(id);
@@ -188,15 +225,18 @@ export class VehicleRenderer {
         }
       }
 
-      // Right-hand traffic: offset vehicle to the right of its heading direction.
-      // getLaneOffset() returns the pixel distance from road center to the right
-      // lane center at the current zoom, matching RoadRenderer's lane halfPx.
+      // Right-hand traffic lane offset.
+      // Rust angle: atan2(dlng, dlat), so angle=0→North, π/2→East.
+      // Screen heading vector = (sin θ, −cos θ).
+      // Perpendicular 90° clockwise (right lane) = (cos θ, sin θ).
       const laneOffset = this.camera.getLaneOffset();
-      const offsetX = -Math.sin(v.angle) * laneOffset;
-      const offsetY =  Math.cos(v.angle) * laneOffset;
+      const offsetX = Math.cos(v.angle) * laneOffset;
+      const offsetY = Math.sin(v.angle) * laneOffset;
 
       sprite.x = px.x + offsetX;
       sprite.y = px.y + offsetY;
+      // Rotation: angle=0 → sprite front (y=0 of texture) points North (up).
+      // PixiJS clockwise rotation=π/2 → front points East. Matches Rust convention.
       sprite.rotation = v.angle;
       sprite.width  = dims.w * spriteScale;
       sprite.height = dims.h * spriteScale;
@@ -213,6 +253,7 @@ export class VehicleRenderer {
         sprite.visible = false;
         this.releaseSprite(id, sprite);
         this.activeSprites.delete(id);
+        this.geoSmoothed.delete(id);
       }
     }
   }
@@ -222,6 +263,28 @@ export class VehicleRenderer {
       sprite.visible = false;
     }
     // Don't return to pool – they'll be reused when zooming back in
+  }
+
+  // ─── Geo smoothing (lerp) ──────────────────────────────────────────────────
+
+  /**
+   * Returns a smoothed lat/lng for vehicle `v`, lerping toward the latest
+   * Rust position.  Eliminates visible jumps from IPC burst delivery and
+   * edge-to-edge transitions.  Because smoothing is in geographic space,
+   * camera pan/zoom never introduces lag.
+   */
+  private smoothGeo(v: VehicleState): { lat: number; lng: number } {
+    const prev = this.geoSmoothed.get(v.id);
+    if (!prev) {
+      const pos = { lat: v.lat, lng: v.lng };
+      this.geoSmoothed.set(v.id, pos);
+      return pos;
+    }
+    const lat = prev.lat + (v.lat - prev.lat) * GEO_LERP;
+    const lng = prev.lng + (v.lng - prev.lng) * GEO_LERP;
+    prev.lat = lat;
+    prev.lng = lng;
+    return prev;
   }
 
   // ─── Sprite pool ───────────────────────────────────────────────────────────
@@ -262,5 +325,6 @@ export class VehicleRenderer {
     this.spritePools.clear();
     this.activeSprites.clear();
     this.textures.clear();
+    this.geoSmoothed.clear();
   }
 }

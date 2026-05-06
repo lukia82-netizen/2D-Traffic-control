@@ -8,9 +8,11 @@ export interface VehicleState {
   lng: number;
   angle: number;
   speed: number;
-  vehicleType: number;
+  vehicleType: number;   // 0=Car, 1=Van, 2=Bus, 3=Truck, 4=Tram
   driverProfile: number;
-  satisfaction: number;
+  tripKind: number;      // 0=local_od, 1=transit, 2=ext_in, 3=ext_out
+  /** Driver frustration 0 (calm) … 100 (rage). */
+  frustration: number;
 }
 
 export interface CongestionData {
@@ -31,19 +33,20 @@ export interface LightStateUpdate {
 /**
  * Decode a base64-encoded binary vehicle frame.
  *
- * Packet layout (28 bytes, 4-byte aligned):
- *   [0..3]   id:          u32  LE
- *   [4..7]   lat:         f32  LE
- *   [8..11]  lng:         f32  LE
- *   [12..15] angle:       f32  LE
- *   [16..19] speed:       f32  LE
- *   [20]     type:        u8
- *   [21]     profile:     u8
- *   [22..23] padding:     u16  (ignored)
- *   [24..27] satisfaction:f32  LE
+ * Packet layout (32 bytes, 4-byte aligned):
+ *   [0..3]   id:           u32  LE
+ *   [4..7]   lat:          f32  LE
+ *   [8..11]  lng:          f32  LE
+ *   [12..15] angle:        f32  LE
+ *   [16..19] speed:        f32  LE
+ *   [20]     vehicleType:  u8   (0=Car, 1=Van, 2=Bus, 3=Truck, 4=Tram)
+ *   [21]     driverProfile:u8
+ *   [22]     tripKind:     u8   (0=local_od, 1=transit, 2=ext_in, 3=ext_out)
+ *   [23]     padding:      u8
+ *   [24..27] frustration:  f32  LE  (0=calm, 100=rage)
+ *   [28..31] padding2:     u32  LE  (reserved)
  */
 export function parseVehicleFrame(base64Data: string): VehicleState[] {
-  // Decode base64 → Uint8Array
   const binaryStr = atob(base64Data);
   const len = binaryStr.length;
   const bytes = new Uint8Array(len);
@@ -51,7 +54,7 @@ export function parseVehicleFrame(base64Data: string): VehicleState[] {
     bytes[i] = binaryStr.charCodeAt(i);
   }
 
-  const PACKET_SIZE = 28;
+  const PACKET_SIZE = 32;
   const count = Math.floor(bytes.byteLength / PACKET_SIZE);
   const view = new DataView(bytes.buffer);
   const vehicles: VehicleState[] = new Array(count);
@@ -59,14 +62,15 @@ export function parseVehicleFrame(base64Data: string): VehicleState[] {
   for (let i = 0; i < count; i++) {
     const base = i * PACKET_SIZE;
     vehicles[i] = {
-      id: view.getUint32(base, true),
-      lat: view.getFloat32(base + 4, true),
-      lng: view.getFloat32(base + 8, true),
-      angle: view.getFloat32(base + 12, true),
-      speed: view.getFloat32(base + 16, true),
-      vehicleType: view.getUint8(base + 20),
-      driverProfile: view.getUint8(base + 21),
-      satisfaction: view.getFloat32(base + 24, true),
+      id:            view.getUint32 (base,      true),
+      lat:           view.getFloat32(base + 4,  true),
+      lng:           view.getFloat32(base + 8,  true),
+      angle:         view.getFloat32(base + 12, true),
+      speed:         view.getFloat32(base + 16, true),
+      vehicleType:   view.getUint8  (base + 20),
+      driverProfile: view.getUint8  (base + 21),
+      tripKind:      view.getUint8  (base + 22),
+      frustration:   view.getFloat32(base + 24, true),
     };
   }
 
@@ -82,12 +86,9 @@ export function parseVehicleFrame(base64Data: string): VehicleState[] {
 export async function listenCongestionUpdates(
   cb: (data: CongestionData[]) => void,
 ): Promise<() => void> {
-  const unlisten = await listen<CongestionData[]>(
-    'congestion_update',
-    (event) => {
-      cb(event.payload);
-    },
-  );
+  const unlisten = await listen<CongestionData[]>('congestion_update', (event) => {
+    cb(event.payload);
+  });
   return unlisten;
 }
 
@@ -98,11 +99,8 @@ export async function listenCongestionUpdates(
 export async function listenLightStateChanges(
   cb: (data: LightStateUpdate[]) => void,
 ): Promise<() => void> {
-  const unlisten = await listen<LightStateUpdate[]>(
-    'light_state_change',
-    (event) => {
-      cb(event.payload);
-    },
-  );
+  const unlisten = await listen<LightStateUpdate[]>('light_state_change', (event) => {
+    cb(event.payload);
+  });
   return unlisten;
 }

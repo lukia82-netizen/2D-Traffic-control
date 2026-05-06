@@ -3,6 +3,8 @@ use petgraph::graph::{DiGraph, NodeIndex};
 use serde::{Deserialize, Serialize};
 
 use crate::map::osm_loader::{OsmData, OsmRelation};
+use crate::map::building_loader::OdBuilding;
+use crate::map::tram_network::TramData;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum IntersectionType {
@@ -10,6 +12,8 @@ pub enum IntersectionType {
     TrafficLight,
     Stop,
     Yield,
+    /// Roundabout node (junction=roundabout) – always one-way.
+    Roundabout,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,7 +54,8 @@ pub struct RoadEdge {
     pub road_type: String,
 }
 
-/// A building polygon represented as an ordered list of [lat, lng] vertices.
+/// A building polygon represented as an ordered list of \[lat, lng\] vertices.
+/// Kept for backward-compat with the frontend buildings response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuildingPolygon {
     pub polygon: Vec<[f64; 2]>,
@@ -69,9 +74,7 @@ pub enum RestrictionKind {
     NoEntry,
 }
 
-/// A resolved turn restriction: vehicles arriving via `from_way_id` and
-/// passing through `via_node_id` may not (or may only) proceed onto
-/// `to_way_id` according to `kind`.
+/// A resolved turn restriction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurnRestriction {
     pub from_way_id: u64,
@@ -86,17 +89,25 @@ pub struct MapData {
     pub graph: RoadGraph,
     pub node_index_map: HashMap<u64, NodeIndex>,
     pub bbox: [f64; 4],
+    /// All spawn points (boundary + junctions) – used as transit boundary nodes.
     pub spawn_points: Vec<NodeIndex>,
-    pub buildings: Vec<BuildingPolygon>,
+    /// Nodes strictly on the bbox boundary (subset of spawn_points) – for transit spawning.
+    pub boundary_nodes: Vec<NodeIndex>,
+    /// OD buildings with type, centroid, access_node.
+    pub od_buildings: Vec<OdBuilding>,
     pub restrictions: Vec<TurnRestriction>,
+    /// Tram network (empty when no tram data in OSM).
+    pub tram_data: TramData,
 }
+
+// ── Demo network ─────────────────────────────────────────────────────────────
 
 /// Build a simple 5×5 grid road network centred on Kraków.
 /// Used as a fallback when the Overpass API is not reachable.
 pub fn build_demo_road_network() -> MapData {
-    const CX: f64 = 19.940;       // centre longitude
-    const CY: f64 = 50.060;       // centre latitude
-    const STEP_LNG: f64 = 0.004;  // ~300 m
+    const CX: f64 = 19.940;
+    const CY: f64 = 50.060;
+    const STEP_LNG: f64 = 0.004;
     const STEP_LAT: f64 = 0.003;
     const COLS: usize = 5;
     const ROWS: usize = 5;
@@ -144,7 +155,6 @@ pub fn build_demo_road_network() -> MapData {
         graph.add_edge(b, a, rev);
     };
 
-    // Horizontal edges
     for r in 0..ROWS {
         for c in 0..(COLS - 1) {
             let a = node_index_map[&nid(r, c)];
@@ -152,7 +162,6 @@ pub fn build_demo_road_network() -> MapData {
             add_edge(&mut graph, a, b);
         }
     }
-    // Vertical edges
     for r in 0..(ROWS - 1) {
         for c in 0..COLS {
             let a = node_index_map[&nid(r, c)];
@@ -163,27 +172,47 @@ pub fn build_demo_road_network() -> MapData {
 
     let bbox = compute_bbox(&graph);
     let spawn_points = find_spawn_points(&graph, &bbox);
+    let boundary_nodes = find_boundary_nodes(&graph, &bbox);
 
     log::info!(
-        "Built DEMO road grid: {} nodes, {} edges, {} spawn points",
+        "Built DEMO road grid: {} nodes, {} edges, {} spawn points, {} boundary nodes",
         graph.node_count(),
         graph.edge_count(),
-        spawn_points.len()
+        spawn_points.len(),
+        boundary_nodes.len()
     );
 
-    MapData { graph, node_index_map, bbox, spawn_points, buildings: Vec::new(), restrictions: Vec::new() }
+    let tram_data = TramData {
+        graph: crate::map::tram_network::TramGraph::new(),
+        node_index_map: HashMap::new(),
+        stops: Vec::new(),
+        lines: Vec::new(),
+    };
+
+    MapData {
+        graph,
+        node_index_map,
+        bbox,
+        spawn_points,
+        boundary_nodes,
+        od_buildings: Vec::new(),
+        restrictions: Vec::new(),
+        tram_data,
+    }
 }
+
+// ── Real OSM network ─────────────────────────────────────────────────────────
 
 pub fn build_road_network(osm_data: OsmData) -> MapData {
     let mut graph = RoadGraph::new();
     let mut node_index_map: HashMap<u64, NodeIndex> = HashMap::new();
 
-    // Collect node ids from HIGHWAY ways only (not buildings).
-    // Building polygon nodes are handled separately and must not pollute the
-    // road graph (they would add ~12 000 extra nodes and slow everything down).
+    // Collect node ids used by highway ways only (buildings handled separately)
     let mut used_node_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
     for way in &osm_data.ways {
-        if !way.tags.contains_key("highway") { continue; }
+        if !way.tags.contains_key("highway") {
+            continue;
+        }
         for &node_id in &way.node_refs {
             used_node_ids.insert(node_id);
         }
@@ -203,29 +232,22 @@ pub fn build_road_network(osm_data: OsmData) -> MapData {
         }
     }
 
-    // Count how many highway ways reference each node (to detect junctions)
-    let mut node_way_count: HashMap<u64, u32> = HashMap::new();
-    for way in &osm_data.ways {
-        if !way.tags.contains_key("highway") { continue; }
-        for &nid in &way.node_refs {
-            *node_way_count.entry(nid).or_insert(0) += 1;
-        }
-    }
-
     // Add graph edges
     for way in &osm_data.ways {
         let tags = &way.tags;
-        // Skip building ways — they are handled separately below
-        if !tags.contains_key("highway") { continue; }
+        if !tags.contains_key("highway") {
+            continue;
+        }
 
-        let oneway = parse_oneway(tags.get("oneway").map(|s| s.as_str()));
-        let highway_type = tags.get("highway").map(|s| s.as_str()).unwrap_or("unclassified");
-        let lanes = parse_lanes(tags.get("lanes").map(|s| s.as_str()),
-                                highway_type);
-        let max_speed = parse_max_speed(tags.get("maxspeed").map(|s| s.as_str()),
-                                        Some(highway_type));
+        let oneway = parse_oneway(tags);
+        let highway_type = tags.get("highway").map(String::as_str).unwrap_or("unclassified");
+        let lanes = parse_lanes(tags.get("lanes").map(String::as_str), highway_type);
+        let max_speed = parse_max_speed(
+            tags.get("maxspeed").map(String::as_str),
+            Some(highway_type),
+        );
         let infra_type = parse_infra_type(tags);
-        let layer = parse_layer(tags.get("layer").map(|s| s.as_str()));
+        let layer = parse_layer(tags.get("layer").map(String::as_str));
         let lane_directions = tags
             .get("turn:lanes")
             .map(|s| parse_turn_lanes(s))
@@ -234,17 +256,20 @@ pub fn build_road_network(osm_data: OsmData) -> MapData {
 
         for window in way.node_refs.windows(2) {
             let from_id = window[0];
-            let to_id = window[1];
+            let to_id   = window[1];
 
-            let (from_idx, to_idx) = match (node_index_map.get(&from_id), node_index_map.get(&to_id)) {
-                (Some(&a), Some(&b)) => (a, b),
-                _ => continue,
-            };
+            let (from_idx, to_idx) =
+                match (node_index_map.get(&from_id), node_index_map.get(&to_id)) {
+                    (Some(&a), Some(&b)) => (a, b),
+                    _ => continue,
+                };
 
             let from_node = &graph[from_idx];
-            let to_node = &graph[to_idx];
-
-            let length_m = haversine_distance_m(from_node.lat, from_node.lng, to_node.lat, to_node.lng);
+            let to_node   = &graph[to_idx];
+            let length_m  = haversine_distance_m(
+                from_node.lat, from_node.lng,
+                to_node.lat,   to_node.lng,
+            );
             let decision_points = [length_m * 0.25, length_m * 0.50, length_m * 0.75];
 
             let edge = RoadEdge {
@@ -261,53 +286,43 @@ pub fn build_road_network(osm_data: OsmData) -> MapData {
             };
 
             match oneway {
-                1 => {
-                    graph.add_edge(from_idx, to_idx, edge);
-                }
-                -1 => {
-                    graph.add_edge(to_idx, from_idx, edge);
-                }
-                _ => {
+                1  => { graph.add_edge(from_idx, to_idx, edge); }
+                -1 => { graph.add_edge(to_idx, from_idx, edge); }
+                _  => {
                     graph.add_edge(from_idx, to_idx, edge.clone());
-                    let rev_edge = RoadEdge {
+                    let rev = RoadEdge {
                         lane_directions: build_lane_directions_reversed(lanes),
                         ..edge
                     };
-                    graph.add_edge(to_idx, from_idx, rev_edge);
+                    graph.add_edge(to_idx, from_idx, rev);
                 }
             }
         }
     }
 
-    // Determine bbox from all used nodes
-    let bbox = compute_bbox(&graph);
+    let bbox           = compute_bbox(&graph);
+    let spawn_points   = find_spawn_points(&graph, &bbox);
+    let boundary_nodes = find_boundary_nodes(&graph, &bbox);
 
-    // Identify spawn points: nodes on the boundary or high-degree nodes
-    let spawn_points = find_spawn_points(&graph, &bbox);
+    // ── OD buildings ─────────────────────────────────────────────────────────
+    let mut od_buildings =
+        crate::map::building_loader::extract_od_buildings(&osm_data);
+    crate::map::building_network::link_to_road_nodes(&mut od_buildings, &graph);
 
-    // ── Parse building polygons ───────────────────────────────────────────────
-    let mut buildings: Vec<BuildingPolygon> = Vec::new();
-    for way in &osm_data.ways {
-        if !way.tags.contains_key("building") { continue; }
-        let polygon: Vec<[f64; 2]> = way.node_refs.iter()
-            .filter_map(|&nid| osm_data.nodes.get(&nid))
-            .map(|n| [n.lat, n.lng])
-            .collect();
-        if polygon.len() >= 3 {
-            buildings.push(BuildingPolygon { polygon });
-        }
-    }
-
-    // ── Parse turn restrictions ───────────────────────────────────────────────
+    // ── Turn restrictions ────────────────────────────────────────────────────
     let restrictions = build_turn_restrictions(&osm_data.relations);
 
+    // ── Tram network ─────────────────────────────────────────────────────────
+    let tram_data = crate::map::tram_network::build_tram_network(&osm_data, &graph);
+
     log::info!(
-        "Built road graph: {} nodes, {} edges, {} spawn points, {} buildings, {} restrictions",
+        "Built road graph: {} nodes, {} edges, {} spawn, {} boundary, {} buildings, {} tram-nodes",
         graph.node_count(),
         graph.edge_count(),
         spawn_points.len(),
-        buildings.len(),
-        restrictions.len(),
+        boundary_nodes.len(),
+        od_buildings.len(),
+        tram_data.graph.node_count()
     );
 
     MapData {
@@ -315,51 +330,76 @@ pub fn build_road_network(osm_data: OsmData) -> MapData {
         node_index_map,
         bbox,
         spawn_points,
-        buildings,
+        boundary_nodes,
+        od_buildings,
         restrictions,
+        tram_data,
     }
 }
 
+// ── Internal helpers ──────────────────────────────────────────────────────────
+
 fn determine_intersection_type(tags: &HashMap<String, String>) -> IntersectionType {
+    // Roundabout (junction tag on the way, propagated to nodes in some OSM extracts)
+    if tags.get("junction").map(String::as_str) == Some("roundabout") {
+        return IntersectionType::Roundabout;
+    }
     if let Some(highway) = tags.get("highway") {
-        if highway == "traffic_signals" {
-            return IntersectionType::TrafficLight;
-        }
-        if highway == "stop" {
-            return IntersectionType::Stop;
-        }
-        if highway == "give_way" {
-            return IntersectionType::Yield;
+        match highway.as_str() {
+            "traffic_signals" => return IntersectionType::TrafficLight,
+            "stop"            => return IntersectionType::Stop,
+            "give_way"        => return IntersectionType::Yield,
+            _                 => {}
         }
     }
     if tags.contains_key("traffic_signals") {
         return IntersectionType::TrafficLight;
     }
-    if tags.get("highway").map(|s| s.as_str()) == Some("crossing") {
+    if tags.get("highway").map(String::as_str) == Some("crossing") {
         return IntersectionType::TrafficLight;
     }
     IntersectionType::Plain
 }
 
-fn parse_oneway(value: Option<&str>) -> i8 {
-    match value {
-        Some("yes") | Some("true") | Some("1") => 1,
-        Some("-1") | Some("reverse") => -1,
-        _ => 0,
+/// Parse the `oneway` direction from the **full** tag map of a way.
+///
+/// Returns:
+/// - `1`  – forward (from → to node order)
+/// - `-1` – reverse (to → from node order)
+/// - `0`  – bidirectional
+fn parse_oneway(tags: &HashMap<String, String>) -> i8 {
+    // Explicit override: oneway=no forces bidirectional even on motorways
+    if tags.get("oneway").map(String::as_str) == Some("no") {
+        return 0;
     }
+    // Explicit oneway tag
+    match tags.get("oneway").map(String::as_str) {
+        Some("yes") | Some("true") | Some("1") => return 1,
+        Some("-1")  | Some("reverse")           => return -1,
+        _ => {}
+    }
+    // Roundabouts are always one-way (forward)
+    if tags.get("junction").map(String::as_str) == Some("roundabout") {
+        return 1;
+    }
+    // Motorways and motorway_links are drawn as separate one-way carriageways
+    match tags.get("highway").map(String::as_str) {
+        Some("motorway") | Some("motorway_link") => return 1,
+        _ => {}
+    }
+    0
 }
 
 fn parse_lanes(value: Option<&str>, highway: &str) -> u8 {
     if let Some(n) = value.and_then(|s| s.parse::<u8>().ok()) {
         return n.max(1).min(8);
     }
-    // Defaults by road type when OSM tag is absent
     match highway {
-        "motorway" | "trunk"                       => 3,
-        "primary"                                  => 2,
-        "secondary" | "tertiary"                   => 2,
-        "residential" | "living_street" | "service"=> 1,
-        _                                          => 1,
+        "motorway" | "trunk"                        => 3,
+        "primary"                                   => 2,
+        "secondary" | "tertiary"                    => 2,
+        "residential" | "living_street" | "service" => 1,
+        _                                           => 1,
     }
 }
 
@@ -377,37 +417,33 @@ fn parse_max_speed(maxspeed: Option<&str>, highway: Option<&str>) -> f32 {
             return (kmh_val / 3.6).max(1.0);
         }
     }
-
-    // Defaults based on highway type (km/h → m/s)
-    let kmh = match highway {
+    let kmh: f32 = match highway {
         Some("motorway") | Some("motorway_link") => 120.0,
-        Some("trunk") | Some("trunk_link") => 90.0,
-        Some("primary") | Some("primary_link") => 70.0,
+        Some("trunk") | Some("trunk_link")       => 90.0,
+        Some("primary") | Some("primary_link")   => 70.0,
         Some("secondary") | Some("secondary_link") => 60.0,
         Some("tertiary") | Some("tertiary_link") => 50.0,
-        Some("residential") => 30.0,
-        Some("living_street") => 10.0,
-        Some("service") => 20.0,
+        Some("residential")                      => 30.0,
+        Some("living_street")                    => 10.0,
+        Some("service")                          => 20.0,
         Some("pedestrian") | Some("footway") | Some("path") => 10.0,
-        _ => 50.0,
+        _                                        => 50.0,
     };
     kmh / 3.6
 }
 
 fn parse_infra_type(tags: &HashMap<String, String>) -> InfraType {
-    if tags.get("bridge").map(|s| s.as_str()) == Some("yes") {
+    if tags.get("bridge").map(String::as_str) == Some("yes") {
         return InfraType::Bridge;
     }
-    if tags.get("tunnel").map(|s| s.as_str()) == Some("yes") {
+    if tags.get("tunnel").map(String::as_str) == Some("yes") {
         return InfraType::Tunnel;
     }
     InfraType::Normal
 }
 
 fn parse_layer(value: Option<&str>) -> i8 {
-    value
-        .and_then(|s| s.parse::<i8>().ok())
-        .unwrap_or(0)
+    value.and_then(|s| s.parse::<i8>().ok()).unwrap_or(0)
 }
 
 fn build_lane_directions(lanes: u8) -> Vec<LaneDirection> {
@@ -432,19 +468,15 @@ fn build_lane_directions_reversed(lanes: u8) -> Vec<LaneDirection> {
     dirs
 }
 
-/// Parse a `turn:lanes` tag value such as `"left|through|right"` into a
-/// per-lane direction list.  Multiple directions per lane (e.g. `left;through`)
-/// resolve to the first listed direction.  Falls back to `Straight` for
-/// unrecognised values.
 fn parse_turn_lanes(tag: &str) -> Vec<LaneDirection> {
     tag.split('|')
         .map(|lane| {
             let first = lane.split(';').next().unwrap_or("through").trim();
             match first {
-                "left" | "sharp_left" | "slight_left" => LaneDirection::Left,
+                "left"  | "sharp_left"  | "slight_left"  => LaneDirection::Left,
                 "right" | "sharp_right" | "slight_right" => LaneDirection::Right,
-                "reverse" => LaneDirection::UTurn,
-                _ => LaneDirection::Straight,
+                "reverse"                                 => LaneDirection::UTurn,
+                _                                         => LaneDirection::Straight,
             }
         })
         .collect()
@@ -452,15 +484,15 @@ fn parse_turn_lanes(tag: &str) -> Vec<LaneDirection> {
 
 fn parse_restriction_kind(s: &str) -> Option<RestrictionKind> {
     match s {
-        "no_left_turn"     => Some(RestrictionKind::NoLeftTurn),
-        "no_right_turn"    => Some(RestrictionKind::NoRightTurn),
-        "no_straight_on"   => Some(RestrictionKind::NoStraightOn),
-        "no_u_turn"        => Some(RestrictionKind::NoUTurn),
-        "only_left_turn"   => Some(RestrictionKind::OnlyLeftTurn),
-        "only_right_turn"  => Some(RestrictionKind::OnlyRightTurn),
-        "only_straight_on" => Some(RestrictionKind::OnlyStraightOn),
-        "no_entry"         => Some(RestrictionKind::NoEntry),
-        _                  => None,
+        "no_left_turn"      => Some(RestrictionKind::NoLeftTurn),
+        "no_right_turn"     => Some(RestrictionKind::NoRightTurn),
+        "no_straight_on"    => Some(RestrictionKind::NoStraightOn),
+        "no_u_turn"         => Some(RestrictionKind::NoUTurn),
+        "only_left_turn"    => Some(RestrictionKind::OnlyLeftTurn),
+        "only_right_turn"   => Some(RestrictionKind::OnlyRightTurn),
+        "only_straight_on"  => Some(RestrictionKind::OnlyStraightOn),
+        "no_entry"          => Some(RestrictionKind::NoEntry),
+        _                   => None,
     }
 }
 
@@ -468,18 +500,15 @@ fn build_turn_restrictions(relations: &[OsmRelation]) -> Vec<TurnRestriction> {
     relations
         .iter()
         .filter_map(|rel| {
-            // Only handle simple node-via restrictions
             let restriction_tag = rel.tags.get("restriction")?;
             let kind = parse_restriction_kind(restriction_tag)?;
 
             let from_way_id = rel.members.iter()
                 .find(|m| m.role == "from" && m.member_type == "way")
                 .map(|m| m.ref_id)?;
-
             let via_node_id = rel.members.iter()
                 .find(|m| m.role == "via" && m.member_type == "node")
                 .map(|m| m.ref_id)?;
-
             let to_way_id = rel.members.iter()
                 .find(|m| m.role == "to" && m.member_type == "way")
                 .map(|m| m.ref_id)?;
@@ -524,30 +553,51 @@ fn find_spawn_points(graph: &RoadGraph, bbox: &[f64; 4]) -> Vec<NodeIndex> {
     let [min_lat, min_lng, max_lat, max_lng] = *bbox;
     let lat_range = max_lat - min_lat;
     let lng_range = max_lng - min_lng;
-    let margin = 0.05; // 5% inward from boundary
+    let margin = 0.05;
 
     let mut spawn_points = Vec::new();
-
     for idx in graph.node_indices() {
         let n = &graph[idx];
-
         let near_boundary = n.lat < min_lat + lat_range * margin
             || n.lat > max_lat - lat_range * margin
             || n.lng < min_lng + lng_range * margin
             || n.lng > max_lng - lng_range * margin;
 
-        let degree = graph.edges(idx).count() + graph.edges_directed(idx, petgraph::Direction::Incoming).count();
+        let degree = graph.edges(idx).count()
+            + graph.edges_directed(idx, petgraph::Direction::Incoming).count();
         let is_junction = degree >= 3;
 
         if near_boundary || is_junction {
             spawn_points.push(idx);
         }
     }
-
-    // If too few, fall back to all nodes
     if spawn_points.len() < 4 {
         spawn_points = graph.node_indices().collect();
     }
-
     spawn_points
+}
+
+/// Nodes within the outermost 3 % of the bounding box – used for transit spawning.
+fn find_boundary_nodes(graph: &RoadGraph, bbox: &[f64; 4]) -> Vec<NodeIndex> {
+    let [min_lat, min_lng, max_lat, max_lng] = *bbox;
+    let lat_range = max_lat - min_lat;
+    let lng_range = max_lng - min_lng;
+    let margin = 0.03;
+
+    let boundary: Vec<NodeIndex> = graph
+        .node_indices()
+        .filter(|&idx| {
+            let n = &graph[idx];
+            n.lat < min_lat + lat_range * margin
+                || n.lat > max_lat - lat_range * margin
+                || n.lng < min_lng + lng_range * margin
+                || n.lng > max_lng - lng_range * margin
+        })
+        .collect();
+
+    if boundary.is_empty() {
+        graph.node_indices().take(4).collect()
+    } else {
+        boundary
+    }
 }

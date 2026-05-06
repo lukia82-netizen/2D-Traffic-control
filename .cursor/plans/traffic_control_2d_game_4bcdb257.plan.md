@@ -7,7 +7,7 @@ todos:
     status: in_progress
   - id: phase2-simulation
     content: "Faza 2: Pętla symulacji IDM w Rust (osobny thread), streaming pozycji do PixiJS, spawning OD-based + tranzyt, DayCycle, pathfinding A* (petgraph)"
-    status: pending
+    status: completed
   - id: phase3-intersections
     content: "Faza 3: Skrzyżowania (FSM świateł), znaki, pierwszeństwo, strzałki pasów - logika Rust + rendering PixiJS"
     status: pending

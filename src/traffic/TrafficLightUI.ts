@@ -63,7 +63,7 @@ export class TrafficLightUI {
 
   init(nodes: NodeData[]): void {
     this.intersectionNodes = nodes.filter(
-      (n) => n.intersectionType === 'TrafficLight',
+      (n) => n.intersectionType === 'traffic_light',
     );
 
     // Map click → check proximity to intersection nodes

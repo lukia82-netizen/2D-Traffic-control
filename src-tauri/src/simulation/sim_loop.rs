@@ -17,12 +17,19 @@ use crate::simulation::spatial_grid::SpatialGrid;
 use crate::simulation::spawn::SpawnSystem;
 use crate::simulation::lane_change::decide_lane_change;
 use crate::simulation::congestion::{compute_congestion, CongestionData};
+use crate::simulation::od_model::OdModel;
+use crate::simulation::speed_config::SpeedConfig;
+use crate::simulation::tram_sim::TramSim;
 use crate::traffic::traffic_light::LightStateUpdate;
 
-const TARGET_TICK_S: f32 = 1.0 / 60.0; // 60 Hz
-// Cell size ≈ 50 m at 50°N latitude
+const TARGET_TICK_S: f32 = 1.0 / 60.0;
 const GRID_CELL_DEG: f64 = 0.00045;
 const CONGESTION_INTERVAL_S: f32 = 0.5;
+
+/// High frustration level that triggers game-over candidate window.
+const GAME_OVER_AVG_THRESHOLD: f32 = 80.0;
+/// Real seconds frustration must stay above threshold to lose.
+const GAME_OVER_DURATION_S: f32 = 30.0;
 
 pub fn run_simulation(
     graph_lock: Arc<RwLock<Option<MapData>>>,
@@ -31,37 +38,48 @@ pub fn run_simulation(
     congestion_tx: Sender<Vec<CongestionData>>,
     light_state_tx: Sender<Vec<LightStateUpdate>>,
 ) {
-    // --- Initialise subsystems ---
     let mut clock = GameClock::new();
     let mut vehicles: Vec<Vehicle> = Vec::with_capacity(512);
     let mut spatial_grid = SpatialGrid::new(GRID_CELL_DEG);
     let mut congestion_timer = 0.0f32;
+    let mut high_frustration_timer = 0.0f32;
 
-    let (mut intersections, mut spawn_system) = {
+    // ── Build subsystems from map ────────────────────────────────────────────
+    let (mut intersections, mut spawn_system, mut od_model, mut tram_sim) = {
         let guard = graph_lock.read();
-        let map = guard.as_ref().expect("map must be loaded before starting simulation");
+        let map   = guard.as_ref().expect("map must be loaded before starting simulation");
+
         let intersections = IntersectionManager::from_graph(&map.graph);
-        let spawn = SpawnSystem::new(map.spawn_points.clone());
-        (intersections, spawn)
+        let speed_config  = SpeedConfig::default();
+
+        let spawn = SpawnSystem::new(
+            map.spawn_points.clone(),
+            map.boundary_nodes.clone(),
+            speed_config,
+        );
+        let od = OdModel::new(
+            map.od_buildings.clone(),
+            &mut rand::rngs::OsRng,
+        );
+
+        // Tram simulation: use IDs starting after the car-id range to avoid collisions
+        let tram = TramSim::new(&map.tram_data, 100_000);
+
+        (intersections, spawn, od, tram)
     };
 
     let mut last_tick = Instant::now();
-
     log::info!("Simulation loop started");
 
     loop {
-        // --- Tick timing ---
-        let now = Instant::now();
-        let real_dt_s = now.duration_since(last_tick).as_secs_f32();
-        last_tick = now;
+        let now        = Instant::now();
+        let real_dt_s  = now.duration_since(last_tick).as_secs_f32().min(0.1);
+        last_tick      = now;
 
-        // Clamp dt to avoid spiral-of-death after pauses/debugger
-        let real_dt_s = real_dt_s.min(0.1);
-
-        // --- Process incoming commands ---
+        // ── Commands ─────────────────────────────────────────────────────────
         loop {
             match command_rx.try_recv() {
-                Ok(cmd) => handle_command(cmd, &mut clock, &mut intersections),
+                Ok(cmd) => handle_command(cmd, &mut clock, &mut intersections, &mut spawn_system),
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     log::info!("Simulation command channel closed, stopping");
@@ -80,31 +98,46 @@ pub fn run_simulation(
         let game_hour = clock.game_hour();
         let spawn_multiplier = DayCycle::spawn_multiplier(game_hour);
 
-        // --- Update traffic lights ---
+        // ── Traffic lights ────────────────────────────────────────────────────
         let light_updates = intersections.update(real_dt_s);
         if !light_updates.is_empty() {
             let _ = light_state_tx.send(light_updates);
         }
 
-        // --- Spawn new vehicles ---
+        // ── Tram simulation ───────────────────────────────────────────────────
         {
             let guard = graph_lock.read();
             if let Some(map) = guard.as_ref() {
-                let new_vehicles = spawn_system.tick(real_dt_s, spawn_multiplier, map, vehicles.len());
+                if !tram_sim.is_empty() {
+                    tram_sim.tick(real_dt_s, game_dt_s, &map.tram_data);
+                }
+            }
+        }
+
+        // ── Spawn vehicles ────────────────────────────────────────────────────
+        {
+            let guard = graph_lock.read();
+            if let Some(map) = guard.as_ref() {
+                let new_vehicles = spawn_system.tick_with_hour(
+                    real_dt_s,
+                    spawn_multiplier,
+                    game_hour,
+                    map,
+                    &od_model,
+                    vehicles.len(),
+                );
                 vehicles.extend(new_vehicles);
             }
         }
 
-        // --- Rebuild spatial grid ---
+        // ── Rebuild spatial grid ─────────────────────────────────────────────
         spatial_grid.clear();
         for v in &vehicles {
             spatial_grid.insert(v.id, v.lat, v.lng);
         }
 
-        // --- Parallel IDM acceleration computation ---
-        // We compute the acceleration for each vehicle in parallel, then apply it.
-        // We read vehicle positions from a snapshot to avoid data races.
-        let accel_inputs: Vec<(f32, f32, f32, f32)> = {
+        // ── Parallel IDM ─────────────────────────────────────────────────────
+        let accel_inputs: Vec<f32> = {
             let guard = graph_lock.read();
             if let Some(map) = guard.as_ref() {
                 vehicles
@@ -113,66 +146,71 @@ pub fn run_simulation(
                         let leader = find_leader(v, &vehicles, &spatial_grid);
                         let (gap, delta_v) = match leader {
                             Some(lid) => {
-                                if let Some(leader_v) = vehicles.iter().find(|o| o.id == lid) {
-                                    let dist = geo_dist_approx(v.lat, v.lng, leader_v.lat, leader_v.lng);
-                                    let dv = v.speed - leader_v.speed;
-                                    (dist, dv)
+                                if let Some(lv) = vehicles.iter().find(|o| o.id == lid) {
+                                    let dist = geo_dist_approx(v.lat, v.lng, lv.lat, lv.lng);
+                                    (dist, v.speed - lv.speed)
                                 } else {
-                                    (1000.0f32, 0.0f32)
+                                    (1000.0, 0.0)
                                 }
                             }
-                            None => (1000.0f32, 0.0f32),
+                            None => (1000.0, 0.0),
                         };
 
-                        // Desired speed is min(driver factor × vehicle max, road max speed)
-                        let desired_speed = compute_desired_speed(v, map);
-
-                        // Check traffic light: if red ahead, treat it as a stopped leader at the edge end
-                        let (gap, delta_v) = apply_traffic_light_effect(v, gap, delta_v, &intersections, map);
+                        let desired = compute_desired_speed(v, map);
+                        let (gap, delta_v) =
+                            apply_traffic_light_effect(v, gap, delta_v, &intersections, map);
 
                         let params = v.driver_profile.params();
-                        let vtype = v.vehicle_type.params();
-                        let a = idm_acceleration(v.speed, desired_speed, gap, delta_v, &params, &vtype);
-                        (a, desired_speed, gap, delta_v)
+                        let vtype  = v.vehicle_type.params();
+                        idm_acceleration(v.speed, desired, gap, delta_v, &params, &vtype)
                     })
                     .collect()
             } else {
-                vec![(0.0, 0.0, 0.0, 0.0); vehicles.len()]
+                vec![0.0; vehicles.len()]
             }
         };
 
-        // --- Apply physics & update positions ---
+        // ── Apply physics ─────────────────────────────────────────────────────
         {
             let guard = graph_lock.read();
             if let Some(map) = guard.as_ref() {
                 for (i, vehicle) in vehicles.iter_mut().enumerate() {
-                    let (accel, _desired, _gap, _dv) = accel_inputs[i];
-                    apply_vehicle_physics(vehicle, accel, real_dt_s, game_dt_s, map, &intersections);
+                    apply_vehicle_physics(
+                        vehicle,
+                        accel_inputs[i],
+                        real_dt_s,
+                        map,
+                        &intersections,
+                        &spawn_system.speed_config,
+                    );
                 }
             }
         }
 
-        // --- Lane change decisions ---
+        // ── Lane changes ──────────────────────────────────────────────────────
         {
             let guard = graph_lock.read();
             if let Some(map) = guard.as_ref() {
-                let vehicle_snapshot: Vec<&Vehicle> = vehicles.iter().collect();
-                let lane_changes: Vec<(u32, u8)> = vehicles
+                let snapshot: Vec<&Vehicle> = vehicles.iter().collect();
+                let changes: Vec<(u32, u8)> = vehicles
                     .iter()
                     .filter_map(|v| {
                         if v.route_pos >= v.route.len() { return None; }
                         let edge_idx = v.route[v.route_pos];
                         let edge = map.graph.edge_weight(edge_idx)?;
-                        let same_edge: Vec<&Vehicle> = vehicle_snapshot
+                        let same_edge: Vec<&Vehicle> = snapshot
                             .iter()
-                            .filter(|o| o.route_pos < o.route.len() && o.route[o.route_pos] == edge_idx)
+                            .filter(|o| {
+                                o.route_pos < o.route.len()
+                                    && o.route[o.route_pos] == edge_idx
+                            })
                             .copied()
                             .collect();
                         decide_lane_change(v, edge, &same_edge).map(|lane| (v.id, lane))
                     })
                     .collect();
 
-                for (vid, new_lane) in lane_changes {
+                for (vid, new_lane) in changes {
                     if let Some(v) = vehicles.iter_mut().find(|v| v.id == vid) {
                         v.current_lane = new_lane;
                         v.lane_change_cooldown = 3.0;
@@ -181,17 +219,44 @@ pub fn run_simulation(
             }
         }
 
-        // --- Remove despawned vehicles ---
+        // ── Despawn ───────────────────────────────────────────────────────────
         vehicles.retain(|v| !v.despawned);
 
-        // --- Serialize and send vehicle frame (skip if no vehicles yet) ---
+        // ── Check game-over conditions ────────────────────────────────────────
         if !vehicles.is_empty() {
-            let frame = serialize_vehicles(&vehicles);
+            let avg_frustration: f32 =
+                vehicles.iter().map(|v| v.frustration).sum::<f32>() / vehicles.len() as f32;
+            let rage_count = vehicles.iter().filter(|v| v.frustration >= 100.0).count();
+            let mass_rage_fraction = rage_count as f32 / vehicles.len() as f32;
+
+            let cfg = &spawn_system.speed_config.rage;
+            if avg_frustration > cfg.global_loss_threshold {
+                high_frustration_timer += real_dt_s;
+                if high_frustration_timer >= cfg.global_loss_duration_s {
+                    log::warn!(
+                        "GAME OVER: avg frustration {:.1} held for {:.0}s",
+                        avg_frustration, high_frustration_timer
+                    );
+                    high_frustration_timer = 0.0;
+                }
+            } else if mass_rage_fraction >= cfg.mass_rage_fraction {
+                log::warn!(
+                    "GAME OVER: mass rage – {:.0}% vehicles at 100 frustration",
+                    mass_rage_fraction * 100.0
+                );
+            } else {
+                high_frustration_timer = 0.0;
+            }
+        }
+
+        // ── Serialise and send vehicle frame ─────────────────────────────────
+        if !vehicles.is_empty() || !tram_sim.is_empty() {
+            let frame = serialize_vehicles(&vehicles, &tram_sim);
             let encoded = base64::engine::general_purpose::STANDARD.encode(&frame);
             let _ = vehicle_channel.send(encoded);
         }
 
-        // --- Congestion update every 500 ms ---
+        // ── Congestion update ─────────────────────────────────────────────────
         congestion_timer += real_dt_s;
         if congestion_timer >= CONGESTION_INTERVAL_S {
             congestion_timer = 0.0;
@@ -202,7 +267,7 @@ pub fn run_simulation(
             }
         }
 
-        // --- Sleep to maintain target tick rate ---
+        // ── Sleep to maintain tick rate ───────────────────────────────────────
         let elapsed = last_tick.elapsed().as_secs_f32();
         let remaining = TARGET_TICK_S - elapsed;
         if remaining > 0.001 {
@@ -211,15 +276,19 @@ pub fn run_simulation(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
+// ── Command handler ────────────────────────────────────────────────────────────
 
-fn handle_command(cmd: SimCommand, clock: &mut GameClock, intersections: &mut IntersectionManager) {
+fn handle_command(
+    cmd: SimCommand,
+    clock: &mut GameClock,
+    intersections: &mut IntersectionManager,
+    spawn_system: &mut SpawnSystem,
+) {
     match cmd {
-        SimCommand::Pause => clock.pause(),
-        SimCommand::Resume => clock.resume(),
-        SimCommand::SetTimeScale(s) => clock.set_time_scale(s),
+        SimCommand::Pause                  => clock.pause(),
+        SimCommand::Resume                 => clock.resume(),
+        SimCommand::SetTimeScale(s)        => clock.set_time_scale(s),
+        SimCommand::SetSpeedConfig(cfg)    => spawn_system.set_speed_config(cfg),
         SimCommand::SetLightMode { intersection_id, mode } => {
             intersections.set_mode(intersection_id, mode);
         }
@@ -230,24 +299,19 @@ fn handle_command(cmd: SimCommand, clock: &mut GameClock, intersections: &mut In
     }
 }
 
-/// Find the id of the vehicle immediately ahead of `ego` on the same edge/lane.
+// ── Physics helpers ────────────────────────────────────────────────────────────
+
 fn find_leader(ego: &Vehicle, vehicles: &[Vehicle], grid: &SpatialGrid) -> Option<u32> {
-    if ego.route_pos >= ego.route.len() {
-        return None;
-    }
+    if ego.route_pos >= ego.route.len() { return None; }
     let ego_edge = ego.route[ego.route_pos];
+    let nearby   = grid.query_nearby(ego.lat, ego.lng, 2);
 
-    let nearby = grid.query_nearby(ego.lat, ego.lng, 2);
-
-    let mut best_id: Option<u32> = None;
+    let mut best_id   = None;
     let mut best_dist = f32::MAX;
 
     for &id in &nearby {
-        if id == ego.id {
-            continue;
-        }
+        if id == ego.id { continue; }
         if let Some(other) = vehicles.iter().find(|v| v.id == id) {
-            // Same edge and lane
             if other.route_pos < other.route.len()
                 && other.route[other.route_pos] == ego_edge
                 && other.current_lane == ego.current_lane
@@ -256,42 +320,37 @@ fn find_leader(ego: &Vehicle, vehicles: &[Vehicle], grid: &SpatialGrid) -> Optio
                 let dist = geo_dist_approx(ego.lat, ego.lng, other.lat, other.lng);
                 if dist < best_dist {
                     best_dist = dist;
-                    best_id = Some(id);
+                    best_id   = Some(id);
                 }
             }
         }
     }
-
     best_id
 }
 
-/// Fast geographic distance approximation in metres (accurate enough for short distances).
 #[inline]
 fn geo_dist_approx(lat1: f64, lng1: f64, lat2: f64, lng2: f64) -> f32 {
     let dlat = (lat2 - lat1) * 111_320.0;
-    let dlng = (lng2 - lng1) * 71_700.0; // at ~50°N
+    let dlng = (lng2 - lng1) * 71_700.0;
     ((dlat * dlat + dlng * dlng) as f32).sqrt()
 }
 
+/// Desired speed = road max_speed × personal_compliance, capped by vehicle type max.
 fn compute_desired_speed(vehicle: &Vehicle, map: &MapData) -> f32 {
     if vehicle.route_pos >= vehicle.route.len() {
         return 0.0;
     }
-    let edge_idx = vehicle.route[vehicle.route_pos];
     let road_max = map
         .graph
-        .edge_weight(edge_idx)
+        .edge_weight(vehicle.route[vehicle.route_pos])
         .map(|e| e.max_speed)
         .unwrap_or(14.0);
 
+    let v0_road  = road_max * vehicle.personal_compliance;
     let vtype_max = vehicle.vehicle_type.params().max_speed;
-    let driver_factor = vehicle.driver_profile.params().desired_speed_factor;
-
-    (road_max * driver_factor).min(vtype_max)
+    v0_road.min(vtype_max)
 }
 
-/// If the vehicle is near the end of its current edge AND the target node has a red light,
-/// inject a virtual stopped leader at the edge end.
 fn apply_traffic_light_effect(
     vehicle: &Vehicle,
     gap: f32,
@@ -299,73 +358,100 @@ fn apply_traffic_light_effect(
     intersections: &IntersectionManager,
     map: &MapData,
 ) -> (f32, f32) {
-    if vehicle.route_pos >= vehicle.route.len() {
-        return (gap, delta_v);
-    }
+    if vehicle.route_pos >= vehicle.route.len() { return (gap, delta_v); }
     let edge_idx = vehicle.route[vehicle.route_pos];
     let edge = match map.graph.edge_weight(edge_idx) {
         Some(e) => e,
-        None => return (gap, delta_v),
+        None    => return (gap, delta_v),
     };
+    let dist_to_end = edge.length_m * (1.0 - vehicle.edge_progress);
+    if dist_to_end > 30.0 { return (gap, delta_v); }
 
-    // Only apply brake effect when within the last 30 m of the edge
-    let dist_to_end_m = edge.length_m * (1.0 - vehicle.edge_progress);
-    if dist_to_end_m > 30.0 {
-        return (gap, delta_v);
+    let target_osm_id = map
+        .graph
+        .edge_endpoints(edge_idx)
+        .map(|(_, tgt)| map.graph[tgt].osm_id);
+
+    if let Some(osm_id) = target_osm_id {
+        if !intersections.can_proceed(osm_id) {
+            let vgap = dist_to_end.max(0.1);
+            let vdv  = vehicle.speed;
+            let new_gap = vgap.min(gap);
+            let new_dv  = if new_gap < gap { vdv } else { delta_v };
+            return (new_gap, new_dv);
+        }
     }
-
-    // Find the target node of this edge
-    let edge_endpoints = map.graph.edge_endpoints(edge_idx);
-    let target_node_idx = match edge_endpoints {
-        Some((_, tgt)) => tgt,
-        None => return (gap, delta_v),
-    };
-    let target_osm_id = map.graph[target_node_idx].osm_id;
-
-    if !intersections.can_proceed(target_osm_id) {
-        // Treat the stop line as a virtual stopped vehicle
-        let virtual_gap = dist_to_end_m.max(0.1);
-        let virtual_delta_v = vehicle.speed; // relative speed to a stopped obstacle
-        let new_gap = virtual_gap.min(gap);
-        let new_dv = if new_gap < gap { virtual_delta_v } else { delta_v };
-        (new_gap, new_dv)
-    } else {
-        (gap, delta_v)
-    }
+    (gap, delta_v)
 }
 
 fn apply_vehicle_physics(
     vehicle: &mut Vehicle,
     accel: f32,
     real_dt_s: f32,
-    _game_dt_s: f32,
     map: &MapData,
     _intersections: &IntersectionManager,
+    speed_cfg: &SpeedConfig,
 ) {
-    // Update speed
     vehicle.accel = accel;
     vehicle.speed = (vehicle.speed + accel * real_dt_s).max(0.0);
 
-    // Update satisfaction
+    // ── Frustration update ─────────────────────────────────────────────────
+    let pi = SpeedConfig::profile_idx(vehicle.driver_profile);
+    let rage = &speed_cfg.rage;
+
     if vehicle.is_stopped() {
-        vehicle.wait_time_real_s += real_dt_s;
-        let threshold = vehicle.driver_profile.params().wait_threshold_real_s;
-        if vehicle.wait_time_real_s > threshold {
-            let decay = vehicle.driver_profile.params().frustration_decay_rate;
-            vehicle.satisfaction = (vehicle.satisfaction - decay * real_dt_s).max(0.0);
-        }
+        // Vehicle is standing still
+        vehicle.standstill_time_real_s += real_dt_s;
+        vehicle.crawl_time_real_s = 0.0;
+
+        let threshold = rage.standstill_threshold_s[pi];
+        let rate = if vehicle.standstill_time_real_s < threshold {
+            rage.decay_rate_linear[pi]
+        } else {
+            let excess = (vehicle.standstill_time_real_s - threshold) / threshold;
+            rage.decay_rate_linear[pi] * (1.0 + excess * excess)
+        };
+        vehicle.frustration = (vehicle.frustration + rate * real_dt_s).min(100.0);
     } else {
-        vehicle.wait_time_real_s = (vehicle.wait_time_real_s - real_dt_s).max(0.0);
-        let recovery = vehicle.driver_profile.params().recovery_rate;
-        vehicle.satisfaction = (vehicle.satisfaction + recovery * real_dt_s).min(100.0);
+        // Vehicle is moving
+        vehicle.standstill_time_real_s = 0.0;
+
+        // Check for crawling (very slow movement)
+        let crawl_speed = if vehicle.route_pos < vehicle.route.len() {
+            let road_max = map.graph.edge_weight(vehicle.route[vehicle.route_pos])
+                .map(|e| e.max_speed)
+                .unwrap_or(14.0);
+            road_max * rage.crawl_fraction
+        } else {
+            0.5
+        };
+
+        if vehicle.speed < crawl_speed.max(0.5) {
+            vehicle.crawl_time_real_s += real_dt_s;
+            if vehicle.crawl_time_real_s > rage.crawl_threshold_s {
+                vehicle.frustration =
+                    (vehicle.frustration + rage.crawl_rate[pi] * real_dt_s).min(100.0);
+            }
+        } else {
+            vehicle.crawl_time_real_s = 0.0;
+            // Recover frustration while moving normally
+            vehicle.frustration =
+                (vehicle.frustration - rage.recovery_rate[pi] * real_dt_s).max(0.0);
+        }
     }
 
-    // Update lane change cooldown
+    // Despawn at rage (frustration = 100)
+    if vehicle.frustration >= 100.0 {
+        vehicle.despawned = true;
+        return;
+    }
+
+    // ── Lane change cooldown ───────────────────────────────────────────────
     if vehicle.lane_change_cooldown > 0.0 {
         vehicle.lane_change_cooldown = (vehicle.lane_change_cooldown - real_dt_s).max(0.0);
     }
 
-    // Advance along edge
+    // ── Advance along route ────────────────────────────────────────────────
     if vehicle.route_pos >= vehicle.route.len() {
         vehicle.despawned = true;
         return;
@@ -375,17 +461,11 @@ fn apply_vehicle_physics(
     let (edge_len, src_idx, tgt_idx) = {
         let edge = match map.graph.edge_weight(edge_idx) {
             Some(e) => e,
-            None => {
-                vehicle.despawned = true;
-                return;
-            }
+            None    => { vehicle.despawned = true; return; }
         };
         let endpoints = match map.graph.edge_endpoints(edge_idx) {
             Some(e) => e,
-            None => {
-                vehicle.despawned = true;
-                return;
-            }
+            None    => { vehicle.despawned = true; return; }
         };
         (edge.length_m, endpoints.0, endpoints.1)
     };
@@ -394,9 +474,8 @@ fn apply_vehicle_physics(
         vehicle.edge_progress += vehicle.speed * real_dt_s / edge_len;
     }
 
-    // Edge transition
     if vehicle.edge_progress >= 1.0 {
-        vehicle.route_pos += 1;
+        vehicle.route_pos    += 1;
         vehicle.edge_progress = 0.0;
 
         if vehicle.route_pos >= vehicle.route.len() {
@@ -408,43 +487,93 @@ fn apply_vehicle_physics(
     // Interpolate position
     let src = &map.graph[src_idx];
     let tgt = &map.graph[tgt_idx];
-    let t = vehicle.edge_progress as f64;
+    let t   = vehicle.edge_progress as f64;
     vehicle.lat = src.lat + (tgt.lat - src.lat) * t;
     vehicle.lng = src.lng + (tgt.lng - src.lng) * t;
 
-    // Heading angle (east-referenced, converted to map-north for rendering)
-    let dlat = tgt.lat - src.lat;
+    // Heading
     let dlng = tgt.lng - src.lng;
-    // atan2(dlng * cos(lat), dlat) gives bearing from north; use simple atan2 for display
+    let dlat = tgt.lat - src.lat;
     vehicle.angle = (dlng as f32).atan2(dlat as f32);
 }
 
-/// Serialise all vehicles into a packed binary buffer.
-/// Each vehicle = 28 bytes (see binary packet format in README).
-fn serialize_vehicles(vehicles: &[Vehicle]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(vehicles.len() * 28);
+// ── Serialisation ─────────────────────────────────────────────────────────────
+
+/// Serialise all vehicles (including trams) into a packed binary buffer.
+///
+/// Per-vehicle layout (32 bytes, 4-byte aligned):
+/// ```text
+///   [0..3]   id:        u32  LE
+///   [4..7]   lat:       f32  LE
+///   [8..11]  lng:       f32  LE
+///   [12..15] angle:     f32  LE
+///   [16..19] speed:     f32  LE
+///   [20]     type:      u8   (0=Car, 1=Van, 2=Bus, 3=Truck, 4=Tram)
+///   [21]     profile:   u8
+///   [22]     trip_kind: u8   (0=local_od, 1=transit, 2=ext_in, 3=ext_out)
+///   [23]     padding:   u8
+///   [24..27] frustration: f32 LE (0=calm, 100=rage)
+///   [28..31] padding2:  u32  LE
+/// ```
+fn serialize_vehicles(vehicles: &[Vehicle], tram_sim: &TramSim) -> Vec<u8> {
+    let total = vehicles.len() + tram_sim.trams.len();
+    let mut buf = Vec::with_capacity(total * 32);
 
     for v in vehicles {
-        let id_bytes = v.id.to_le_bytes();
-        let lat_bytes = (v.lat as f32).to_le_bytes();
-        let lng_bytes = (v.lng as f32).to_le_bytes();
-        let angle_bytes = v.angle.to_le_bytes();
-        let speed_bytes = v.speed.to_le_bytes();
-        let vtype_byte = v.vehicle_type as u8;
-        let profile_byte = v.driver_profile as u8;
-        let padding: [u8; 2] = [0, 0];
-        let sat_bytes = v.satisfaction.to_le_bytes();
+        push_vehicle_packet(
+            &mut buf,
+            v.id,
+            v.lat,
+            v.lng,
+            v.angle,
+            v.speed,
+            v.vehicle_type as u8,
+            v.driver_profile as u8,
+            v.trip_kind,
+            v.frustration,
+        );
+    }
 
-        buf.extend_from_slice(&id_bytes);      // [0..3]
-        buf.extend_from_slice(&lat_bytes);     // [4..7]
-        buf.extend_from_slice(&lng_bytes);     // [8..11]
-        buf.extend_from_slice(&angle_bytes);   // [12..15]
-        buf.extend_from_slice(&speed_bytes);   // [16..19]
-        buf.push(vtype_byte);                  // [20]
-        buf.push(profile_byte);                // [21]
-        buf.extend_from_slice(&padding);       // [22..23]
-        buf.extend_from_slice(&sat_bytes);     // [24..27]
+    for t in &tram_sim.trams {
+        push_vehicle_packet(
+            &mut buf,
+            t.id,
+            t.lat,
+            t.lng,
+            t.angle,
+            t.speed,
+            crate::vehicles::types::VehicleType::Tram as u8,
+            0, // Normal profile placeholder
+            t.trip_kind,
+            t.frustration,
+        );
     }
 
     buf
+}
+
+#[inline]
+fn push_vehicle_packet(
+    buf: &mut Vec<u8>,
+    id: u32,
+    lat: f64,
+    lng: f64,
+    angle: f32,
+    speed: f32,
+    vtype: u8,
+    profile: u8,
+    trip_kind: u8,
+    frustration: f32,
+) {
+    buf.extend_from_slice(&id.to_le_bytes());              // [0..3]
+    buf.extend_from_slice(&(lat as f32).to_le_bytes());    // [4..7]
+    buf.extend_from_slice(&(lng as f32).to_le_bytes());    // [8..11]
+    buf.extend_from_slice(&angle.to_le_bytes());           // [12..15]
+    buf.extend_from_slice(&speed.to_le_bytes());           // [16..19]
+    buf.push(vtype);                                       // [20]
+    buf.push(profile);                                     // [21]
+    buf.push(trip_kind);                                   // [22]
+    buf.push(0u8);                                         // [23] padding
+    buf.extend_from_slice(&frustration.to_le_bytes());     // [24..27]
+    buf.extend_from_slice(&0u32.to_le_bytes());            // [28..31] padding2
 }

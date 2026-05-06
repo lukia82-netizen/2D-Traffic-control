@@ -28,8 +28,15 @@ export interface EdgeData {
   roadType: string;
 }
 
+export interface BuildingData {
+  id: number;
+  /** Ordered list of [lng, lat] vertices (GeoJSON convention). */
+  polygon: [number, number][];
+  buildingType: 'residential' | 'commercial' | 'office' | 'other';
+}
+
+/** @deprecated Use BuildingData */
 export interface BuildingPolygon {
-  /** Ordered list of [lat, lng] vertices */
   polygon: [number, number][];
 }
 
@@ -48,12 +55,29 @@ export interface TurnRestriction {
     | 'no_entry';
 }
 
+export interface TramStop {
+  osmId: number;
+  lat: number;
+  lng: number;
+  name: string | null;
+  stopDwellS: number;
+}
+
+export interface TramEdge {
+  fromOsmId: number;
+  toOsmId: number;
+  lengthM: number;
+  maxSpeed: number;
+  /** 'dedicated' | 'shared_with_road' */
+  trackType: string;
+}
+
 export interface MapData {
   nodes: NodeData[];
   edges: EdgeData[];
   spawnPoints: [number, number][];
   bbox: [number, number, number, number];
-  buildings: BuildingPolygon[];
+  buildings: BuildingData[];
   restrictions: TurnRestriction[];
 }
 
@@ -98,12 +122,20 @@ export async function setTimeScale(scale: number): Promise<void> {
 /**
  * Change the traffic light control mode for an intersection.
  * mode: 'Manual' | 'SemiAuto' | 'Auto' | 'Adaptive'
+ *
+ * Converts PascalCase/CamelCase → snake_case before sending to Rust
+ * (e.g. 'SemiAuto' → 'semi_auto').
  */
 export async function setTrafficLightMode(
   intersectionId: number,
   mode: string,
 ): Promise<void> {
-  return invoke<void>('set_traffic_light_mode', { intersectionId, mode });
+  // Convert PascalCase → snake_case: insert '_' before each uppercase letter
+  // that follows a lowercase letter, then lowercase everything.
+  const rustMode = mode
+    .replace(/([a-z])([A-Z])/g, '$1_$2')
+    .toLowerCase();
+  return invoke<void>('set_traffic_light_mode', { intersectionId, mode: rustMode });
 }
 
 /**
@@ -115,4 +147,61 @@ export async function setTrafficLightPhase(
   phase: number,
 ): Promise<void> {
   return invoke<void>('set_traffic_light_phase', { intersectionId, phase });
+}
+
+// ── Speed / compliance config ─────────────────────────────────────────────────
+
+export interface ComplianceRange {
+  base: number;
+  min: number;
+  max: number;
+}
+
+export interface RouteConfig {
+  refSpeedMs: number;
+  noiseSigma: number;
+  normalAlpha: [number, number];
+  sundayAlpha: [number, number];
+  piratAlpha: [number, number];
+  cautiousAlpha: [number, number];
+}
+
+export interface RageConfig {
+  standstillThresholdS: [number, number, number, number];
+  decayRateLinear: [number, number, number, number];
+  recoveryRate: [number, number, number, number];
+  crawlFraction: number;
+  crawlThresholdS: number;
+  crawlRate: [number, number, number, number];
+  repeatStopBonus: [number, number, number, number];
+  globalLossThreshold: number;
+  globalLossDurationS: number;
+  massRageFraction: number;
+}
+
+export interface SpeedConfig {
+  urban1lane: number;
+  urban2lane: number;
+  urban3lanePlus: number;
+  urbanMotorway: number;
+  urbanResidential: number;
+  urbanLiving: number;
+  rural1lane: number;
+  rural2lanePlus: number;
+  ruralMotorway: number;
+  complianceNormal: ComplianceRange;
+  complianceSunday: ComplianceRange;
+  compliancePirat: ComplianceRange;
+  complianceCautious: ComplianceRange;
+  noiseSigma: number;
+  route: RouteConfig;
+  rage: RageConfig;
+}
+
+/**
+ * Update speed / compliance / rage configuration at runtime.
+ * Changes take effect for newly spawned vehicles.
+ */
+export async function setSpeedConfig(config: SpeedConfig): Promise<void> {
+  return invoke<void>('set_speed_config', { config });
 }
