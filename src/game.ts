@@ -29,6 +29,7 @@ import { GameClockUI } from './time/GameClockUI';
 import { SandboxUI, CITY_PRESETS } from './ui/SandboxUI';
 import { LESZNO_BBOX } from './map/MapLibreSetup';
 import { ROAD_TYPE_GROUP } from './rendering/RoadRenderer';
+import { TrafficAudioSystem } from './audio/TrafficAudioSystem';
 
 // ─── Mode: always start in SANDBOX ───────────────────────────────────────────
 // Sandbox uses Leszno, skips building rendering (big perf win), shows
@@ -147,6 +148,7 @@ export class Game {
   private currentBbox: [number, number, number, number] = DEFAULT_BBOX;
   /** null = real OSM data; string = sandbox grid type ('mixed'|'one_lane'|'single_road'|…) */
   private currentGridMode: string | null = 'single_road';
+  private audio: TrafficAudioSystem | null = null;
 
   constructor(map: maplibregl.Map, overlay: PixiOverlay) {
     this.map = map;
@@ -174,6 +176,8 @@ export class Game {
     this.trafficLightUI = new TrafficLightUI(this.map);
     this.trafficLightRenderer = new TrafficLightRenderer(this.overlay, this.map);
     this.gameClockUI = new GameClockUI();
+    this.audio = new TrafficAudioSystem();
+    this.audio.init();
 
     // Init vehicle textures
     await this.vehicleRenderer.init();
@@ -464,6 +468,8 @@ export class Game {
   // ─── Main game loop ────────────────────────────────────────────────────────
 
   private gameLoop(ticker: PIXI.Ticker): void {
+    this.audio?.update(this.vehicles, this.gameClockUI.paused || this.gameOver);
+
     // Animate oneway arrows regardless of pause state
     this.infraRenderer.update(ticker.deltaMS);
 
@@ -532,6 +538,7 @@ export class Game {
     this.unlistenCongestion?.();
     this.unlistenLights?.();
     this.unlistenGameOver?.();
+    this.audio?.destroy();
     this.sandboxUI?.destroy();
     this.buildingRenderer.destroy();
     this.roadRenderer.destroy();
