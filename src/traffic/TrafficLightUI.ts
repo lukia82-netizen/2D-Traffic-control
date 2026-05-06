@@ -5,9 +5,15 @@ import {
   setTrafficLightMode,
   setTrafficLightPhase,
   setLightDurations,
+  TRAFFIC_LIGHT_PHASE_ADVANCE_PROGRAM,
 } from '../bridge/commands';
 
 type LightMode = 'Auto' | 'SemiAuto' | 'Manual' | 'Adaptive';
+
+const MAP_CLICK_ADVANCE_STORAGE = 'tl-map-click-advance';
+
+/** ~obszar skrzyżowania na mapie (zgodnie z szerokością węzła w RoadRenderer). */
+const INTERSECTION_HIT_RADIUS_M = 34;
 
 // Phase index constants
 const PHASE_RED = 0;
@@ -42,13 +48,15 @@ export class TrafficLightUI {
   private readonly adaptiveEffectiveGreen: HTMLElement;
   private readonly phaseDots: HTMLElement[];
   private readonly closeBtn: HTMLElement;
+  private readonly mapClickAdvanceChk: HTMLInputElement;
 
   private selectedIntersectionId: number | null = null;
   private readonly lightStates: Map<number, LightStateUpdate> = new Map();
-  private intersectionNodes: NodeData[] = [];
+  /** Traffic lights + pedestrian crossings (map hit-test & panel). */
+  private signalizedNodes: NodeData[] = [];
   private hiddenNodeIds: Set<number> = new Set();
 
-  // Click-detect radius in pixels
+  /** Click-detect radius in pixels when „map click → phase” is off. */
   private static readonly CLICK_RADIUS_PX = 20;
 
   constructor(map: maplibregl.Map) {
@@ -73,26 +81,31 @@ export class TrafficLightUI {
       this.require('phase-yellow'),
       this.require('phase-green'),
     ];
+    this.mapClickAdvanceChk = this.require('light-map-click-advance') as HTMLInputElement;
+    try {
+      const saved = localStorage.getItem(MAP_CLICK_ADVANCE_STORAGE);
+      if (saved === '0') this.mapClickAdvanceChk.checked = false;
+      if (saved === '1') this.mapClickAdvanceChk.checked = true;
+    } catch {
+      /* ignore */
+    }
+    this.mapClickAdvanceChk.addEventListener('change', () => {
+      try {
+        localStorage.setItem(MAP_CLICK_ADVANCE_STORAGE, this.mapClickAdvanceChk.checked ? '1' : '0');
+      } catch {
+        /* ignore */
+      }
+    });
   }
 
   // ─── Lifecycle ─────────────────────────────────────────────────────────────
 
   init(nodes: NodeData[]): void {
-    this.intersectionNodes = nodes.filter(
-      (n) => n.intersectionType === 'traffic_light',
+    this.signalizedNodes = nodes.filter(
+      (n) =>
+        n.intersectionType === 'traffic_light' ||
+        n.intersectionType === 'pedestrian_crossing',
     );
-
-    // Map click → check proximity to intersection nodes
-    this.map.on('click', (e) => {
-      const clickPx = this.map.project([e.lngLat.lng, e.lngLat.lat]);
-      const closest = this.findClosestIntersection(clickPx.x, clickPx.y);
-
-      if (closest !== null) {
-        this.selectIntersection(closest);
-      } else {
-        this.hidePanel();
-      }
-    });
 
     // Mode change
     this.modeSelect.addEventListener('change', () => {
@@ -155,6 +168,36 @@ export class TrafficLightUI {
   hidePanel(): void {
     this.panel.classList.add('hidden');
     this.selectedIntersectionId = null;
+  }
+
+  /**
+   * Map click: wybór skrzyżowania / opcjonalnie następna faza w obszarze (metry).
+   * Zwraca `true`, gdy klik został obsłużony — wtedy nie wybieraj pojazdu pod spodem.
+   */
+  handleMapClick(
+    clickLng: number,
+    clickLat: number,
+    clickPxX: number,
+    clickPxY: number,
+    tauriAvailable: boolean,
+  ): boolean {
+    const useMeters = this.mapClickAdvanceChk.checked;
+    const hit = useMeters
+      ? this.findClosestSignalizedMeters(clickLng, clickLat)
+      : this.findClosestSignalizedPixels(clickPxX, clickPxY);
+
+    if (hit === null) {
+      this.hidePanel();
+      return false;
+    }
+
+    this.selectIntersection(hit.id);
+
+    if (tauriAvailable && useMeters) {
+      this.advancePhaseFromMapClick(hit);
+    }
+
+    return true;
   }
 
   /**
@@ -223,21 +266,57 @@ export class TrafficLightUI {
     }
   }
 
-  private findClosestIntersection(px: number, py: number): number | null {
-    let bestId: number | null = null;
+  private findClosestSignalizedPixels(px: number, py: number): NodeData | null {
+    let best: NodeData | null = null;
     let bestDist = TrafficLightUI.CLICK_RADIUS_PX;
 
-    for (const node of this.intersectionNodes) {
+    for (const node of this.signalizedNodes) {
       if (this.hiddenNodeIds.has(node.id)) continue;
       const nodePx = this.map.project([node.lng, node.lat]);
       const dist = Math.hypot(nodePx.x - px, nodePx.y - py);
       if (dist < bestDist) {
         bestDist = dist;
-        bestId = node.id;
+        best = node;
       }
     }
 
-    return bestId;
+    return best;
+  }
+
+  private findClosestSignalizedMeters(clickLng: number, clickLat: number): NodeData | null {
+    let best: NodeData | null = null;
+    let bestM = INTERSECTION_HIT_RADIUS_M;
+
+    for (const node of this.signalizedNodes) {
+      if (this.hiddenNodeIds.has(node.id)) continue;
+      const m = planarDistanceM(clickLat, clickLng, clickLat, node.lng, node.lat);
+      if (m < bestM) {
+        bestM = m;
+        best = node;
+      }
+    }
+
+    return best;
+  }
+
+  /** Ustaw tryb Manual i przejdź do następnej fazy (program TL lub R→Y→G na przejściu). */
+  private advancePhaseFromMapClick(node: NodeData): void {
+    const id = node.id;
+    const run = async (): Promise<void> => {
+      try {
+        await setTrafficLightMode(id, 'Manual');
+        if (node.intersectionType === 'pedestrian_crossing') {
+          const cur = this.lightStates.get(id)?.phase ?? PHASE_RED;
+          const next = (cur + 1) % 3;
+          await setTrafficLightPhase(id, next);
+        } else {
+          await setTrafficLightPhase(id, TRAFFIC_LIGHT_PHASE_ADVANCE_PROGRAM);
+        }
+      } catch (err) {
+        console.error(err);
+      }
+    };
+    void run();
   }
 
   private applyPhaseVisual(phase: number): void {
@@ -255,6 +334,18 @@ export class TrafficLightUI {
     if (!el) throw new Error(`TrafficLightUI: element #${id} not found`);
     return el;
   }
+}
+
+function planarDistanceM(
+  refLat: number,
+  lng1: number,
+  lat1: number,
+  lng2: number,
+  lat2: number,
+): number {
+  const dLat = (lat2 - lat1) * 111_320;
+  const dLng = (lng2 - lng1) * 111_320 * Math.cos((refLat * Math.PI) / 180);
+  return Math.hypot(dLat, dLng);
 }
 
 // Re-export phase constants for external use

@@ -473,6 +473,25 @@ html, body {
   border-color: rgba(0, 212, 255, 0.4);
 }
 
+.light-map-click-row {
+  margin-top: -4px;
+}
+
+.light-map-click-label {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 11px;
+  line-height: 1.35;
+  color: rgba(255, 255, 255, 0.55);
+  cursor: pointer;
+}
+
+.light-map-click-label input {
+  margin-top: 2px;
+  flex-shrink: 0;
+}
+
 #light-manual-controls {
   display: flex;
   flex-direction: column;

@@ -224,6 +224,14 @@ export class Game {
       }
     });
     this.map.on('click', (e) => {
+      const consumed = this.trafficLightUI.handleMapClick(
+        e.lngLat.lng,
+        e.lngLat.lat,
+        e.point.x,
+        e.point.y,
+        this.tauriAvailable,
+      );
+      if (consumed) return;
       void this.selectVehicleAtScreenPoint(e.point.x, e.point.y);
     });
 
