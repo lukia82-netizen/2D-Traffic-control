@@ -323,3 +323,59 @@ impl TrafficLight {
         matches!(self.kind, TrafficLightKind::Pedestrian(..))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn light_phase_roundtrip_u8() {
+        assert_eq!(LightPhase::from_u8(0), LightPhase::Red);
+        assert_eq!(LightPhase::from_u8(1), LightPhase::Yellow);
+        assert_eq!(LightPhase::from_u8(2), LightPhase::Green);
+        assert_eq!(LightPhase::from_u8(255), LightPhase::Red);
+        assert_eq!(LightPhase::Green.to_u8(), 2);
+    }
+
+    #[test]
+    fn pedestrian_auto_cycles_green_to_yellow() {
+        let mut p = PedestrianCrossingLight::new(99, 10.0, 3.0, 10.0);
+        p.mode = LightControlMode::Auto;
+        p.current_phase = LightPhase::Green;
+        p.phase_timer = 9.5;
+        p.update(1.0);
+        assert_eq!(p.current_phase, LightPhase::Yellow);
+        assert_eq!(p.phase_timer, 0.0);
+    }
+
+    #[test]
+    fn pedestrian_time_remaining_non_negative() {
+        let p = PedestrianCrossingLight::new(1, 12.0, 3.0, 12.0);
+        assert!(p.time_remaining() >= 0.0);
+    }
+
+    #[test]
+    fn force_phase_cmd_vehicle_advances_on_magic_byte() {
+        use crate::traffic::phased_traffic_light::JunctionLayout;
+        use petgraph::graph::EdgeIndex;
+        use std::collections::HashMap;
+
+        let arms: Vec<EdgeIndex> = (0..4).map(EdgeIndex::new).collect();
+        let mut edge_to_arm = HashMap::new();
+        for (i, e) in arms.iter().enumerate() {
+            edge_to_arm.insert(*e, i as u8);
+        }
+        let layout = JunctionLayout { arms, edge_to_arm };
+        let mut tl = TrafficLight::new_vehicle_multiphase(7, layout);
+        let start = match &tl.kind {
+            TrafficLightKind::VehiclePhased(ph) => ph.step_index,
+            _ => panic!("expected vehicle phased"),
+        };
+        tl.force_phase_cmd(TL_CMD_ADVANCE_STEP);
+        let after = match &tl.kind {
+            TrafficLightKind::VehiclePhased(ph) => ph.step_index,
+            _ => panic!("expected vehicle phased"),
+        };
+        assert_ne!(start, after);
+    }
+}

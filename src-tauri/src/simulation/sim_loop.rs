@@ -27,8 +27,6 @@ use crate::simulation::tram_sim::TramSim;
 const TARGET_TICK_S: f32 = 1.0 / 60.0;
 const CONGESTION_INTERVAL_S: f32 = 0.5;
 const STOP_LINE_OFFSET_M: f32 = 8.0;
-const MIN_IDM_GAP_M: f32 = 0.1;
-
 /// Smallest admissible IDM free gap to avoid divide-by-zero and explosive braking.
 const MIN_IDM_GAP_M: f32 = 0.1;
 /// Additional spawn breathing room after bumper gap has been computed.

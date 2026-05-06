@@ -172,3 +172,33 @@ impl SpeedConfig {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compliance_for_matches_profile() {
+        let cfg = SpeedConfig::default();
+        assert!((cfg.compliance_for(DriverProfile::Pirat).base - 1.35).abs() < 1e-5);
+        assert!((cfg.compliance_for(DriverProfile::Sunday).base - 0.95).abs() < 1e-5);
+    }
+
+    #[test]
+    fn route_alpha_range_ordering() {
+        let cfg = SpeedConfig::default();
+        let (n_lo, n_hi) = cfg.route_alpha_range(DriverProfile::Normal);
+        assert!(n_lo <= n_hi);
+        let (p_lo, p_hi) = cfg.route_alpha_range(DriverProfile::Pirat);
+        assert!(p_lo >= n_lo, "pirat should prefer faster routing on average");
+        assert!(p_hi > n_hi);
+    }
+
+    #[test]
+    fn profile_idx_is_stable() {
+        assert_eq!(SpeedConfig::profile_idx(DriverProfile::Normal), 0);
+        assert_eq!(SpeedConfig::profile_idx(DriverProfile::Sunday), 1);
+        assert_eq!(SpeedConfig::profile_idx(DriverProfile::Pirat), 2);
+        assert_eq!(SpeedConfig::profile_idx(DriverProfile::Cautious), 3);
+    }
+}
