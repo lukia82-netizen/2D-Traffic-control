@@ -13,8 +13,9 @@ import {
   listenCongestionUpdates,
   listenLightStateChanges,
   listenGameOver,
+  listenIdmDebug,
 } from './bridge/events';
-import type { VehicleState, CongestionData, LightStateUpdate, GameOverPayload } from './bridge/events';
+import type { VehicleState, CongestionData, LightStateUpdate, GameOverPayload, IdmDebugPayload } from './bridge/events';
 import { PixiOverlay } from './rendering/PixiOverlay';
 import { CameraManager } from './rendering/CameraManager';
 import { RoadRenderer } from './rendering/RoadRenderer';
@@ -135,6 +136,7 @@ export class Game {
   private unlistenCongestion: (() => void) | null = null;
   private unlistenLights: (() => void) | null = null;
   private unlistenGameOver: (() => void) | null = null;
+  private unlistenIdmDebug: (() => void) | null = null;
 
   // Scoring
   private score = 0;
@@ -468,6 +470,9 @@ export class Game {
     this.unlistenGameOver = await listenGameOver((data) =>
       this.onGameOver(data),
     );
+    this.unlistenIdmDebug = await listenIdmDebug((data) =>
+      this.onIdmDebug(data),
+    );
   }
 
   // ─── Simulation start ──────────────────────────────────────────────────────
@@ -526,6 +531,10 @@ export class Game {
       this.score,
       data.timestampGame,
     );
+  }
+
+  private onIdmDebug(data: IdmDebugPayload): void {
+    this.uiRenderer.updateIdmDebug(data);
   }
 
   // ─── Main game loop ────────────────────────────────────────────────────────
@@ -600,6 +609,7 @@ export class Game {
     this.unlistenLights?.();
     this.unlistenGameOver?.();
     this.bboxPicker?.destroy();
+    this.unlistenIdmDebug?.();
     this.sandboxUI?.destroy();
     this.mapScenarioEditorUI?.destroy();
     this.buildingRenderer.destroy();

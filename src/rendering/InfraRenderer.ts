@@ -105,10 +105,10 @@ export class InfraRenderer {
       }
 
       // Stop line: white bar perpendicular to the road, set back from the
-      // target node when that node is a traffic light or stop sign.
+      // target node when that node is a stop sign.
+      // Traffic-light stop lines are rendered in TrafficLightRenderer per approach.
       const targetNode = toNode;
       if (
-        targetNode.intersectionType === 'traffic_light' ||
         targetNode.intersectionType === 'stop'
       ) {
         this.drawStopLine(gfx, fromPx, toPx, edge);

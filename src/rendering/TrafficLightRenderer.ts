@@ -11,9 +11,9 @@ import { projectPoint } from '../map/MapLibreSetup';
 const MIN_ZOOM = 13;
 
 /** How far along the edge (0–1) the stop line sits. */
-const STOP_LINE_T = 0.88;
+const STOP_LINE_T = 0.92;
 /** How far along the edge the signal head sits (just before stop line). */
-const SIGNAL_HEAD_T = 0.82;
+const SIGNAL_HEAD_T = 0.90;
 
 /** Radius of signal housing circle at zoom 16. */
 const HOUSING_R_REF = 5;

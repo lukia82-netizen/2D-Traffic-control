@@ -38,6 +38,17 @@ struct GameOverPayload {
     timestamp_game: f32,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IdmDebugPayload {
+    vehicle_id: u32,
+    speed: f32,
+    gap: f32,
+    delta_v: f32,
+    dist_to_stop_line: f32,
+    red_blocking: bool,
+}
+
 pub fn run_simulation(
     graph_lock: Arc<RwLock<Option<MapData>>>,
     command_rx: Receiver<SimCommand>,
@@ -48,39 +59,34 @@ pub fn run_simulation(
     let mut vehicles: Vec<Vehicle> = Vec::with_capacity(512);
     let mut congestion_timer = 0.0f32;
     let mut high_frustration_timer = 0.0f32;
+    let mut idm_debug_timer = 0.0f32;
 
     // ── Build subsystems from map ────────────────────────────────────────────
-    let (mut intersections, mut spawn_system, od_model, mut tram_sim) = {
+    let (mut intersections, mut spawn_system, mut od_model, mut tram_sim) = {
         let guard = graph_lock.read();
         let map   = guard.as_ref().expect("map must be loaded before starting simulation");
 
-        let intersections = IntersectionManager::from_graph(&map.graph);
-
-        // Send all initial light states so the frontend shows the correct
-        // staggered phases immediately (instead of defaulting everything to Red).
-        let initial_states = intersections.all_state_updates();
-        if !initial_states.is_empty() {
-            let _ = app_handle.emit("light_state_change", &initial_states);
-        }
-
-        let speed_config  = SpeedConfig::default();
-
-        let spawn = SpawnSystem::new(
-            map.spawn_points.clone(),
-            map.boundary_nodes.clone(),
-            speed_config,
-            map.is_sandbox,
-        );
-        let od = OdModel::new(
-            map.od_buildings.clone(),
-            &mut rand::rngs::OsRng,
-        );
-
-        // Tram simulation: use IDs starting after the car-id range to avoid collisions
-        let tram = TramSim::new(&map.tram_data, 100_000);
-
-        (intersections, spawn, od, tram)
+        (
+            IntersectionManager::from_graph(&map.graph),
+            SpawnSystem::new(
+                map.spawn_points.clone(),
+                map.boundary_nodes.clone(),
+                SpeedConfig::default(),
+                map.is_sandbox,
+            ),
+            OdModel::new(map.od_buildings.clone(), &mut rand::rngs::OsRng),
+            // Tram simulation: use IDs starting after the car-id range to avoid collisions
+            TramSim::new(&map.tram_data, 100_000),
+        )
     };
+    let mut map_signature = current_map_signature(&graph_lock);
+
+    // Send all initial light states so the frontend shows the correct
+    // staggered phases immediately (instead of defaulting everything to Red).
+    let initial_states = intersections.all_state_updates();
+    if !initial_states.is_empty() {
+        let _ = app_handle.emit("light_state_change", &initial_states);
+    }
 
     // Per-(edge, lane) sorted vehicle index buckets — rebuilt every tick.
     // Key: (EdgeIndex, lane_number), Value: Vec of indices into `vehicles` sorted by edge_progress ascending.
@@ -111,6 +117,37 @@ pub fn run_simulation(
                     log::info!("Simulation command channel closed, stopping");
                     return;
                 }
+            }
+        }
+
+        // Reload simulation-dependent caches when the map has changed.
+        // This avoids stale NodeIndex/EdgeIndex references after `load_map`.
+        let latest_signature = current_map_signature(&graph_lock);
+        if latest_signature != map_signature {
+            let guard = graph_lock.read();
+            if let Some(map) = guard.as_ref() {
+                intersections = IntersectionManager::from_graph(&map.graph);
+                let mut refreshed_spawn = SpawnSystem::new(
+                    map.spawn_points.clone(),
+                    map.boundary_nodes.clone(),
+                    SpeedConfig::default(),
+                    map.is_sandbox,
+                );
+                // Preserve user-updated runtime tuning across map reloads.
+                refreshed_spawn.speed_config = spawn_system.speed_config.clone();
+                refreshed_spawn.max_vehicles = spawn_system.max_vehicles;
+                spawn_system = refreshed_spawn;
+                od_model = OdModel::new(map.od_buildings.clone(), &mut rand::rngs::OsRng);
+                tram_sim = TramSim::new(&map.tram_data, 100_000);
+                vehicles.clear();
+                edge_lane_vehicles.clear();
+                map_signature = latest_signature;
+
+                let light_states = intersections.all_state_updates();
+                if !light_states.is_empty() {
+                    let _ = app_handle.emit("light_state_change", &light_states);
+                }
+                log::info!("Map changed during simulation; rebuilt spawn/OD/tram caches");
             }
         }
 
@@ -318,6 +355,33 @@ pub fn run_simulation(
                     high_frustration_timer = 0.0;
                 }
             }
+
+            // IDM debug snapshot (~5 Hz): one representative vehicle.
+            idm_debug_timer += PHYSICS_DT;
+            if idm_debug_timer >= 0.2 {
+                idm_debug_timer = 0.0;
+                if let Some((i, ego)) = vehicles
+                    .iter()
+                    .enumerate()
+                    .find(|(_, v)| v.route_pos < v.route.len() && v.vehicle_type as u8 != 4)
+                {
+                    let guard = graph_lock.read();
+                    if let Some(map) = guard.as_ref() {
+                        let (gap, delta_v) = find_leader_arc(i, ego, &vehicles, &edge_lane_vehicles, map);
+                        let (dist_to_stop_line, red_blocking) =
+                            stop_line_debug(ego, map, &intersections).unwrap_or((1000.0, false));
+                        let payload = IdmDebugPayload {
+                            vehicle_id: ego.id,
+                            speed: ego.speed,
+                            gap,
+                            delta_v,
+                            dist_to_stop_line,
+                            red_blocking,
+                        };
+                        let _ = app_handle.emit("idm_debug", payload);
+                    }
+                }
+            }
         } // end while physics_accumulator >= PHYSICS_DT
 
         // ── Render: serialise once per outer loop iteration ──────────────────
@@ -347,6 +411,43 @@ pub fn run_simulation(
             std::thread::sleep(Duration::from_secs_f32(remaining));
         }
     }
+}
+
+fn stop_line_debug(
+    vehicle: &Vehicle,
+    map: &MapData,
+    intersections: &IntersectionManager,
+) -> Option<(f32, bool)> {
+    if vehicle.route_pos >= vehicle.route.len() {
+        return None;
+    }
+    let edge_idx = vehicle.route[vehicle.route_pos];
+    let edge = map.graph.edge_weight(edge_idx)?;
+    let (_, tgt) = map.graph.edge_endpoints(edge_idx)?;
+    let tgt_osm_id = map.graph[tgt].osm_id;
+    let itype = &map.graph[tgt].intersection_type;
+
+    if !matches!(itype, IntersectionType::TrafficLight | IntersectionType::PedestrianCrossing) {
+        return None;
+    }
+
+    const STOP_LINE_OFFSET_M: f32 = 8.0;
+    let dist_to_end = edge.length_m * (1.0 - vehicle.edge_progress);
+    let dist_to_stop_line = (dist_to_end - STOP_LINE_OFFSET_M).max(0.0);
+    let red_blocking = !intersections.can_vehicle_proceed(tgt_osm_id, vehicle.has_stopped_at_stop_sign);
+    Some((dist_to_stop_line, red_blocking))
+}
+
+fn current_map_signature(graph_lock: &Arc<RwLock<Option<MapData>>>) -> Option<(usize, usize, usize, usize)> {
+    let guard = graph_lock.read();
+    guard.as_ref().map(|map| {
+        (
+            map.graph.node_count(),
+            map.graph.edge_count(),
+            map.od_buildings.len(),
+            map.tram_data.graph.node_count(),
+        )
+    })
 }
 
 // ── Command handler ────────────────────────────────────────────────────────────
@@ -495,6 +596,9 @@ fn apply_intersection_effect(
         None    => return (gap, delta_v),
     };
     let dist_to_end = edge.length_m * (1.0 - vehicle.edge_progress);
+    // Stop line is slightly before the node center.
+    const STOP_LINE_OFFSET_M: f32 = 8.0;
+    let dist_to_stop_line = (dist_to_end - STOP_LINE_OFFSET_M).max(0.05);
 
     let (tgt_node_idx, tgt_osm_id) = match map.graph.edge_endpoints(edge_idx) {
         Some((_, tgt)) => (tgt, map.graph[tgt].osm_id),
@@ -507,10 +611,15 @@ fn apply_intersection_effect(
         intersection_type,
         IntersectionType::TrafficLight | IntersectionType::PedestrianCrossing
     ) {
-        if dist_to_end <= 30.0 && !intersections.can_proceed(tgt_osm_id) {
-            // Treat the stop-line as a stationary obstacle at the node.
-            let vgap = dist_to_end.max(0.1);
-            let vdv  = vehicle.speed;
+        // Dynamic braking look-ahead: enough distance for comfortable stop.
+        // This makes red lights visible to IDM early enough on longer approaches.
+        let braking_lookahead_m = (vehicle.speed * vehicle.speed) / (2.0 * 3.5) + 15.0;
+        if dist_to_stop_line <= braking_lookahead_m.max(25.0)
+            && !intersections.can_vehicle_proceed(tgt_osm_id, vehicle.has_stopped_at_stop_sign)
+        {
+            // Virtual leader: standing at stop line.
+            let vgap = dist_to_stop_line;
+            let vdv  = vehicle.speed; // leader speed = 0
             let new_gap = vgap.min(gap);
             let new_dv  = if new_gap < gap { vdv } else { delta_v };
             return (new_gap, new_dv);
@@ -582,7 +691,7 @@ fn apply_vehicle_physics(
     accel: f32,
     real_dt_s: f32,
     map: &MapData,
-    _intersections: &IntersectionManager,
+    intersections: &IntersectionManager,
     speed_cfg: &SpeedConfig,
 ) {
     vehicle.accel = accel;
@@ -699,6 +808,23 @@ fn apply_vehicle_physics(
 
     if edge_len > 0.0 {
         vehicle.edge_progress += vehicle.speed * real_dt_s / edge_len;
+    }
+
+    // Hard red-line guard: never let a vehicle cross the stop line on red/yellow.
+    // IDM does the smooth braking; this guard prevents rare frame-step overshoot.
+    if let Some((_, tgt)) = map.graph.edge_endpoints(edge_idx) {
+        let tgt_osm_id = map.graph[tgt].osm_id;
+        let itype = &map.graph[tgt].intersection_type;
+        if matches!(itype, IntersectionType::TrafficLight | IntersectionType::PedestrianCrossing)
+            && !intersections.can_vehicle_proceed(tgt_osm_id, vehicle.has_stopped_at_stop_sign)
+        {
+            const STOP_LINE_OFFSET_M: f32 = 8.0;
+            let stop_t = (1.0 - STOP_LINE_OFFSET_M / edge_len.max(1.0)).clamp(0.0, 1.0);
+            if vehicle.edge_progress >= stop_t {
+                vehicle.edge_progress = stop_t;
+                vehicle.speed = vehicle.speed.min(0.2);
+            }
+        }
     }
 
     if vehicle.edge_progress >= 1.0 {

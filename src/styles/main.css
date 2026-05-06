@@ -119,6 +119,40 @@ html, body {
 }
 
 /* ============================================================
+   IDM debug panel - top left (below clock)
+   ============================================================ */
+#idm-debug-panel {
+  position: absolute;
+  top: 116px;
+  left: 16px;
+  min-width: 220px;
+  padding: 8px 10px;
+  background: rgba(10, 10, 30, 0.72);
+  backdrop-filter: blur(12px) saturate(1.4);
+  -webkit-backdrop-filter: blur(12px) saturate(1.4);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+#idm-debug-title {
+  font-size: 10px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: rgba(255, 255, 255, 0.55);
+  margin-bottom: 4px;
+}
+
+#idm-debug-line,
+#idm-debug-line2,
+#idm-debug-line3,
+#idm-debug-line4 {
+  font-size: 12px;
+  color: #c7d8ff;
+  line-height: 1.35;
+}
+
+/* ============================================================
    Satisfaction / Frustration bar - top right
    ============================================================ */
 #satisfaction-bar {

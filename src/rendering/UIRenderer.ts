@@ -19,6 +19,10 @@ export class UIRenderer {
   private readonly vehicleCountEl: HTMLElement;
   private readonly notificationArea: HTMLElement;
   private readonly scoreValueEl: HTMLElement;
+  private readonly idmDebugLine: HTMLElement;
+  private readonly idmDebugLine2: HTMLElement;
+  private readonly idmDebugLine3: HTMLElement;
+  private readonly idmDebugLine4: HTMLElement;
 
   // Game-over overlay elements
   private readonly gameOverOverlay: HTMLElement;
@@ -36,6 +40,10 @@ export class UIRenderer {
     this.vehicleCountEl = this.require('vehicle-count');
     this.notificationArea = this.require('notification-area');
     this.scoreValueEl = this.require('score-value');
+    this.idmDebugLine = this.require('idm-debug-line');
+    this.idmDebugLine2 = this.require('idm-debug-line2');
+    this.idmDebugLine3 = this.require('idm-debug-line3');
+    this.idmDebugLine4 = this.require('idm-debug-line4');
 
     this.gameOverOverlay = this.require('game-over-overlay');
     this.gameOverReason = this.require('game-over-reason');
@@ -85,6 +93,23 @@ export class UIRenderer {
 
   updateScore(score: number): void {
     this.scoreValueEl.textContent = Math.floor(score).toLocaleString();
+  }
+
+  updateIdmDebug(data: {
+    vehicleId: number;
+    speed: number;
+    gap: number;
+    deltaV: number;
+    distToStopLine: number;
+    redBlocking: boolean;
+  }): void {
+    this.idmDebugLine.textContent = `vehicle: ${data.vehicleId}`;
+    this.idmDebugLine2.textContent =
+      `v: ${data.speed.toFixed(1)} m/s | gap: ${data.gap.toFixed(1)} m`;
+    this.idmDebugLine3.textContent =
+      `dv: ${data.deltaV.toFixed(1)} m/s | stop: ${data.distToStopLine.toFixed(1)} m`;
+    this.idmDebugLine4.textContent = `red: ${data.redBlocking ? 'YES' : 'NO'}`;
+    this.idmDebugLine4.style.color = data.redBlocking ? '#ff6b6b' : '#7fffb0';
   }
 
   /**
