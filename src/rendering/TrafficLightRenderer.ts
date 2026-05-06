@@ -4,16 +4,18 @@ import type { PixiOverlay } from './PixiOverlay';
 import type { NodeData, EdgeData } from '../bridge/commands';
 import type { LightStateUpdate } from '../bridge/events';
 import { projectPoint } from '../map/MapLibreSetup';
+import { SIGNAL_HEAD_BACK_M, STOP_LINE_OFFSET_M } from '../constants/stopLine';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 /** Minimum zoom at which traffic lights are drawn. */
 const MIN_ZOOM = 13;
 
-/** How far along the edge (0–1) the stop line sits. */
-const STOP_LINE_T = 0.985;
-/** How far along the edge the signal head sits (just before stop line). */
-const SIGNAL_HEAD_T = 0.965;
+/** Normalized position (0=start → 1=intersection) where `offsetFromEndM` meters before the node fall. */
+function tBeforeNode(lengthM: number, offsetFromEndM: number): number {
+  const L = Math.max(lengthM, 1);
+  return Math.max(0, Math.min(1, 1 - offsetFromEndM / L));
+}
 
 /** Radius of signal housing circle at zoom 16. */
 const HOUSING_R_REF = 5;
@@ -42,6 +44,8 @@ interface Approach {
   fromLat: number; fromLng: number;
   toLat: number; toLng: number;
   lanes: number;
+  /** Edge length in meters — matches sim `edge.length_m` for consistent stop line placement. */
+  lengthM: number;
   isPedestrian: boolean;
   /** Matches Rust `JunctionLayout` clockwise inbound sort (bearing = atan2(Δlng, Δlat)). */
   armIndex: number;
@@ -53,9 +57,8 @@ interface Approach {
  * Renders traffic-light signal heads and stop lines **per road approach**.
  *
  * For each incoming edge at a TrafficLight node:
- *   • A white stop line is drawn perpendicular to the road at ~88 % along the edge.
- *   • A coloured signal head (housing + bulb) is drawn at ~82 %.
- *   • Vehicle junctions: per-arm bulbs when the backend sends `junctionArmPhases` (opposing greens).
+ *   • Stop line and signal heads use the same setbacks as the sim (`STOP_LINE_OFFSET_M`).
+ *   • Vehicle junctions: per-arm bulbs when the backend sends `junctionArmPhases` (otherwise one phase per intersection).
  *
  * Layer: `overlay.trafficLights`.
  */
@@ -117,6 +120,7 @@ export class TrafficLightRenderer {
       toLat: number;
       toLng: number;
       lanes: number;
+      lengthM: number;
       isPedestrian: boolean;
     };
 
@@ -143,6 +147,7 @@ export class TrafficLightRenderer {
         toLat: toNode.lat,
         toLng: toNode.lng,
         lanes: edge.lanes,
+        lengthM: Math.max(edge.lengthM, 1),
         isPedestrian: this.pedestrianNodeIds.has(edge.to),
       });
     }
@@ -173,6 +178,7 @@ export class TrafficLightRenderer {
           toLat: r.toLat,
           toLng: r.toLng,
           lanes: r.lanes,
+          lengthM: r.lengthM,
           isPedestrian: r.isPedestrian,
           armIndex,
         });
@@ -281,6 +287,9 @@ export class TrafficLightRenderer {
       const hw = ap.lanes * HALF_PX_REF * scale; // half-width of road
       const sideOffset = hw + SIGNAL_SIDE_MARGIN_REF * scale;
 
+      const stopT = tBeforeNode(ap.lengthM, STOP_LINE_OFFSET_M);
+      const signalT = tBeforeNode(ap.lengthM, STOP_LINE_OFFSET_M + SIGNAL_HEAD_BACK_M);
+
       if (ap.isPedestrian) {
         // ── Pedestrian crossing: zebra stripes ──────────────────────────────
         // Draw across the full road width at the node position (t=1.0)
@@ -301,16 +310,16 @@ export class TrafficLightRenderer {
         }
 
         // ── Stop line (before the zebra) ────────────────────────────────────
-        const slx = from.x + ux * len * STOP_LINE_T;
-        const sly = from.y + uy * len * STOP_LINE_T;
+        const slx = from.x + ux * len * stopT;
+        const sly = from.y + uy * len * stopT;
         staticGfx
           .moveTo(slx - rx * hw, sly - ry * hw)
           .lineTo(slx + rx * hw, sly + ry * hw)
           .stroke({ width: Math.max(1.5, 2 * scale), color: 0xffffff, alpha: 0.9 });
 
         // ── Car signal head (right side, before stop line) ──────────────────
-        const shx = from.x + ux * len * SIGNAL_HEAD_T + rx * sideOffset;
-        const shy = from.y + uy * len * SIGNAL_HEAD_T + ry * sideOffset;
+        const shx = from.x + ux * len * signalT + rx * sideOffset;
+        const shy = from.y + uy * len * signalT + ry * sideOffset;
         const carGfx = new PIXI.Graphics();
         this.drawSignalHead(carGfx, hr, br, phase);
         carGfx.x = shx; carGfx.y = shy;
@@ -333,15 +342,15 @@ export class TrafficLightRenderer {
 
       } else {
         // ── Regular traffic light ────────────────────────────────────────────
-        const slx = from.x + ux * len * STOP_LINE_T;
-        const sly = from.y + uy * len * STOP_LINE_T;
+        const slx = from.x + ux * len * stopT;
+        const sly = from.y + uy * len * stopT;
         staticGfx
           .moveTo(slx - rx * hw, sly - ry * hw)
           .lineTo(slx + rx * hw, sly + ry * hw)
           .stroke({ width: Math.max(1, 1.5 * scale), color: 0xffffff, alpha: 0.85 });
 
-        const shx = from.x + ux * len * SIGNAL_HEAD_T + rx * sideOffset;
-        const shy = from.y + uy * len * SIGNAL_HEAD_T + ry * sideOffset;
+        const shx = from.x + ux * len * signalT + rx * sideOffset;
+        const shy = from.y + uy * len * signalT + ry * sideOffset;
         const headGfx = new PIXI.Graphics();
         this.drawSignalHead(headGfx, hr, br, phase);
         headGfx.x = shx; headGfx.y = shy;

@@ -103,10 +103,16 @@ interface EdgeRenderable {
   edge: EdgeData;
 }
 
+/** Intersection cap drawn at road nodes (TL / ped nodes get a distinct tint). */
 interface JunctionCircle {
   x: number; y: number;
   w: number; color: number; alpha: number;
+  signalized: boolean;
 }
+
+/** Fill for signalized junction zones — stands out from normal asphalt grey. */
+const SIGNAL_JUNCTION_FILL = 0x5a6ea8;
+const SIGNAL_JUNCTION_ALPHA = 0.38;
 
 // ─── RoadRenderer ─────────────────────────────────────────────────────────────
 
@@ -240,9 +246,22 @@ export class RoadRenderer {
         const prev = junctionMap.get(nodeId);
         if (!prev || r.w > prev.w) {
           const px = projectPoint(this.map, node.lng, node.lat);
-          junctionMap.set(nodeId, { x: px.x, y: px.y, w: r.w, color: r.style.color, alpha: r.alpha });
+          junctionMap.set(nodeId, {
+            x: px.x,
+            y: px.y,
+            w: r.w,
+            color: r.style.color,
+            alpha: r.alpha,
+            signalized: false,
+          });
         }
       }
+    }
+    for (const [nodeId, j] of junctionMap) {
+      const n = this.nodeMap.get(nodeId);
+      j.signalized =
+        n?.intersectionType === 'traffic_light' ||
+        n?.intersectionType === 'pedestrian_crossing';
     }
 
     // ── Pass 1: road casings ───────────────────────────────────────────────
@@ -264,7 +283,14 @@ export class RoadRenderer {
 
     // ── Pass 4: junction fill circles ──────────────────────────────────────
     for (const j of junctionMap.values()) {
-      gfx.circle(j.x, j.y, j.w + 0.5).fill({ color: j.color, alpha: j.alpha });
+      if (j.signalized) {
+        gfx.circle(j.x, j.y, j.w + 1.2).fill({
+          color: SIGNAL_JUNCTION_FILL,
+          alpha: SIGNAL_JUNCTION_ALPHA,
+        });
+      } else {
+        gfx.circle(j.x, j.y, j.w + 0.5).fill({ color: j.color, alpha: j.alpha });
+      }
     }
 
     // ── Pass 5: centre dashes on two-way roads ─────────────────────────────

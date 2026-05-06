@@ -26,7 +26,11 @@ use crate::simulation::tram_sim::TramSim;
 
 const TARGET_TICK_S: f32 = 1.0 / 60.0;
 const CONGESTION_INTERVAL_S: f32 = 0.5;
-const STOP_LINE_OFFSET_M: f32 = 8.0;
+
+/// Distance along an incoming edge from the **intersection node** to the stop line / virtual leader.
+/// Larger value = stop farther **before** the junction (vehicles do not enter the crossing on red).
+const STOP_LINE_OFFSET_M: f32 = 16.0;
+
 /// Smallest admissible IDM free gap to avoid divide-by-zero and explosive braking.
 const MIN_IDM_GAP_M: f32 = 0.1;
 /// Additional spawn breathing room after bumper gap has been computed.
@@ -1129,7 +1133,6 @@ fn apply_vehicle_physics(
                 map,
             )
         {
-            const STOP_LINE_OFFSET_M: f32 = 8.0;
             let stop_t = (1.0 - STOP_LINE_OFFSET_M / edge_len.max(1.0)).clamp(0.0, 1.0);
             if vehicle.edge_progress >= stop_t {
                 vehicle.edge_progress = stop_t;
