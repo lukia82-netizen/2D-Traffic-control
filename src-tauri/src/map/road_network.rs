@@ -353,6 +353,118 @@ pub fn build_single_road_network(bbox: [f64; 4]) -> MapData {
     }
 }
 
+/// Build the default **single-intersection** sandbox map:
+/// one traffic-light-controlled crossing with one lane per approach.
+///
+/// Layout:
+///            N
+///            |
+///      W ----+---- E
+///            |
+///            S
+pub fn build_single_intersection_network(bbox: [f64; 4]) -> MapData {
+    let cx = (bbox[0] + bbox[2]) / 2.0;
+    let cy = (bbox[1] + bbox[3]) / 2.0;
+
+    // ~250 m from center to each approach node.
+    let arm_lat = 0.00225;
+    let cos_lat = (cy * std::f64::consts::PI / 180.0).cos().max(0.01);
+    let arm_lng = arm_lat / cos_lat;
+
+    let mut graph = RoadGraph::new();
+    let mut node_index_map: HashMap<u64, NodeIndex> = HashMap::new();
+
+    let center = graph.add_node(RoadNode {
+        osm_id: 100,
+        lat: cy,
+        lng: cx,
+        intersection_type: IntersectionType::TrafficLight,
+    });
+    let north = graph.add_node(RoadNode {
+        osm_id: 101,
+        lat: cy + arm_lat,
+        lng: cx,
+        intersection_type: IntersectionType::Plain,
+    });
+    let south = graph.add_node(RoadNode {
+        osm_id: 102,
+        lat: cy - arm_lat,
+        lng: cx,
+        intersection_type: IntersectionType::Plain,
+    });
+    let west = graph.add_node(RoadNode {
+        osm_id: 103,
+        lat: cy,
+        lng: cx - arm_lng,
+        intersection_type: IntersectionType::Plain,
+    });
+    let east = graph.add_node(RoadNode {
+        osm_id: 104,
+        lat: cy,
+        lng: cx + arm_lng,
+        intersection_type: IntersectionType::Plain,
+    });
+
+    node_index_map.insert(100, center);
+    node_index_map.insert(101, north);
+    node_index_map.insert(102, south);
+    node_index_map.insert(103, west);
+    node_index_map.insert(104, east);
+
+    let make_edge = |len: f32| RoadEdge {
+        osm_id: 0,
+        lanes: 1,
+        max_speed: 11.11, // 40 km/h
+        oneway: true,
+        infra_type: InfraType::Normal,
+        layer: 0,
+        length_m: len,
+        lane_directions: vec![LaneDirection::Straight],
+        decision_points: [len * 0.25, len * 0.5, len * 0.75],
+        road_type: "secondary".to_string(),
+        has_tram_track: false,
+    };
+    let add_two_way = |graph: &mut RoadGraph, a: NodeIndex, b: NodeIndex| {
+        let len = {
+            let na = &graph[a];
+            let nb = &graph[b];
+            haversine_distance_m(na.lat, na.lng, nb.lat, nb.lng)
+        };
+        graph.add_edge(a, b, make_edge(len));
+        graph.add_edge(b, a, make_edge(len));
+    };
+
+    add_two_way(&mut graph, north, center);
+    add_two_way(&mut graph, south, center);
+    add_two_way(&mut graph, west, center);
+    add_two_way(&mut graph, east, center);
+
+    let bbox = compute_bbox(&graph);
+    let spawn_points = vec![north, south, west, east];
+    let boundary_nodes = spawn_points.clone();
+
+    log::info!("Built SINGLE-INTERSECTION sandbox: 5 nodes, 8 directed edges");
+
+    let tram_data = TramData {
+        graph: crate::map::tram_network::TramGraph::new(),
+        node_index_map: HashMap::new(),
+        stops: Vec::new(),
+        lines: Vec::new(),
+    };
+
+    MapData {
+        graph,
+        node_index_map,
+        bbox,
+        spawn_points,
+        boundary_nodes,
+        od_buildings: Vec::new(),
+        restrictions: Vec::new(),
+        tram_data,
+        is_sandbox: true,
+    }
+}
+
 // ── Real OSM network ─────────────────────────────────────────────────────────
 
 pub fn build_road_network(osm_data: OsmData) -> MapData {

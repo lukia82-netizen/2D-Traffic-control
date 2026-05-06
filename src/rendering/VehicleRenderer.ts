@@ -45,6 +45,30 @@ const VEHICLE_DIMS: Record<number, { w: number; h: number }> = {
   4: { w: 7,  h: 52 }, // Tram  – 14 px wide (58 %) – was 8×56
 };
 
+/**
+ * Target vehicle width as a fraction of one lane width (all zoom levels).
+ * Keeping this ratio stable makes cars visually fit lanes regardless of zoom.
+ */
+const VEHICLE_WIDTH_FILL: Record<number, number> = {
+  0: 0.76, // car
+  1: 0.84, // van
+  2: 0.90, // bus
+  3: 0.94, // truck
+  4: 0.90, // tram
+};
+
+/**
+ * Vehicle length as a multiple of rendered width.
+ * Fixed per type so zoom changes do not stretch vehicles unnaturally.
+ */
+const VEHICLE_LENGTH_FACTOR: Record<number, number> = {
+  0: 1.9, // car
+  1: 2.2, // van
+  2: 2.8, // bus
+  3: 3.2, // truck
+  4: 4.2, // tram
+};
+
 /** Frustration thresholds for visual bubbles. */
 const FRUSTRATION_CALM     = 40;
 const FRUSTRATION_ANNOYED  = 65;
@@ -128,13 +152,13 @@ export class VehicleRenderer {
   private readonly map: maplibregl.Map;
   private readonly camera: CameraManager;
 
-  // ── Sprite mode ─────────────────────────────────────────────────────────────
-  /** Pre-rendered textures per vehicle type */
-  private readonly textures: Map<number, PIXI.Texture> = new Map();
-  /** Pooled inactive sprites per vehicle type */
-  private readonly spritePools: Map<number, PIXI.Sprite[]> = new Map();
-  /** Currently active sprites keyed by vehicle id */
-  private readonly activeSprites: Map<number, PIXI.Sprite> = new Map();
+  // ── Rectangle mode (no sprites) ────────────────────────────────────────────
+  /** Pooled inactive rectangle graphics per vehicle type */
+  private readonly rectPools: Map<number, PIXI.Graphics[]> = new Map();
+  /** Currently active rectangle graphics keyed by vehicle id */
+  private readonly activeRects: Map<number, PIXI.Graphics> = new Map();
+  /** Type cache so returned rectangles go back to correct pool. */
+  private readonly activeRectTypes: Map<number, number> = new Map();
 
   // ── Dot mode ────────────────────────────────────────────────────────────────
   /** Single Graphics object reused every frame to batch-draw all dots */
@@ -202,27 +226,9 @@ export class VehicleRenderer {
   // ─── Initialisation ────────────────────────────────────────────────────────
 
   async init(): Promise<void> {
-    // Build sprite textures for each vehicle type (small RenderTextures)
+    // Init rectangle pools for each vehicle type
     for (const typeId of VEHICLE_TYPES) {
-      const dims = VEHICLE_DIMS[typeId] ?? VEHICLE_DIMS[0];
-      const color = VEHICLE_COLORS[typeId] ?? 0xffffff;
-
-      const gfx = new PIXI.Graphics();
-      // Rounded rect body
-      gfx.roundRect(0, 0, dims.w, dims.h, 2).fill({ color, alpha: 1 });
-      // Dark outline for contrast on any background
-      gfx.roundRect(0, 0, dims.w, dims.h, 2)
-        .stroke({ color: 0x000000, alpha: 0.5, width: 1 });
-      // Windshield highlight (top 25% of body)
-      gfx.roundRect(1, 1, dims.w - 2, dims.h * 0.25, 1)
-        .fill({ color: 0xffffff, alpha: 0.25 });
-
-      const rt = PIXI.RenderTexture.create({ width: dims.w, height: dims.h });
-      this.overlay.app.renderer.render({ container: gfx, target: rt });
-      gfx.destroy();
-
-      this.textures.set(typeId, rt);
-      this.spritePools.set(typeId, []);
+      this.rectPools.set(typeId, []);
     }
 
     // Dot graphics object lives in groundVehicles layer, below sprites
@@ -245,7 +251,7 @@ export class VehicleRenderer {
 
     if (mode === 'dot') {
       this.renderDots(vehicles, dotRadius);
-      this.hideAllSprites();
+      this.hideAllRects();
     } else {
       this.clearDots();
       this.renderSprites(vehicles, infraMap, spriteScale);
@@ -354,9 +360,10 @@ export class VehicleRenderer {
   private renderSprites(
     vehicles: Map<number, VehicleState>,
     infraMap: Map<number, string>,
-    spriteScale: number,
+    _spriteScale: number,
   ): void {
     const bounds = this.map.getBounds();
+    const laneWidthPx = this.camera.getLaneOffset() * 2;
     const renderedIds = new Set<number>();
 
     for (const [id, v] of vehicles) {
@@ -372,23 +379,26 @@ export class VehicleRenderer {
 
       const typeId = v.vehicleType < VEHICLE_TYPES.length ? v.vehicleType : 0;
       const dims = VEHICLE_DIMS[typeId] ?? VEHICLE_DIMS[0];
+      const widthFill = VEHICLE_WIDTH_FILL[typeId] ?? VEHICLE_WIDTH_FILL[0];
+      const lengthFactor = VEHICLE_LENGTH_FACTOR[typeId] ?? VEHICLE_LENGTH_FACTOR[0];
       const infraType = infraMap.get(id) ?? 'normal';
       const isTunnel = infraType === 'tunnel';
       const isBridge = infraType === 'bridge';
 
       const px = this.map.project([smooth.lng, smooth.lat]);
 
-      // Acquire or create sprite
-      let sprite = this.activeSprites.get(id);
-      if (!sprite) {
-        sprite = this.acquireSprite(typeId);
-        this.activeSprites.set(id, sprite);
+      // Acquire or create rectangle graphic
+      let rect = this.activeRects.get(id);
+      if (!rect) {
+        rect = this.acquireRect(typeId);
+        this.activeRects.set(id, rect);
+        this.activeRectTypes.set(id, typeId);
         if (isTunnel) {
-          this.overlay.tunnelVehicles.addChild(sprite);
+          this.overlay.tunnelVehicles.addChild(rect);
         } else if (isBridge) {
-          this.overlay.bridgeVehicles.addChild(sprite);
+          this.overlay.bridgeVehicles.addChild(rect);
         } else {
-          this.overlay.groundVehicles.addChild(sprite);
+          this.overlay.groundVehicles.addChild(rect);
         }
       }
 
@@ -402,25 +412,27 @@ export class VehicleRenderer {
       const offsetX = Math.cos(angle) * laneOffset;
       const offsetY = Math.sin(angle) * laneOffset;
 
-      sprite.x = px.x + offsetX;
-      sprite.y = px.y + offsetY;
-      // Rotation: use smoothed angle so the sprite glides at OSM node crossings.
-      sprite.rotation = angle;
-      sprite.width  = dims.w * spriteScale;
-      sprite.height = dims.h * spriteScale;
-      sprite.anchor.set(0.5, 0.5);
-      sprite.alpha = isTunnel ? TUNNEL_ALPHA : 1;
-      sprite.visible = true;
+      rect.x = px.x + offsetX;
+      rect.y = px.y + offsetY;
+      // Rotation: use smoothed angle so the rectangle glides at OSM node crossings.
+      rect.rotation = angle;
+      // Width tracks lane width directly so car-to-lane proportion is stable at every zoom.
+      const targetWidth = Math.max(4, laneWidthPx * widthFill);
+      const targetHeight = targetWidth * lengthFactor;
+      rect.scale.set(targetWidth / dims.w, targetHeight / dims.h);
+      rect.alpha = isTunnel ? TUNNEL_ALPHA : 1;
+      rect.visible = true;
 
       renderedIds.add(id);
     }
 
     // Return sprites for vehicles that left viewport or were removed
-    for (const [id, sprite] of this.activeSprites) {
+    for (const [id, rect] of this.activeRects) {
       if (!renderedIds.has(id)) {
-        sprite.visible = false;
-        this.releaseSprite(id, sprite);
-        this.activeSprites.delete(id);
+        rect.visible = false;
+        this.releaseRect(id, rect);
+        this.activeRects.delete(id);
+        this.activeRectTypes.delete(id);
         this.geoSmoothed.delete(id);
         this.angleSmoothed.delete(id);
         this.vehicleGroupCache.delete(id);
@@ -429,9 +441,9 @@ export class VehicleRenderer {
     }
   }
 
-  private hideAllSprites(): void {
-    for (const sprite of this.activeSprites.values()) {
-      sprite.visible = false;
+  private hideAllRects(): void {
+    for (const rect of this.activeRects.values()) {
+      rect.visible = false;
     }
     // Don't return to pool – they'll be reused when zooming back in
   }
@@ -517,28 +529,29 @@ export class VehicleRenderer {
 
   // ─── Sprite pool ───────────────────────────────────────────────────────────
 
-  private acquireSprite(typeId: number): PIXI.Sprite {
-    const pool = this.spritePools.get(typeId);
+  private acquireRect(typeId: number): PIXI.Graphics {
+    const pool = this.rectPools.get(typeId);
     if (pool && pool.length > 0) {
-      const sprite = pool.pop()!;
-      sprite.visible = true;
-      return sprite;
+      const rect = pool.pop()!;
+      rect.visible = true;
+      return rect;
     }
-    const texture = this.textures.get(typeId) ?? PIXI.Texture.EMPTY;
-    return new PIXI.Sprite(texture);
+    const dims = VEHICLE_DIMS[typeId] ?? VEHICLE_DIMS[0];
+    const color = VEHICLE_COLORS[typeId] ?? 0xffffff;
+    const rect = new PIXI.Graphics();
+    // Pure rectangle (no sprite, no rounded corners, no windshield details).
+    rect
+      .rect(-dims.w / 2, -dims.h / 2, dims.w, dims.h)
+      .fill({ color, alpha: 1.0 });
+    return rect;
   }
 
-  private releaseSprite(vehicleId: number, sprite: PIXI.Sprite): void {
-    for (const [typeId, tex] of this.textures) {
-      if (sprite.texture === tex) {
-        sprite.parent?.removeChild(sprite);
-        const pool = this.spritePools.get(typeId);
-        if (pool) pool.push(sprite);
-        return;
-      }
-    }
-    sprite.destroy();
-    void vehicleId;
+  private releaseRect(vehicleId: number, rect: PIXI.Graphics): void {
+    rect.parent?.removeChild(rect);
+    const typeId = this.activeRectTypes.get(vehicleId) ?? 0;
+    const pool = this.rectPools.get(typeId);
+    if (pool) pool.push(rect);
+    else rect.destroy();
   }
 
   // ─── Cleanup ───────────────────────────────────────────────────────────────
@@ -546,14 +559,13 @@ export class VehicleRenderer {
   destroy(): void {
     this.dotGraphics?.destroy();
     this.bubbleGraphics?.destroy();
-    for (const sprites of this.spritePools.values()) {
-      for (const s of sprites) s.destroy();
+    for (const rects of this.rectPools.values()) {
+      for (const r of rects) r.destroy();
     }
-    for (const s of this.activeSprites.values()) s.destroy();
-    for (const t of this.textures.values()) t.destroy(true);
-    this.spritePools.clear();
-    this.activeSprites.clear();
-    this.textures.clear();
+    for (const r of this.activeRects.values()) r.destroy();
+    this.rectPools.clear();
+    this.activeRects.clear();
+    this.activeRectTypes.clear();
     this.geoSmoothed.clear();
     this.angleSmoothed.clear();
   }

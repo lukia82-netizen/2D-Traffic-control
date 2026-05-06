@@ -140,6 +140,11 @@ export async function setMaxVehicles(count: number): Promise<void> {
   return invoke<void>('set_max_vehicles', { count });
 }
 
+/** Select a vehicle for backend debug tracking (`null` clears selection). */
+export async function setDebugVehicle(vehicleId: number | null): Promise<void> {
+  return invoke<void>('set_debug_vehicle', { vehicleId });
+}
+
 /**
  * Change the traffic light control mode for an intersection.
  * mode: 'Manual' | 'SemiAuto' | 'Auto' | 'Adaptive'

@@ -22,8 +22,13 @@ pub fn find_path(
     route_alpha: f32,
     ref_speed: f32,
 ) -> Option<Vec<EdgeIndex>> {
-    let to_lat = graph[to].lat;
-    let to_lng = graph[to].lng;
+    // Guard against stale NodeIndex values (e.g. when map data changes while
+    // a simulation thread is still running). Returning `None` skips this spawn
+    // instead of panicking the whole sim loop.
+    let _ = graph.node_weight(from)?;
+    let to_node = graph.node_weight(to)?;
+    let to_lat = to_node.lat;
+    let to_lng = to_node.lng;
 
     let result = astar(
         graph,
@@ -37,9 +42,12 @@ pub fn find_path(
         },
         |node_idx| {
             // Admissible heuristic: minimum travel time at 130 km/h (~36 m/s)
-            let n = &graph[node_idx];
-            let dist = haversine_distance_m(n.lat, n.lng, to_lat, to_lng);
-            dist / 36.0
+            if let Some(n) = graph.node_weight(node_idx) {
+                let dist = haversine_distance_m(n.lat, n.lng, to_lat, to_lng);
+                dist / 36.0
+            } else {
+                0.0
+            }
         },
     );
 

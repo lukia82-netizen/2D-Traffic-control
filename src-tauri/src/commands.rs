@@ -3,9 +3,8 @@ use tauri::ipc::Channel;
 use serde::{Deserialize, Serialize};
 
 use crate::state::{AppState, SimCommand, SimControl, LightControlMode};
-use crate::map::osm_loader::fetch_osm_data;
 use crate::map::road_network::{
-    build_road_network, build_demo_road_network, build_single_road_network, MapData, IntersectionType, InfraType,
+    build_single_intersection_network, MapData, IntersectionType, InfraType,
     LaneDirection, RestrictionKind,
 };
 use crate::simulation::sim_loop::run_simulation;
@@ -100,80 +99,15 @@ pub async fn load_map(
 ) -> Result<MapDataResponse, String> {
     log::info!("load_map called with bbox: west={}, south={}, east={}, north={}", bbox.west, bbox.south, bbox.east, bbox.north);
 
-    let map_data = match fetch_osm_data([bbox.west, bbox.south, bbox.east, bbox.north]).await {
-        Ok(osm_data) => {
-            log::info!("OSM data fetched, building road network");
-            build_road_network(osm_data)
-        }
-        Err(e) => {
-            log::warn!("Overpass API unavailable ({}) , using demo road network", e);
-            build_demo_road_network()
-        }
-    };
+    // Temporary default for physics tuning:
+    // always start from a deterministic minimal map (one junction, one signal set).
+    // This keeps traffic behaviour reproducible while core vehicle logic is tuned.
+    let map_data = build_single_intersection_network([bbox.west, bbox.south, bbox.east, bbox.north]);
 
     let response = build_map_response(&map_data);
     let mut guard = state.road_graph.write();
     *guard = Some(map_data);
     Ok(response)
-}
-
-fn build_map_response(map_data: &MapData) -> MapDataResponse {
-    use petgraph::visit::EdgeRef;
-    use crate::map::road_network::IntersectionType;
-
-    let mut nodes = Vec::new();
-    for node_idx in map_data.graph.node_indices() {
-        let node = &map_data.graph[node_idx];
-        nodes.push(NodeData {
-            id: node.osm_id,
-            lat: node.lat,
-            lng: node.lng,
-            intersection_type: match node.intersection_type {
-                IntersectionType::Plain => "plain".to_string(),
-                IntersectionType::TrafficLight => "traffic_light".to_string(),
-                IntersectionType::Stop => "stop".to_string(),
-                IntersectionType::Yield => "yield".to_string(),
-            },
-        });
-    }
-
-    let mut edges = Vec::new();
-    for edge_ref in map_data.graph.edge_references() {
-        let edge = edge_ref.weight();
-        let from_node = &map_data.graph[edge_ref.source()];
-        let to_node = &map_data.graph[edge_ref.target()];
-        edges.push(EdgeData {
-            id: edge_ref.id().index() as u64,
-            from: from_node.osm_id,
-            to: to_node.osm_id,
-            lanes: edge.lanes,
-            max_speed: edge.max_speed,
-            oneway: edge.oneway,
-            infra_type: match edge.infra_type {
-                crate::map::road_network::InfraType::Normal => "normal".to_string(),
-                crate::map::road_network::InfraType::Bridge => "bridge".to_string(),
-                crate::map::road_network::InfraType::Tunnel => "tunnel".to_string(),
-            },
-            layer: edge.layer,
-            length_m: edge.length_m,
-        });
-    }
-
-    let spawn_points: Vec<[f64; 2]> = map_data
-        .spawn_points
-        .iter()
-        .map(|&idx| {
-            let node = &map_data.graph[idx];
-            [node.lat, node.lng]
-        })
-        .collect();
-
-    MapDataResponse {
-        nodes,
-        edges,
-        spawn_points,
-        bbox: map_data.bbox,
-    }
 }
 
 #[command]
@@ -289,6 +223,15 @@ pub fn set_light_durations(
     send_sim_command(&state, SimCommand::SetLightDurations { intersection_id, green_s, red_s })
 }
 
+/// Set the vehicle tracked by debug overlay (`None` clears selection).
+#[command]
+pub fn set_debug_vehicle(
+    vehicle_id: Option<u32>,
+    state: State<AppState>,
+) -> Result<(), String> {
+    send_sim_command(&state, SimCommand::SetDebugVehicle(vehicle_id))
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 fn send_sim_command(state: &State<AppState>, cmd: SimCommand) -> Result<(), String> {
@@ -339,6 +282,7 @@ fn build_map_response(map_data: &MapData) -> MapDataResponse {
         }.to_string()).collect();
 
         edges.push(EdgeData {
+            id: edge_ref.id().index() as u64,
             from: from_node.osm_id,
             to: to_node.osm_id,
             lanes: edge.lanes,

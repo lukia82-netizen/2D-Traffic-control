@@ -131,6 +131,16 @@ export interface GameOverPayload {
   timestampGame: number;
 }
 
+export interface IdmDebugPayload {
+  vehicleId: number;
+  speed: number;
+  gap: number;
+  deltaV: number;
+  distToStopLine: number;
+  redBlocking: boolean;
+  routePoints: [number, number][];
+}
+
 /**
  * Subscribe to the one-shot game_over event.
  * Returns an unsubscribe function.
@@ -139,6 +149,19 @@ export async function listenGameOver(
   cb: (data: GameOverPayload) => void,
 ): Promise<() => void> {
   const unlisten = await listen<GameOverPayload>('game_over', (event) => {
+    cb(event.payload);
+  });
+  return unlisten;
+}
+
+/**
+ * Subscribe to IDM debug snapshots for one representative vehicle.
+ * Returns an unsubscribe function.
+ */
+export async function listenIdmDebug(
+  cb: (data: IdmDebugPayload) => void,
+): Promise<() => void> {
+  const unlisten = await listen<IdmDebugPayload>('idm_debug', (event) => {
     cb(event.payload);
   });
   return unlisten;

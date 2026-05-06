@@ -42,9 +42,9 @@ export class CameraManager {
   static readonly ZOOM_DOT_MAX = 13;        // below → pure dot mode
   static readonly ZOOM_SPRITE_FULL = 14;    // above → pure sprite mode
   static readonly ZOOM_REF = 16;            // reference zoom for scale = 2.0
-  static readonly SPRITE_SCALE_MIN = 0.7;   // scale at ZOOM_SPRITE_FULL
-  static readonly SPRITE_SCALE_REF = 2.0;   // scale at ZOOM_REF (car = 12×24 px)
-  static readonly SPRITE_SCALE_MAX = 3.5;   // cap so sprites don't get enormous
+  static readonly SPRITE_SCALE_MIN = 1.0;   // scale at ZOOM_SPRITE_FULL
+  static readonly SPRITE_SCALE_REF = 2.8;   // scale at ZOOM_REF (car = ~17×34 px)
+  static readonly SPRITE_SCALE_MAX = 6.0;   // higher cap for close-in zoom readability
 
   constructor(map: maplibregl.Map) {
     this.map = map;

@@ -8,7 +8,7 @@ use tauri::ipc::Channel;
 use tauri::{AppHandle, Emitter};
 use base64::Engine;
 use serde::Serialize;
-use petgraph::graph::EdgeIndex;
+use petgraph::graph::{EdgeIndex, NodeIndex};
 
 use crate::map::road_network::{MapData, IntersectionType};
 use crate::state::SimCommand;
@@ -26,6 +26,8 @@ use crate::simulation::tram_sim::TramSim;
 
 const TARGET_TICK_S: f32 = 1.0 / 60.0;
 const CONGESTION_INTERVAL_S: f32 = 0.5;
+const STOP_LINE_OFFSET_M: f32 = 8.0;
+const MIN_IDM_GAP_M: f32 = 0.1;
 
 /// Smallest admissible IDM free gap to avoid divide-by-zero and explosive braking.
 const MIN_IDM_GAP_M: f32 = 0.1;
@@ -34,12 +36,27 @@ const SPAWN_BUFFER_M: f32 = 2.0;
 const DEFAULT_DEBUG_VEHICLE_ID: u32 = 2;
 const DEFAULT_DEBUG_LOG_INTERVAL_S: f32 = 0.5;
 
+/// Only consider cross-traffic IDM within this distance to the node (meters).
+const CROSS_TRAFFIC_MAX_DIST_M: f32 = 70.0;
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct GameOverPayload {
     reason: String,
     value: f32,
     timestamp_game: f32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IdmDebugPayload {
+    vehicle_id: u32,
+    speed: f32,
+    gap: f32,
+    delta_v: f32,
+    dist_to_stop_line: f32,
+    red_blocking: bool,
+    route_points: Vec<[f64; 2]>,
 }
 
 pub fn run_simulation(
@@ -63,39 +80,34 @@ pub fn run_simulation(
     let mut congestion_timer = 0.0f32;
     let mut high_frustration_timer = 0.0f32;
     let mut idm_debug_timer = 0.0f32;
+    let mut selected_debug_vehicle: Option<u32> = None;
 
     // ── Build subsystems from map ────────────────────────────────────────────
-    let (mut intersections, mut spawn_system, od_model, mut tram_sim) = {
+    let (mut intersections, mut spawn_system, mut od_model, mut tram_sim) = {
         let guard = graph_lock.read();
         let map   = guard.as_ref().expect("map must be loaded before starting simulation");
 
-        let intersections = IntersectionManager::from_graph(&map.graph);
-
-        // Send all initial light states so the frontend shows the correct
-        // staggered phases immediately (instead of defaulting everything to Red).
-        let initial_states = intersections.all_state_updates();
-        if !initial_states.is_empty() {
-            let _ = app_handle.emit("light_state_change", &initial_states);
-        }
-
-        let speed_config  = SpeedConfig::default();
-
-        let spawn = SpawnSystem::new(
-            map.spawn_points.clone(),
-            map.boundary_nodes.clone(),
-            speed_config,
-            map.is_sandbox,
-        );
-        let od = OdModel::new(
-            map.od_buildings.clone(),
-            &mut rand::rngs::OsRng,
-        );
-
-        // Tram simulation: use IDs starting after the car-id range to avoid collisions
-        let tram = TramSim::new(&map.tram_data, 100_000);
-
-        (intersections, spawn, od, tram)
+        (
+            IntersectionManager::from_graph(&map.graph),
+            SpawnSystem::new(
+                map.spawn_points.clone(),
+                map.boundary_nodes.clone(),
+                SpeedConfig::default(),
+                map.is_sandbox,
+            ),
+            OdModel::new(map.od_buildings.clone(), &mut rand::rngs::OsRng),
+            // Tram simulation: use IDs starting after the car-id range to avoid collisions
+            TramSim::new(&map.tram_data, 100_000),
+        )
     };
+    let mut map_signature = current_map_signature(&graph_lock);
+
+    // Send all initial light states so the frontend shows the correct
+    // staggered phases immediately (instead of defaulting everything to Red).
+    let initial_states = intersections.all_state_updates();
+    if !initial_states.is_empty() {
+        let _ = app_handle.emit("light_state_change", &initial_states);
+    }
 
     // Per-(edge, lane) sorted vehicle index buckets — rebuilt every tick.
     // Key: (EdgeIndex, lane_number), Value: Vec of indices into `vehicles` sorted by edge_progress ascending.
@@ -120,12 +132,49 @@ pub fn run_simulation(
         // ── Commands ─────────────────────────────────────────────────────────
         loop {
             match command_rx.try_recv() {
-                Ok(cmd) => handle_command(cmd, &mut clock, &mut intersections, &mut spawn_system),
+                Ok(cmd) => handle_command(
+                    cmd,
+                    &mut clock,
+                    &mut intersections,
+                    &mut spawn_system,
+                    &mut selected_debug_vehicle,
+                ),
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     log::info!("Simulation command channel closed, stopping");
                     return;
                 }
+            }
+        }
+
+        // Reload simulation-dependent caches when the map has changed.
+        // This avoids stale NodeIndex/EdgeIndex references after `load_map`.
+        let latest_signature = current_map_signature(&graph_lock);
+        if latest_signature != map_signature {
+            let guard = graph_lock.read();
+            if let Some(map) = guard.as_ref() {
+                intersections = IntersectionManager::from_graph(&map.graph);
+                let mut refreshed_spawn = SpawnSystem::new(
+                    map.spawn_points.clone(),
+                    map.boundary_nodes.clone(),
+                    SpeedConfig::default(),
+                    map.is_sandbox,
+                );
+                // Preserve user-updated runtime tuning across map reloads.
+                refreshed_spawn.speed_config = spawn_system.speed_config.clone();
+                refreshed_spawn.max_vehicles = spawn_system.max_vehicles;
+                spawn_system = refreshed_spawn;
+                od_model = OdModel::new(map.od_buildings.clone(), &mut rand::rngs::OsRng);
+                tram_sim = TramSim::new(&map.tram_data, 100_000);
+                vehicles.clear();
+                edge_lane_vehicles.clear();
+                map_signature = latest_signature;
+
+                let light_states = intersections.all_state_updates();
+                if !light_states.is_empty() {
+                    let _ = app_handle.emit("light_state_change", &light_states);
+                }
+                log::info!("Map changed during simulation; rebuilt spawn/OD/tram caches");
             }
         }
 
@@ -220,6 +269,14 @@ pub fn run_simulation(
                 });
             }
 
+            let vehicles_by_target_node: HashMap<NodeIndex, Vec<usize>> = {
+                let guard = graph_lock.read();
+                match guard.as_ref() {
+                    Some(map) => build_vehicles_by_target_node(&vehicles, map),
+                    None => HashMap::new(),
+                }
+            };
+
             // Parallel IDM acceleration computation (read-only, safe to parallelise)
             let tram_snapshot: Vec<(f64, f64, f32)> = tram_sim.trams.iter()
                 .map(|t| (t.lat, t.lng, t.speed))
@@ -236,6 +293,16 @@ pub fn run_simulation(
                                 find_leader_arc(i, v, &vehicles, &edge_lane_vehicles, map);
                             let (gap, delta_v) =
                                 apply_tram_leader_effect(v, gap, delta_v, &tram_snapshot);
+                            let (gap, delta_v) = apply_cross_traffic_leader_effect(
+                                i,
+                                v,
+                                &vehicles,
+                                &vehicles_by_target_node,
+                                map,
+                                &intersections,
+                                gap,
+                                delta_v,
+                            );
                             let desired = compute_desired_speed(v, map);
                             let (gap, delta_v) =
                                 apply_intersection_effect(v, gap, delta_v, &intersections, map);
@@ -376,6 +443,42 @@ pub fn run_simulation(
                     high_frustration_timer = 0.0;
                 }
             }
+
+            // IDM debug snapshot (~5 Hz): one representative vehicle.
+            idm_debug_timer += PHYSICS_DT;
+            if idm_debug_timer >= 0.2 {
+                idm_debug_timer = 0.0;
+                let debug_target = if let Some(sel_id) = selected_debug_vehicle {
+                    vehicles
+                        .iter()
+                        .enumerate()
+                        .find(|(_, v)| v.id == sel_id && v.route_pos < v.route.len())
+                } else {
+                    vehicles
+                        .iter()
+                        .enumerate()
+                        .find(|(_, v)| v.route_pos < v.route.len() && v.vehicle_type as u8 != 4)
+                };
+                if let Some((i, ego)) = debug_target
+                {
+                    let guard = graph_lock.read();
+                    if let Some(map) = guard.as_ref() {
+                        let (gap, delta_v) = find_leader_arc(i, ego, &vehicles, &edge_lane_vehicles, map);
+                        let (dist_to_stop_line, red_blocking) =
+                            stop_line_debug(ego, map, &intersections).unwrap_or((1000.0, false));
+                        let payload = IdmDebugPayload {
+                            vehicle_id: ego.id,
+                            speed: ego.speed,
+                            gap,
+                            delta_v,
+                            dist_to_stop_line,
+                            red_blocking,
+                            route_points: build_route_points(ego, map),
+                        };
+                        let _ = app_handle.emit("idm_debug", payload);
+                    }
+                }
+            }
         } // end while physics_accumulator >= PHYSICS_DT
 
         // ── Render: serialise once per outer loop iteration ──────────────────
@@ -407,6 +510,42 @@ pub fn run_simulation(
     }
 }
 
+fn stop_line_debug(
+    vehicle: &Vehicle,
+    map: &MapData,
+    intersections: &IntersectionManager,
+) -> Option<(f32, bool)> {
+    if vehicle.route_pos >= vehicle.route.len() {
+        return None;
+    }
+    let edge_idx = vehicle.route[vehicle.route_pos];
+    let edge = map.graph.edge_weight(edge_idx)?;
+    let (_, tgt) = map.graph.edge_endpoints(edge_idx)?;
+    let tgt_osm_id = map.graph[tgt].osm_id;
+    let itype = &map.graph[tgt].intersection_type;
+
+    if !matches!(itype, IntersectionType::TrafficLight | IntersectionType::PedestrianCrossing) {
+        return None;
+    }
+
+    let dist_to_end = edge.length_m * (1.0 - vehicle.edge_progress);
+    let dist_to_stop_line = distance_to_stop_line_from_front_bumper(vehicle, dist_to_end);
+    let red_blocking = !intersections.can_vehicle_proceed(tgt_osm_id, vehicle.has_stopped_at_stop_sign);
+    Some((dist_to_stop_line, red_blocking))
+}
+
+fn current_map_signature(graph_lock: &Arc<RwLock<Option<MapData>>>) -> Option<(usize, usize, usize, usize)> {
+    let guard = graph_lock.read();
+    guard.as_ref().map(|map| {
+        (
+            map.graph.node_count(),
+            map.graph.edge_count(),
+            map.od_buildings.len(),
+            map.tram_data.graph.node_count(),
+        )
+    })
+}
+
 // ── Command handler ────────────────────────────────────────────────────────────
 
 fn handle_command(
@@ -414,6 +553,7 @@ fn handle_command(
     clock: &mut GameClock,
     intersections: &mut IntersectionManager,
     spawn_system: &mut SpawnSystem,
+    selected_debug_vehicle: &mut Option<u32>,
 ) {
     match cmd {
         SimCommand::Pause                  => clock.pause(),
@@ -430,8 +570,26 @@ fn handle_command(
         SimCommand::SetLightDurations { intersection_id, green_s, red_s } => {
             intersections.set_durations(intersection_id, green_s, red_s);
         }
+        SimCommand::SetDebugVehicle(id) => {
+            *selected_debug_vehicle = id;
+        }
         SimCommand::Stop => {}
     }
+}
+
+fn build_route_points(vehicle: &Vehicle, map: &MapData) -> Vec<[f64; 2]> {
+    let mut points = Vec::new();
+    points.push([vehicle.lng, vehicle.lat]);
+    if vehicle.route_pos >= vehicle.route.len() {
+        return points;
+    }
+    for &edge_idx in vehicle.route.iter().skip(vehicle.route_pos) {
+        if let Some((_, tgt)) = map.graph.edge_endpoints(edge_idx) {
+            let n = &map.graph[tgt];
+            points.push([n.lng, n.lat]);
+        }
+    }
+    points
 }
 
 // ── Physics helpers ────────────────────────────────────────────────────────────
@@ -560,6 +718,8 @@ fn apply_intersection_effect(
         None    => return (gap, delta_v),
     };
     let dist_to_end = edge.length_m * (1.0 - vehicle.edge_progress);
+    // IDM must see free space from the FRONT BUMPER to the stop line.
+    let dist_to_stop_line = distance_to_stop_line_from_front_bumper(vehicle, dist_to_end);
 
     let (tgt_node_idx, tgt_osm_id) = match map.graph.edge_endpoints(edge_idx) {
         Some((_, tgt)) => (tgt, map.graph[tgt].osm_id),
@@ -572,10 +732,15 @@ fn apply_intersection_effect(
         intersection_type,
         IntersectionType::TrafficLight | IntersectionType::PedestrianCrossing
     ) {
-        if dist_to_end <= 30.0 && !intersections.can_proceed(tgt_osm_id) {
-            // Treat the stop-line as a stationary obstacle at the node.
-            let vgap = dist_to_end.max(0.1);
-            let vdv  = vehicle.speed;
+        // Dynamic braking look-ahead: enough distance for comfortable stop.
+        // This makes red lights visible to IDM early enough on longer approaches.
+        let braking_lookahead_m = (vehicle.speed * vehicle.speed) / (2.0 * 3.5) + 15.0;
+        if dist_to_stop_line <= braking_lookahead_m.max(25.0)
+            && !intersections.can_vehicle_proceed(tgt_osm_id, vehicle.has_stopped_at_stop_sign)
+        {
+            // Virtual leader: standing at stop line.
+            let vgap = dist_to_stop_line.max(MIN_IDM_GAP_M);
+            let vdv  = vehicle.speed; // leader speed = 0
             let new_gap = vgap.min(gap);
             let new_dv  = if new_gap < gap { vdv } else { delta_v };
             return (new_gap, new_dv);
@@ -588,7 +753,7 @@ fn apply_intersection_effect(
     // vehicle reaches speed < 0.3 m/s.  After stopping, the vehicle may proceed.
     if matches!(intersection_type, IntersectionType::Stop) {
         if dist_to_end <= 15.0 && !vehicle.has_stopped_at_stop_sign {
-            let vgap = dist_to_end.max(0.1);
+            let vgap = dist_to_stop_line.max(MIN_IDM_GAP_M);
             let new_gap = vgap.min(gap);
             let new_dv  = vehicle.speed;
             return (new_gap, new_dv);
@@ -601,7 +766,7 @@ fn apply_intersection_effect(
         const YIELD_SPEED: f32 = 1.39; // 5 km/h
         if dist_to_end <= 20.0 && vehicle.speed > YIELD_SPEED {
             // Treat the junction entry as a slow virtual leader.
-            let virtual_gap = dist_to_end.max(0.5);
+            let virtual_gap = dist_to_stop_line.max(0.5);
             let virtual_dv  = vehicle.speed - YIELD_SPEED;
             let new_gap = virtual_gap.min(gap);
             let new_dv  = if new_gap < gap { virtual_dv } else { delta_v };
@@ -610,6 +775,13 @@ fn apply_intersection_effect(
     }
 
     (gap, delta_v)
+}
+
+#[inline]
+fn distance_to_stop_line_from_front_bumper(vehicle: &Vehicle, dist_to_end: f32) -> f32 {
+    let dist_center_to_stop_line = (dist_to_end - STOP_LINE_OFFSET_M).max(0.0);
+    let half_length = vehicle.vehicle_type.params().length_m * 0.5;
+    (dist_center_to_stop_line - half_length).max(MIN_IDM_GAP_M)
 }
 
 /// Check nearby trams as potential IDM obstacles.
@@ -642,12 +814,181 @@ fn apply_tram_leader_effect(
     (best_gap, best_dv)
 }
 
+/// Index vehicles by the graph node at the **end** of their current edge
+/// (the intersection / lane-merge node they are driving toward).
+fn build_vehicles_by_target_node(vehicles: &[Vehicle], map: &MapData) -> HashMap<NodeIndex, Vec<usize>> {
+    let mut m: HashMap<NodeIndex, Vec<usize>> = HashMap::new();
+    for (i, v) in vehicles.iter().enumerate() {
+        if v.route_pos >= v.route.len() {
+            continue;
+        }
+        let edge = v.route[v.route_pos];
+        if let Some((_, tgt)) = map.graph.edge_endpoints(edge) {
+            m.entry(tgt).or_default().push(i);
+        }
+    }
+    m
+}
+
+#[inline]
+fn cross_traffic_intersection_type(itype: &IntersectionType) -> bool {
+    // All node types except roundabouts: traffic-light junctions need this for
+    // turn conflicts when two streams may have simultaneous green (or permissive turns).
+    !matches!(itype, IntersectionType::Roundabout)
+}
+
+/// `true` when two edges meet at `tgt` from meaningfully different directions
+/// (crossing or opposing), not parallel duplicates of the same approach corridor.
+#[inline]
+fn edges_are_conflicting_approaches(
+    map: &MapData,
+    ego_edge: EdgeIndex,
+    other_edge: EdgeIndex,
+    tgt: NodeIndex,
+) -> bool {
+    let (es, et) = match map.graph.edge_endpoints(ego_edge) {
+        Some(x) => x,
+        None => return false,
+    };
+    let (os, ot) = match map.graph.edge_endpoints(other_edge) {
+        Some(x) => x,
+        None => return false,
+    };
+    if et != tgt || ot != tgt {
+        return false;
+    }
+
+    let n_tgt = &map.graph[tgt];
+    let n_es = &map.graph[es];
+    let n_os = &map.graph[os];
+    // Unit vectors along each edge toward `tgt` (incoming directions).
+    let vx = (n_tgt.lng - n_es.lng) as f32;
+    let vy = (n_tgt.lat - n_es.lat) as f32;
+    let wx = (n_tgt.lng - n_os.lng) as f32;
+    let wy = (n_tgt.lat - n_os.lat) as f32;
+    let lv = (vx * vx + vy * vy).sqrt().max(1e-9);
+    let lw = (wx * wx + wy * wy).sqrt().max(1e-9);
+    let dot = (vx / lv) * (wx / lw) + (vy / lv) * (wy / lw);
+    // Same dual-carriageway / parallel approach lanes → dot ≈ 1 → skip.
+    dot < 0.94
+}
+
+/// Lateral / cross-street conflict (plain, yield, stop, **traffic lights**, pedestrian signals).
+///
+/// Vehicles on a **different incoming edge** that share the same target node and are
+/// closer to that node along their approach temporarily act as an IDM leader: we use our
+/// remaining arc length to the node as gap and their speed in the IDM relative-velocity term.
+///
+/// For signalised nodes, a vehicle counts only if [`IntersectionManager::can_vehicle_proceed`]
+/// is true for that approach — so queued traffic on red does not spuriously block cross traffic.
+fn apply_cross_traffic_leader_effect(
+    ego_idx: usize,
+    ego: &Vehicle,
+    vehicles: &[Vehicle],
+    by_target_node: &HashMap<NodeIndex, Vec<usize>>,
+    map: &MapData,
+    intersections: &IntersectionManager,
+    gap: f32,
+    delta_v: f32,
+) -> (f32, f32) {
+    if ego.route_pos >= ego.route.len() {
+        return (gap, delta_v);
+    }
+    let ego_edge = ego.route[ego.route_pos];
+    let ego_edge_len = match map.graph.edge_weight(ego_edge) {
+        Some(e) => e.length_m,
+        None => return (gap, delta_v),
+    };
+    let tgt_node = match map.graph.edge_endpoints(ego_edge) {
+        Some((_, tgt)) => tgt,
+        None => return (gap, delta_v),
+    };
+    if !cross_traffic_intersection_type(&map.graph[tgt_node].intersection_type) {
+        return (gap, delta_v);
+    }
+
+    let tgt_osm_id = map.graph[tgt_node].osm_id;
+    if !intersections.can_vehicle_proceed(tgt_osm_id, ego.has_stopped_at_stop_sign) {
+        return (gap, delta_v);
+    }
+
+    let d_ego = (1.0 - ego.edge_progress) * ego_edge_len;
+    if d_ego > CROSS_TRAFFIC_MAX_DIST_M {
+        return (gap, delta_v);
+    }
+
+    let Some(candidates) = by_target_node.get(&tgt_node) else {
+        return (gap, delta_v);
+    };
+
+    // Others must be at least this much nearer to the node (m) to count as priority cross traffic.
+    const PRIORITY_HEADWAY_M: f32 = 0.5;
+
+    let mut best_d_other = f32::MAX;
+    let mut best_v_other = 0.0f32;
+    let mut found = false;
+
+    for &other_idx in candidates {
+        if other_idx == ego_idx {
+            continue;
+        }
+        let other = &vehicles[other_idx];
+        if other.route_pos >= other.route.len() {
+            continue;
+        }
+        let other_edge = other.route[other.route_pos];
+        if other_edge == ego_edge {
+            continue;
+        }
+        let other_len = match map.graph.edge_weight(other_edge) {
+            Some(e) => e.length_m,
+            None => continue,
+        };
+        let other_tgt = match map.graph.edge_endpoints(other_edge) {
+            Some((_, t)) => t,
+            None => continue,
+        };
+        if other_tgt != tgt_node {
+            continue;
+        }
+        if !edges_are_conflicting_approaches(map, ego_edge, other_edge, tgt_node) {
+            continue;
+        }
+        if !intersections.can_vehicle_proceed(tgt_osm_id, other.has_stopped_at_stop_sign) {
+            continue;
+        }
+
+        let d_other = (1.0 - other.edge_progress) * other_len;
+        if d_other + PRIORITY_HEADWAY_M >= d_ego {
+            continue;
+        }
+        if !found || d_other < best_d_other {
+            found = true;
+            best_d_other = d_other;
+            best_v_other = other.speed;
+        }
+    }
+
+    if !found {
+        return (gap, delta_v);
+    }
+
+    let cross_gap = d_ego.max(0.1);
+    let cross_dv = ego.speed - best_v_other;
+
+    if cross_gap < gap {
+        (cross_gap, cross_dv)
+    } else {
+        (gap, delta_v)
+    }
+}
+
 fn apply_vehicle_physics(
     vehicle: &mut Vehicle,
     accel: f32,
     real_dt_s: f32,
     map: &MapData,
-    _intersections: &IntersectionManager,
+    intersections: &IntersectionManager,
     speed_cfg: &SpeedConfig,
 ) {
     vehicle.accel = accel;
@@ -764,6 +1105,23 @@ fn apply_vehicle_physics(
 
     if edge_len > 0.0 {
         vehicle.edge_progress += vehicle.speed * real_dt_s / edge_len;
+    }
+
+    // Hard red-line guard: never let a vehicle cross the stop line on red/yellow.
+    // IDM does the smooth braking; this guard prevents rare frame-step overshoot.
+    if let Some((_, tgt)) = map.graph.edge_endpoints(edge_idx) {
+        let tgt_osm_id = map.graph[tgt].osm_id;
+        let itype = &map.graph[tgt].intersection_type;
+        if matches!(itype, IntersectionType::TrafficLight | IntersectionType::PedestrianCrossing)
+            && !intersections.can_vehicle_proceed(tgt_osm_id, vehicle.has_stopped_at_stop_sign)
+        {
+            const STOP_LINE_OFFSET_M: f32 = 8.0;
+            let stop_t = (1.0 - STOP_LINE_OFFSET_M / edge_len.max(1.0)).clamp(0.0, 1.0);
+            if vehicle.edge_progress >= stop_t {
+                vehicle.edge_progress = stop_t;
+                vehicle.speed = vehicle.speed.min(0.2);
+            }
+        }
     }
 
     if vehicle.edge_progress >= 1.0 {
