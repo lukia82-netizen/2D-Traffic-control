@@ -43,6 +43,14 @@ const VEHICLE_DIMS: Record<number, { w: number; h: number }> = {
 const FRUSTRATION_CALM     = 40;
 const FRUSTRATION_ANNOYED  = 65;
 const FRUSTRATION_ANGRY    = 85;
+const FRUSTRATION_RAGE     = 99;
+
+/** Bubble labels per threshold */
+const BUBBLE_LABELS = ['!', '!!', '!!!', '💢'] as const;
+/** Bubble colors per tier: annoyed, angry, raging, rage-quit */
+const BUBBLE_COLORS = [0xffdd00, 0xff8800, 0xff3300, 0xff0000] as const;
+/** Bubble vertical offset above the sprite (px) */
+const BUBBLE_OFFSET_Y = 12;
 
 const TUNNEL_ALPHA = 0.25;
 const VEHICLE_TYPES = [0, 1, 2, 3, 4];
@@ -91,6 +99,10 @@ export class VehicleRenderer {
   /** Single Graphics object reused every frame to batch-draw all dots */
   private dotGraphics: PIXI.Graphics | null = null;
 
+  // ── Frustration bubbles ──────────────────────────────────────────────────────
+  /** Single Graphics object reused every frame to draw frustration bubbles */
+  private bubbleGraphics: PIXI.Graphics | null = null;
+
   // ── Lerp smoothing (geo space) ───────────────────────────────────────────────
   /** Smoothed geographic positions to eliminate flicker from IPC burst delivery */
   private readonly geoSmoothed: Map<number, { lat: number; lng: number }> = new Map();
@@ -130,6 +142,10 @@ export class VehicleRenderer {
     // Dot graphics object lives in groundVehicles layer, below sprites
     this.dotGraphics = new PIXI.Graphics();
     this.overlay.groundVehicles.addChild(this.dotGraphics);
+
+    // Bubble graphics lives in the dedicated frustration layer (above vehicles)
+    this.bubbleGraphics = new PIXI.Graphics();
+    this.overlay.frustrationLayer.addChild(this.bubbleGraphics);
   }
 
   // ─── Frame update ──────────────────────────────────────────────────────────
@@ -148,6 +164,9 @@ export class VehicleRenderer {
       this.clearDots();
       this.renderSprites(vehicles, infraMap, spriteScale);
     }
+
+    // Draw frustration bubbles regardless of vehicle render mode
+    this.renderFrustrationBubbles(vehicles);
   }
 
   // ─── Dot rendering ─────────────────────────────────────────────────────────
@@ -182,6 +201,61 @@ export class VehicleRenderer {
 
   private clearDots(): void {
     this.dotGraphics?.clear();
+  }
+
+  // ─── Frustration bubbles ───────────────────────────────────────────────────
+
+  /**
+   * Draw small indicator bubbles above frustrated vehicles.
+   * Tier system:
+   *   40–65  → yellow  "!"
+   *   65–85  → orange  "!!"
+   *   85–99  → red     "!!!"
+   *   ≥99    → red     "💢" + fast flicker
+   *
+   * Uses a single batched Graphics object so all bubbles cost ~1 draw call.
+   */
+  private renderFrustrationBubbles(vehicles: Map<number, VehicleState>): void {
+    const gfx = this.bubbleGraphics!;
+    const bounds = this.map.getBounds();
+    gfx.clear();
+
+    const now = performance.now();
+    for (const v of vehicles.values()) {
+      if (v.frustration < FRUSTRATION_CALM) continue;
+
+      const smooth = this.geoSmoothed.get(v.id) ?? { lat: v.lat, lng: v.lng };
+
+      // Frustum cull
+      if (
+        smooth.lng < bounds.getWest() || smooth.lng > bounds.getEast() ||
+        smooth.lat < bounds.getSouth() || smooth.lat > bounds.getNorth()
+      ) continue;
+
+      // Pick tier
+      let tier: number;
+      if (v.frustration >= FRUSTRATION_RAGE)   tier = 3;
+      else if (v.frustration >= FRUSTRATION_ANGRY)   tier = 2;
+      else if (v.frustration >= FRUSTRATION_ANNOYED) tier = 1;
+      else                                           tier = 0;
+
+      const color = BUBBLE_COLORS[tier];
+      const px = this.map.project([smooth.lng, smooth.lat]);
+      const cx = px.x;
+      const cy = px.y - BUBBLE_OFFSET_Y;
+
+      // Flicker for rage tier
+      if (tier === 3 && Math.floor(now / 300) % 2 === 0) continue;
+
+      // Pulsing scale (simple sin wave per tier)
+      const pulse = 1 + 0.15 * Math.sin(now / (300 - tier * 60));
+      const radius = (3 + tier) * pulse;
+
+      // Draw circle indicator
+      gfx.circle(cx, cy, radius).fill({ color, alpha: 0.9 });
+      // Tiny dot outline for visibility on light backgrounds
+      gfx.circle(cx, cy, radius).stroke({ color: 0x000000, alpha: 0.3, width: 0.5 });
+    }
   }
 
   // ─── Sprite rendering ──────────────────────────────────────────────────────
@@ -317,6 +391,7 @@ export class VehicleRenderer {
 
   destroy(): void {
     this.dotGraphics?.destroy();
+    this.bubbleGraphics?.destroy();
     for (const sprites of this.spritePools.values()) {
       for (const s of sprites) s.destroy();
     }

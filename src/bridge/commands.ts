@@ -58,11 +58,10 @@ export interface TurnRestriction {
 }
 
 export interface TramStop {
-  osmId: number;
+  id: number;
   lat: number;
   lng: number;
-  name: string | null;
-  stopDwellS: number;
+  dwellS: number;
 }
 
 export interface TramEdge {
@@ -81,6 +80,7 @@ export interface MapData {
   bbox: [number, number, number, number];
   buildings: BuildingData[];
   restrictions: TurnRestriction[];
+  tramStops: TramStop[];
 }
 
 // ─── Typed invoke wrappers ────────────────────────────────────────────────────
@@ -206,4 +206,16 @@ export interface SpeedConfig {
  */
 export async function setSpeedConfig(config: SpeedConfig): Promise<void> {
   return invoke<void>('set_speed_config', { config });
+}
+
+/**
+ * Set the green and red phase durations for a traffic light.
+ * Effective in SemiAuto and Auto modes; has no effect in Manual / Adaptive.
+ */
+export async function setLightDurations(
+  intersectionId: number,
+  greenS: number,
+  redS: number,
+): Promise<void> {
+  return invoke<void>('set_light_durations', { intersectionId, greenS, redS });
 }

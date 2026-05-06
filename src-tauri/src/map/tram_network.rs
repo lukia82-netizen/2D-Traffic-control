@@ -82,11 +82,10 @@ pub fn build_tram_network(osm_data: &OsmData, road_graph: &RoadGraph) -> TramDat
         .map(|idx| road_graph[idx].osm_id)
         .collect();
 
-    // Collect tram ways (railway=tram)
+    // Collect tram ways (railway=tram) – stored in the dedicated tram_ways field
     let tram_ways: Vec<&crate::map::osm_loader::OsmWay> = osm_data
-        .ways
+        .tram_ways
         .iter()
-        .filter(|w| w.tags.get("railway").map(String::as_str) == Some("tram"))
         .collect();
 
     // Gather all node ids referenced by tram ways + explicit stops

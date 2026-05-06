@@ -12,8 +12,9 @@ import * as PIXI from 'pixi.js';
  *   5 – tunnelVehicles   Vehicles inside tunnels (α 0.25)
  *   6 – groundVehicles   Surface-level vehicles
  *   7 – bridgeVehicles   Vehicles on bridges
- *   8 – trafficLights    Traffic light state sprites
- *   9 – congestionLayer  Congestion heat overlay
+ *   8 – frustrationLayer Frustration bubble indicators above vehicles
+ *   9 – trafficLights    Traffic light state sprites
+ *  10 – congestionLayer  Congestion heat overlay
  */
 export class PixiOverlay {
   app!: PIXI.Application;
@@ -26,6 +27,7 @@ export class PixiOverlay {
   tunnelVehicles!: PIXI.Container;
   groundVehicles!: PIXI.Container;
   bridgeVehicles!: PIXI.Container;
+  frustrationLayer!: PIXI.Container;
   trafficLights!: PIXI.Container;
   congestionLayer!: PIXI.Container;
 
@@ -62,6 +64,7 @@ export class PixiOverlay {
     this.tunnelVehicles  = new PIXI.Container();
     this.groundVehicles  = new PIXI.Container();
     this.bridgeVehicles  = new PIXI.Container();
+    this.frustrationLayer = new PIXI.Container();
     this.trafficLights   = new PIXI.Container();
     this.congestionLayer = new PIXI.Container();
 
@@ -73,6 +76,7 @@ export class PixiOverlay {
     this.app.stage.addChild(this.tunnelVehicles);
     this.app.stage.addChild(this.groundVehicles);
     this.app.stage.addChild(this.bridgeVehicles);
+    this.app.stage.addChild(this.frustrationLayer);
     this.app.stage.addChild(this.trafficLights);
     this.app.stage.addChild(this.congestionLayer);
 

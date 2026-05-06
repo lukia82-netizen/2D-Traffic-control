@@ -16,10 +16,10 @@ todos:
     status: completed
   - id: phase5-lights-control
     content: "Faza 5: Tryby sterowania światłami (ręczny, półauto, auto, adaptacyjny) - Tauri commands + UI"
-    status: pending
+    status: completed
   - id: phase6-gamemode
     content: "Faza 6: System zadowolenia/frustracji, scoring, alerty korków, kompletny HUD"
-    status: pending
+    status: completed
 isProject: false
 ---
 

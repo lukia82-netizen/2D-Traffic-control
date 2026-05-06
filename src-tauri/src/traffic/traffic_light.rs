@@ -28,6 +28,14 @@ pub struct LightStateUpdate {
     pub intersection_id: u64,
     pub phase: u8,
     pub time_remaining: f32,
+    /// Number of vehicles queued (relevant for Adaptive mode display).
+    pub queue_count: u32,
+    /// Current control mode as a string: "manual" | "semi_auto" | "auto" | "adaptive"
+    pub mode: String,
+    /// Configured green duration in seconds
+    pub green_duration: f32,
+    /// Configured red duration in seconds
+    pub red_duration: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -151,10 +159,26 @@ impl TrafficLight {
     }
 
     pub fn to_state_update(&self) -> LightStateUpdate {
+        let mode_str = match self.mode {
+            LightControlMode::Manual   => "manual",
+            LightControlMode::SemiAuto => "semi_auto",
+            LightControlMode::Auto     => "auto",
+            LightControlMode::Adaptive => "adaptive",
+        };
         LightStateUpdate {
             intersection_id: self.intersection_id,
             phase: self.current_phase.to_u8(),
             time_remaining: self.time_remaining(),
+            queue_count: self.queue_count,
+            mode: mode_str.to_string(),
+            green_duration: self.green_duration,
+            red_duration: self.red_duration,
         }
+    }
+
+    /// Set fixed phase durations (used by SemiAuto mode).
+    pub fn set_durations(&mut self, green_s: f32, red_s: f32) {
+        self.green_duration = green_s.max(5.0);
+        self.red_duration = red_s.max(5.0);
     }
 }

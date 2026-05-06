@@ -242,46 +242,53 @@ pub fn load_osm_pbf(path: &std::path::Path) -> Result<OsmData, String> {
                 for (k, v) in n.tags() {
                     tags.insert(k.to_string(), v.to_string());
                 }
-                osm_data.nodes.insert(
-                    n.id() as u64,
-                    OsmNode {
-                        id: n.id() as u64,
-                        lat: n.lat(),
-                        lng: n.lon(),
-                        tags,
-                    },
-                );
+                let node = OsmNode {
+                    id: n.id() as u64,
+                    lat: n.lat(),
+                    lng: n.lon(),
+                    tags,
+                };
+                if node.tags.get("railway").map(|s| s.as_str()) == Some("tram_stop") {
+                    osm_data.tram_stops.push(node.clone());
+                }
+                osm_data.nodes.insert(node.id, node);
             }
             Element::DenseNode(n) => {
                 let mut tags = HashMap::new();
                 for (k, v) in n.tags() {
                     tags.insert(k.to_string(), v.to_string());
                 }
-                osm_data.nodes.insert(
-                    n.id() as u64,
-                    OsmNode {
-                        id: n.id() as u64,
-                        lat: n.lat(),
-                        lng: n.lon(),
-                        tags,
-                    },
-                );
+                let node = OsmNode {
+                    id: n.id() as u64,
+                    lat: n.lat(),
+                    lng: n.lon(),
+                    tags,
+                };
+                if node.tags.get("railway").map(|s| s.as_str()) == Some("tram_stop") {
+                    osm_data.tram_stops.push(node.clone());
+                }
+                osm_data.nodes.insert(node.id, node);
             }
             Element::Way(w) => {
-                let highway_tag = w.tags().find(|(k, _)| *k == "highway");
-                if highway_tag.is_some() {
-                    let mut tags = HashMap::new();
-                    for (k, v) in w.tags() {
-                        tags.insert(k.to_string(), v.to_string());
-                    }
-                    let node_refs: Vec<u64> = w.refs().map(|r| r as u64).collect();
-                    if !node_refs.is_empty() {
-                        osm_data.ways.push(OsmWay {
-                            id: w.id() as u64,
-                            node_refs,
-                            tags,
-                        });
-                    }
+                let mut tags = HashMap::new();
+                for (k, v) in w.tags() {
+                    tags.insert(k.to_string(), v.to_string());
+                }
+                let node_refs: Vec<u64> = w.refs().map(|r| r as u64).collect();
+                if node_refs.is_empty() {
+                    return;
+                }
+                let way = OsmWay {
+                    id: w.id() as u64,
+                    node_refs,
+                    tags,
+                };
+                if way.tags.get("railway").map(|s| s.as_str()) == Some("tram") {
+                    // Dedicated tram-track way
+                    osm_data.tram_ways.push(way);
+                } else if way.tags.contains_key("highway") || way.tags.contains_key("building") {
+                    // Road way or building footprint
+                    osm_data.ways.push(way);
                 }
             }
             Element::Relation(_) => {}
@@ -289,9 +296,11 @@ pub fn load_osm_pbf(path: &std::path::Path) -> Result<OsmData, String> {
         .map_err(|e| format!("Failed to read PBF elements: {}", e))?;
 
     log::info!(
-        "Loaded PBF: {} nodes, {} ways",
+        "Loaded PBF: {} nodes, {} ways, {} tram ways, {} tram stops",
         osm_data.nodes.len(),
-        osm_data.ways.len()
+        osm_data.ways.len(),
+        osm_data.tram_ways.len(),
+        osm_data.tram_stops.len(),
     );
 
     Ok(osm_data)

@@ -1,4 +1,4 @@
-use tauri::{command, State};
+use tauri::{command, State, AppHandle};
 use tauri::ipc::Channel;
 use serde::{Deserialize, Serialize};
 
@@ -9,9 +9,7 @@ use crate::map::road_network::{
     LaneDirection, RestrictionKind,
 };
 use crate::simulation::sim_loop::run_simulation;
-use crate::simulation::congestion::CongestionData;
 use crate::simulation::speed_config::SpeedConfig;
-use crate::traffic::traffic_light::LightStateUpdate;
 
 // ── Response DTOs ─────────────────────────────────────────────────────────────
 
@@ -59,6 +57,16 @@ pub struct TurnRestrictionData {
     pub kind: String,
 }
 
+/// Tram stop DTO – sent once at startup as part of the map response.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TramStopData {
+    pub id: u64,
+    pub lat: f64,
+    pub lng: f64,
+    pub dwell_s: f32,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MapDataResponse {
@@ -68,6 +76,7 @@ pub struct MapDataResponse {
     pub bbox: [f64; 4],
     pub buildings: Vec<BuildingData>,
     pub restrictions: Vec<TurnRestrictionData>,
+    pub tram_stops: Vec<TramStopData>,
 }
 
 // ── Commands ──────────────────────────────────────────────────────────────────
@@ -99,6 +108,7 @@ pub async fn load_map(
 #[command]
 pub fn start_simulation(
     on_vehicle_frame: Channel<String>,
+    app: AppHandle,
     state: State<AppState>,
 ) -> Result<(), String> {
     log::info!("start_simulation called");
@@ -112,11 +122,10 @@ pub fn start_simulation(
     }
 
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<SimCommand>();
-    let (congestion_tx, _congestion_rx) = std::sync::mpsc::channel::<Vec<CongestionData>>();
-    let (light_tx, _light_rx) = std::sync::mpsc::channel::<Vec<LightStateUpdate>>();
 
     let graph_arc_for_thread = graph_arc.clone();
     let channel = on_vehicle_frame;
+    let app_handle = app;
 
     std::thread::Builder::new()
         .name("sim_loop".to_string())
@@ -125,8 +134,7 @@ pub fn start_simulation(
                 graph_arc_for_thread,
                 cmd_rx,
                 channel,
-                congestion_tx,
-                light_tx,
+                app_handle,
             );
         })
         .map_err(|e| format!("Failed to spawn simulation thread: {}", e))?;
@@ -189,6 +197,18 @@ pub fn set_speed_config(
     state: State<AppState>,
 ) -> Result<(), String> {
     send_sim_command(&state, SimCommand::SetSpeedConfig(config))
+}
+
+/// Set the green and red phase durations for a traffic light.
+/// Effective in SemiAuto and Auto modes; ignored in Manual and Adaptive.
+#[command]
+pub fn set_light_durations(
+    intersection_id: u64,
+    green_s: f32,
+    red_s: f32,
+    state: State<AppState>,
+) -> Result<(), String> {
+    send_sim_command(&state, SimCommand::SetLightDurations { intersection_id, green_s, red_s })
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -296,5 +316,33 @@ fn build_map_response(map_data: &MapData) -> MapDataResponse {
         })
         .collect();
 
-    MapDataResponse { nodes, edges, spawn_points, bbox: map_data.bbox, buildings, restrictions }
+    // ── Tram stops ──────────────────────────────────────────────────────────
+    let tram_stops: Vec<TramStopData> = map_data
+        .tram_data
+        .graph
+        .node_indices()
+        .filter_map(|idx| {
+            let node = &map_data.tram_data.graph[idx];
+            if node.is_stop {
+                Some(TramStopData {
+                    id: node.id,
+                    lat: node.lat,
+                    lng: node.lng,
+                    dwell_s: node.stop_dwell_s,
+                })
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    MapDataResponse {
+        nodes,
+        edges,
+        spawn_points,
+        bbox: map_data.bbox,
+        buildings,
+        restrictions,
+        tram_stops,
+    }
 }

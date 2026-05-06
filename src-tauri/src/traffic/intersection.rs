@@ -108,6 +108,12 @@ impl IntersectionManager {
         }
     }
 
+    pub fn set_durations(&mut self, intersection_id: u64, green_s: f32, red_s: f32) {
+        if let Some(tl) = self.traffic_lights.get_mut(&intersection_id) {
+            tl.set_durations(green_s, red_s);
+        }
+    }
+
     /// Update queue count for adaptive mode (called from congestion monitor).
     pub fn update_queue(&mut self, intersection_id: u64, count: u32) {
         if let Some(tl) = self.traffic_lights.get_mut(&intersection_id) {

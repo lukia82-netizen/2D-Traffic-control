@@ -1,10 +1,12 @@
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 use parking_lot::RwLock;
 use std::sync::Arc;
 use rayon::prelude::*;
 use tauri::ipc::Channel;
+use tauri::{AppHandle, Emitter};
 use base64::Engine;
+use serde::Serialize;
 
 use crate::map::road_network::{MapData, IntersectionType};
 use crate::state::SimCommand;
@@ -16,22 +18,28 @@ use crate::simulation::idm::idm_acceleration;
 use crate::simulation::spatial_grid::SpatialGrid;
 use crate::simulation::spawn::SpawnSystem;
 use crate::simulation::lane_change::{decide_lane_change, compute_vehicle_target_lane};
-use crate::simulation::congestion::{compute_congestion, CongestionData};
+use crate::simulation::congestion::compute_congestion;
 use crate::simulation::od_model::OdModel;
 use crate::simulation::speed_config::SpeedConfig;
 use crate::simulation::tram_sim::TramSim;
-use crate::traffic::traffic_light::LightStateUpdate;
 
 const TARGET_TICK_S: f32 = 1.0 / 60.0;
 const GRID_CELL_DEG: f64 = 0.00045;
 const CONGESTION_INTERVAL_S: f32 = 0.5;
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GameOverPayload {
+    reason: String,
+    value: f32,
+    timestamp_game: f32,
+}
+
 pub fn run_simulation(
     graph_lock: Arc<RwLock<Option<MapData>>>,
     command_rx: Receiver<SimCommand>,
     vehicle_channel: Channel<String>,
-    congestion_tx: Sender<Vec<CongestionData>>,
-    light_state_tx: Sender<Vec<LightStateUpdate>>,
+    app_handle: AppHandle,
 ) {
     let mut clock = GameClock::new();
     let mut vehicles: Vec<Vehicle> = Vec::with_capacity(512);
@@ -96,7 +104,7 @@ pub fn run_simulation(
         // ── Traffic lights ────────────────────────────────────────────────────
         let light_updates = intersections.update(real_dt_s);
         if !light_updates.is_empty() {
-            let _ = light_state_tx.send(light_updates);
+            let _ = app_handle.emit("light_state_change", &light_updates);
         }
 
         // ── Tram simulation ───────────────────────────────────────────────────
@@ -241,6 +249,11 @@ pub fn run_simulation(
                         "GAME OVER: avg frustration {:.1} held for {:.0}s",
                         avg_frustration, high_frustration_timer
                     );
+                    let _ = app_handle.emit("game_over", GameOverPayload {
+                        reason: "avg_frustration".to_string(),
+                        value: avg_frustration,
+                        timestamp_game: clock.game_time_s as f32,
+                    });
                     high_frustration_timer = 0.0;
                 }
             } else if mass_rage_fraction >= cfg.mass_rage_fraction {
@@ -248,6 +261,11 @@ pub fn run_simulation(
                     "GAME OVER: mass rage – {:.0}% vehicles at 100 frustration",
                     mass_rage_fraction * 100.0
                 );
+                let _ = app_handle.emit("game_over", GameOverPayload {
+                    reason: "mass_rage".to_string(),
+                    value: mass_rage_fraction * 100.0,
+                    timestamp_game: clock.game_time_s as f32,
+                });
             } else {
                 high_frustration_timer = 0.0;
             }
@@ -267,7 +285,7 @@ pub fn run_simulation(
             let guard = graph_lock.read();
             if let Some(map) = guard.as_ref() {
                 let cdata = compute_congestion(&map.graph, &vehicles);
-                let _ = congestion_tx.send(cdata);
+                let _ = app_handle.emit("congestion_update", &cdata);
             }
         }
 
@@ -298,6 +316,9 @@ fn handle_command(
         }
         SimCommand::SetLightPhase { intersection_id, phase } => {
             intersections.set_phase(intersection_id, phase);
+        }
+        SimCommand::SetLightDurations { intersection_id, green_s, red_s } => {
+            intersections.set_durations(intersection_id, green_s, red_s);
         }
         SimCommand::Stop => {}
     }

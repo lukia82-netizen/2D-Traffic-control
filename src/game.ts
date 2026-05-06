@@ -11,8 +11,9 @@ import {
   parseVehicleFrame,
   listenCongestionUpdates,
   listenLightStateChanges,
+  listenGameOver,
 } from './bridge/events';
-import type { VehicleState, CongestionData, LightStateUpdate } from './bridge/events';
+import type { VehicleState, CongestionData, LightStateUpdate, GameOverPayload } from './bridge/events';
 import { PixiOverlay } from './rendering/PixiOverlay';
 import { CameraManager } from './rendering/CameraManager';
 import { RoadRenderer } from './rendering/RoadRenderer';
@@ -82,7 +83,7 @@ function buildDemoMapData(): MapData {
     spawnPoints.push([nodes[nid(r, COLS - 1)].lat, nodes[nid(r, COLS - 1)].lng]);
   }
 
-  return { nodes, edges, spawnPoints, bbox: DEFAULT_BBOX, buildings: [], restrictions: [] };
+  return { nodes, edges, spawnPoints, bbox: DEFAULT_BBOX, buildings: [], restrictions: [], tramStops: [] };
 }
 
 // Simulation starts at 06:00 (game seconds since midnight)
@@ -125,6 +126,11 @@ export class Game {
   // Unlisten callbacks for Tauri events
   private unlistenCongestion: (() => void) | null = null;
   private unlistenLights: (() => void) | null = null;
+  private unlistenGameOver: (() => void) | null = null;
+
+  // Scoring
+  private score = 0;
+  private gameOver = false;
 
   // Whether the Rust backend is available (desktop Tauri vs browser dev mode)
   private tauriAvailable = false;
@@ -222,6 +228,9 @@ export class Game {
     this.unlistenLights = await listenLightStateChanges((data) =>
       this.onLightStateChange(data),
     );
+    this.unlistenGameOver = await listenGameOver((data) =>
+      this.onGameOver(data),
+    );
   }
 
   // ─── Simulation start ──────────────────────────────────────────────────────
@@ -265,13 +274,30 @@ export class Game {
     this.trafficLightRenderer.updateStates(data);
   }
 
+  private onGameOver(data: GameOverPayload): void {
+    this.gameOver = true;
+    // Compute average frustration from current vehicles
+    let avgFrustration = 0;
+    if (this.vehicles.size > 0) {
+      let total = 0;
+      for (const v of this.vehicles.values()) total += v.frustration;
+      avgFrustration = total / this.vehicles.size;
+    }
+    this.uiRenderer.showGameOver(
+      data.reason,
+      data.reason === 'avg_frustration' ? avgFrustration : data.value,
+      this.score,
+      data.timestampGame,
+    );
+  }
+
   // ─── Main game loop ────────────────────────────────────────────────────────
 
   private gameLoop(ticker: PIXI.Ticker): void {
     // Animate oneway arrows regardless of pause state
     this.infraRenderer.update(ticker.deltaMS);
 
-    if (this.gameClockUI.paused) return;
+    if (this.gameClockUI.paused || this.gameOver) return;
 
     // Advance game clock
     const realDeltaS = ticker.deltaMS / 1000;
@@ -285,6 +311,9 @@ export class Game {
 
     // Update satisfaction bar from vehicle states
     this.updateSatisfaction();
+
+    // Update score
+    this.updateScore(realDeltaS);
   }
 
   // ─── Derived state ─────────────────────────────────────────────────────────
@@ -303,11 +332,29 @@ export class Game {
     this.uiRenderer.updateVehicleCount(this.vehicles.size);
   }
 
+  /**
+   * Score increases each second based on:
+   *  - Number of active vehicles (more = harder = more points)
+   *  - Inverse of average frustration (calm traffic = max points)
+   * Score rate: vehicles × (1 - avg_frustration/100) × 10 pts/s
+   */
+  private updateScore(realDeltaS: number): void {
+    if (this.vehicles.size === 0) return;
+    let total = 0;
+    for (const v of this.vehicles.values()) total += v.frustration;
+    const avgFrustration = total / this.vehicles.size;
+
+    const rate = this.vehicles.size * (1 - avgFrustration / 100) * 10;
+    this.score += rate * realDeltaS;
+    this.uiRenderer.updateScore(this.score);
+  }
+
   // ─── Cleanup ───────────────────────────────────────────────────────────────
 
   destroy(): void {
     this.unlistenCongestion?.();
     this.unlistenLights?.();
+    this.unlistenGameOver?.();
     this.buildingRenderer.destroy();
     this.roadRenderer.destroy();
     this.vehicleRenderer.destroy();

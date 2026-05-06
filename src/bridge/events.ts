@@ -26,6 +26,14 @@ export interface LightStateUpdate {
   intersectionId: number;
   phase: number;
   timeRemaining: number;
+  /** Number of vehicles queued at this intersection (Adaptive mode sensor). */
+  queueCount: number;
+  /** Current control mode: "manual" | "semi_auto" | "auto" | "adaptive" */
+  mode: string;
+  /** Configured green phase duration (seconds). */
+  greenDuration: number;
+  /** Configured red phase duration (seconds). */
+  redDuration: number;
 }
 
 // ─── Binary frame parser ──────────────────────────────────────────────────────
@@ -100,6 +108,30 @@ export async function listenLightStateChanges(
   cb: (data: LightStateUpdate[]) => void,
 ): Promise<() => void> {
   const unlisten = await listen<LightStateUpdate[]>('light_state_change', (event) => {
+    cb(event.payload);
+  });
+  return unlisten;
+}
+
+// ─── Game Over ────────────────────────────────────────────────────────────────
+
+export interface GameOverPayload {
+  /** "avg_frustration" or "mass_rage" */
+  reason: string;
+  /** The triggering value (frustration % or rage fraction %). */
+  value: number;
+  /** In-game timestamp in seconds (e.g. 6*3600 = 06:00). */
+  timestampGame: number;
+}
+
+/**
+ * Subscribe to the one-shot game_over event.
+ * Returns an unsubscribe function.
+ */
+export async function listenGameOver(
+  cb: (data: GameOverPayload) => void,
+): Promise<() => void> {
+  const unlisten = await listen<GameOverPayload>('game_over', (event) => {
     cb(event.payload);
   });
   return unlisten;

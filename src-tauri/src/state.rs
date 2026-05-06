@@ -35,6 +35,12 @@ pub enum SimCommand {
         intersection_id: u64,
         phase: u8,
     },
+    /// Set fixed phase durations for SemiAuto / Auto modes.
+    SetLightDurations {
+        intersection_id: u64,
+        green_s: f32,
+        red_s: f32,
+    },
     Stop,
 }
 
