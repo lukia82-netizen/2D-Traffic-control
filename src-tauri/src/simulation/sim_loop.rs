@@ -8,7 +8,7 @@ use tauri::ipc::Channel;
 use tauri::{AppHandle, Emitter};
 use base64::Engine;
 use serde::Serialize;
-use petgraph::graph::EdgeIndex;
+use petgraph::graph::{EdgeIndex, NodeIndex};
 
 use crate::map::road_network::{MapData, IntersectionType};
 use crate::state::SimCommand;
@@ -29,6 +29,9 @@ const CONGESTION_INTERVAL_S: f32 = 0.5;
 
 /// Physical length of a vehicle subtracted from the gap so IDM sees bumper-to-bumper distance.
 const VEHICLE_LENGTH_M: f32 = 4.5;
+
+/// Only consider cross-traffic IDM within this distance to the node (meters).
+const CROSS_TRAFFIC_MAX_DIST_M: f32 = 70.0;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -246,6 +249,14 @@ pub fn run_simulation(
                 });
             }
 
+            let vehicles_by_target_node: HashMap<NodeIndex, Vec<usize>> = {
+                let guard = graph_lock.read();
+                match guard.as_ref() {
+                    Some(map) => build_vehicles_by_target_node(&vehicles, map),
+                    None => HashMap::new(),
+                }
+            };
+
             // Parallel IDM acceleration computation (read-only, safe to parallelise)
             let tram_snapshot: Vec<(f64, f64, f32)> = tram_sim.trams.iter()
                 .map(|t| (t.lat, t.lng, t.speed))
@@ -262,6 +273,16 @@ pub fn run_simulation(
                                 find_leader_arc(i, v, &vehicles, &edge_lane_vehicles, map);
                             let (gap, delta_v) =
                                 apply_tram_leader_effect(v, gap, delta_v, &tram_snapshot);
+                            let (gap, delta_v) = apply_cross_traffic_leader_effect(
+                                i,
+                                v,
+                                &vehicles,
+                                &vehicles_by_target_node,
+                                map,
+                                &intersections,
+                                gap,
+                                delta_v,
+                            );
                             let desired = compute_desired_speed(v, map);
                             let (gap, delta_v) =
                                 apply_intersection_effect(v, gap, delta_v, &intersections, map);
@@ -720,6 +741,175 @@ fn apply_tram_leader_effect(
     }
 
     (best_gap, best_dv)
+}
+
+/// Index vehicles by the graph node at the **end** of their current edge
+/// (the intersection / lane-merge node they are driving toward).
+fn build_vehicles_by_target_node(vehicles: &[Vehicle], map: &MapData) -> HashMap<NodeIndex, Vec<usize>> {
+    let mut m: HashMap<NodeIndex, Vec<usize>> = HashMap::new();
+    for (i, v) in vehicles.iter().enumerate() {
+        if v.route_pos >= v.route.len() {
+            continue;
+        }
+        let edge = v.route[v.route_pos];
+        if let Some((_, tgt)) = map.graph.edge_endpoints(edge) {
+            m.entry(tgt).or_default().push(i);
+        }
+    }
+    m
+}
+
+#[inline]
+fn cross_traffic_intersection_type(itype: &IntersectionType) -> bool {
+    // All node types except roundabouts: traffic-light junctions need this for
+    // turn conflicts when two streams may have simultaneous green (or permissive turns).
+    !matches!(itype, IntersectionType::Roundabout)
+}
+
+/// `true` when two edges meet at `tgt` from meaningfully different directions
+/// (crossing or opposing), not parallel duplicates of the same approach corridor.
+#[inline]
+fn edges_are_conflicting_approaches(
+    map: &MapData,
+    ego_edge: EdgeIndex,
+    other_edge: EdgeIndex,
+    tgt: NodeIndex,
+) -> bool {
+    let (es, et) = match map.graph.edge_endpoints(ego_edge) {
+        Some(x) => x,
+        None => return false,
+    };
+    let (os, ot) = match map.graph.edge_endpoints(other_edge) {
+        Some(x) => x,
+        None => return false,
+    };
+    if et != tgt || ot != tgt {
+        return false;
+    }
+
+    let n_tgt = &map.graph[tgt];
+    let n_es = &map.graph[es];
+    let n_os = &map.graph[os];
+    // Unit vectors along each edge toward `tgt` (incoming directions).
+    let vx = (n_tgt.lng - n_es.lng) as f32;
+    let vy = (n_tgt.lat - n_es.lat) as f32;
+    let wx = (n_tgt.lng - n_os.lng) as f32;
+    let wy = (n_tgt.lat - n_os.lat) as f32;
+    let lv = (vx * vx + vy * vy).sqrt().max(1e-9);
+    let lw = (wx * wx + wy * wy).sqrt().max(1e-9);
+    let dot = (vx / lv) * (wx / lw) + (vy / lv) * (wy / lw);
+    // Same dual-carriageway / parallel approach lanes → dot ≈ 1 → skip.
+    dot < 0.94
+}
+
+/// Lateral / cross-street conflict (plain, yield, stop, **traffic lights**, pedestrian signals).
+///
+/// Vehicles on a **different incoming edge** that share the same target node and are
+/// closer to that node along their approach temporarily act as an IDM leader: we use our
+/// remaining arc length to the node as gap and their speed in the IDM relative-velocity term.
+///
+/// For signalised nodes, a vehicle counts only if [`IntersectionManager::can_vehicle_proceed`]
+/// is true for that approach — so queued traffic on red does not spuriously block cross traffic.
+fn apply_cross_traffic_leader_effect(
+    ego_idx: usize,
+    ego: &Vehicle,
+    vehicles: &[Vehicle],
+    by_target_node: &HashMap<NodeIndex, Vec<usize>>,
+    map: &MapData,
+    intersections: &IntersectionManager,
+    gap: f32,
+    delta_v: f32,
+) -> (f32, f32) {
+    if ego.route_pos >= ego.route.len() {
+        return (gap, delta_v);
+    }
+    let ego_edge = ego.route[ego.route_pos];
+    let ego_edge_len = match map.graph.edge_weight(ego_edge) {
+        Some(e) => e.length_m,
+        None => return (gap, delta_v),
+    };
+    let tgt_node = match map.graph.edge_endpoints(ego_edge) {
+        Some((_, tgt)) => tgt,
+        None => return (gap, delta_v),
+    };
+    if !cross_traffic_intersection_type(&map.graph[tgt_node].intersection_type) {
+        return (gap, delta_v);
+    }
+
+    let tgt_osm_id = map.graph[tgt_node].osm_id;
+    if !intersections.can_vehicle_proceed(tgt_osm_id, ego.has_stopped_at_stop_sign) {
+        return (gap, delta_v);
+    }
+
+    let d_ego = (1.0 - ego.edge_progress) * ego_edge_len;
+    if d_ego > CROSS_TRAFFIC_MAX_DIST_M {
+        return (gap, delta_v);
+    }
+
+    let Some(candidates) = by_target_node.get(&tgt_node) else {
+        return (gap, delta_v);
+    };
+
+    // Others must be at least this much nearer to the node (m) to count as priority cross traffic.
+    const PRIORITY_HEADWAY_M: f32 = 0.5;
+
+    let mut best_d_other = f32::MAX;
+    let mut best_v_other = 0.0f32;
+    let mut found = false;
+
+    for &other_idx in candidates {
+        if other_idx == ego_idx {
+            continue;
+        }
+        let other = &vehicles[other_idx];
+        if other.route_pos >= other.route.len() {
+            continue;
+        }
+        let other_edge = other.route[other.route_pos];
+        if other_edge == ego_edge {
+            continue;
+        }
+        let other_len = match map.graph.edge_weight(other_edge) {
+            Some(e) => e.length_m,
+            None => continue,
+        };
+        let other_tgt = match map.graph.edge_endpoints(other_edge) {
+            Some((_, t)) => t,
+            None => continue,
+        };
+        if other_tgt != tgt_node {
+            continue;
+        }
+        if !edges_are_conflicting_approaches(map, ego_edge, other_edge, tgt_node) {
+            continue;
+        }
+        if !intersections.can_vehicle_proceed(tgt_osm_id, other.has_stopped_at_stop_sign) {
+            continue;
+        }
+
+        let d_other = (1.0 - other.edge_progress) * other_len;
+        if d_other + PRIORITY_HEADWAY_M >= d_ego {
+            continue;
+        }
+        if !found || d_other < best_d_other {
+            found = true;
+            best_d_other = d_other;
+            best_v_other = other.speed;
+        }
+    }
+
+    if !found {
+        return (gap, delta_v);
+    }
+
+    let cross_gap = d_ego.max(0.1);
+    let cross_dv = ego.speed - best_v_other;
+
+    if cross_gap < gap {
+        (cross_gap, cross_dv)
+    } else {
+        (gap, delta_v)
+    }
 }
 
 fn apply_vehicle_physics(
