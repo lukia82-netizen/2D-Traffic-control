@@ -9,12 +9,13 @@ import * as PIXI from 'pixi.js';
  *   2 – arrowLayer       Animated oneway-direction arrows (live containers)
  *   3 – tunnelOverlay    Dashed lines over tunnel roads
  *   4 – staticMarkings   Bridge shadows and other static road markings
- *   5 – tunnelVehicles   Vehicles inside tunnels (α 0.25)
- *   6 – groundVehicles   Surface-level vehicles
- *   7 – bridgeVehicles   Vehicles on bridges
- *   8 – frustrationLayer Frustration bubble indicators above vehicles
- *   9 – trafficLights    Traffic light state sprites
- *  10 – congestionLayer  Congestion heat overlay
+ *   5 – roadSigns        SVG road sign sprites (STOP, sygnalizacja, etc.)
+ *   6 – tunnelVehicles   Vehicles inside tunnels (α 0.25)
+ *   7 – groundVehicles   Surface-level vehicles
+ *   8 – bridgeVehicles   Vehicles on bridges
+ *   9 – frustrationLayer Frustration bubble indicators above vehicles
+ *  10 – trafficLights    Traffic light state sprites
+ *  11 – congestionLayer  Congestion heat overlay
  */
 export class PixiOverlay {
   app!: PIXI.Application;
@@ -24,6 +25,7 @@ export class PixiOverlay {
   arrowLayer!: PIXI.Container;
   tunnelOverlay!: PIXI.Container;
   staticMarkings!: PIXI.Container;
+  roadSigns!: PIXI.Container;
   tunnelVehicles!: PIXI.Container;
   groundVehicles!: PIXI.Container;
   bridgeVehicles!: PIXI.Container;
@@ -61,6 +63,7 @@ export class PixiOverlay {
     this.arrowLayer      = new PIXI.Container();
     this.tunnelOverlay   = new PIXI.Container();
     this.staticMarkings  = new PIXI.Container();
+    this.roadSigns       = new PIXI.Container();
     this.tunnelVehicles  = new PIXI.Container();
     this.groundVehicles  = new PIXI.Container();
     this.bridgeVehicles  = new PIXI.Container();
@@ -73,6 +76,7 @@ export class PixiOverlay {
     this.app.stage.addChild(this.arrowLayer);
     this.app.stage.addChild(this.tunnelOverlay);
     this.app.stage.addChild(this.staticMarkings);
+    this.app.stage.addChild(this.roadSigns);
     this.app.stage.addChild(this.tunnelVehicles);
     this.app.stage.addChild(this.groundVehicles);
     this.app.stage.addChild(this.bridgeVehicles);
