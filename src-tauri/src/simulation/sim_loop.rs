@@ -279,6 +279,7 @@ pub fn run_simulation(
                                 &vehicles,
                                 &vehicles_by_target_node,
                                 map,
+                                &intersections,
                                 gap,
                                 delta_v,
                             );
@@ -760,10 +761,9 @@ fn build_vehicles_by_target_node(vehicles: &[Vehicle], map: &MapData) -> HashMap
 
 #[inline]
 fn cross_traffic_intersection_type(itype: &IntersectionType) -> bool {
-    matches!(
-        itype,
-        IntersectionType::Plain | IntersectionType::Yield | IntersectionType::Stop
-    )
+    // All node types except roundabouts: traffic-light junctions need this for
+    // turn conflicts when two streams may have simultaneous green (or permissive turns).
+    !matches!(itype, IntersectionType::Roundabout)
 }
 
 /// `true` when two edges meet at `tgt` from meaningfully different directions
@@ -802,17 +802,21 @@ fn edges_are_conflicting_approaches(
     dot < 0.94
 }
 
-/// Lateral / cross-street conflict at uncontrolled-style junctions (plain, yield, stop).
+/// Lateral / cross-street conflict (plain, yield, stop, **traffic lights**, pedestrian signals).
 ///
 /// Vehicles on a **different incoming edge** that share the same target node and are
 /// closer to that node along their approach temporarily act as an IDM leader: we use our
 /// remaining arc length to the node as gap and their speed in the IDM relative-velocity term.
+///
+/// For signalised nodes, a vehicle counts only if [`IntersectionManager::can_vehicle_proceed`]
+/// is true for that approach — so queued traffic on red does not spuriously block cross traffic.
 fn apply_cross_traffic_leader_effect(
     ego_idx: usize,
     ego: &Vehicle,
     vehicles: &[Vehicle],
     by_target_node: &HashMap<NodeIndex, Vec<usize>>,
     map: &MapData,
+    intersections: &IntersectionManager,
     gap: f32,
     delta_v: f32,
 ) -> (f32, f32) {
@@ -829,6 +833,11 @@ fn apply_cross_traffic_leader_effect(
         None => return (gap, delta_v),
     };
     if !cross_traffic_intersection_type(&map.graph[tgt_node].intersection_type) {
+        return (gap, delta_v);
+    }
+
+    let tgt_osm_id = map.graph[tgt_node].osm_id;
+    if !intersections.can_vehicle_proceed(tgt_osm_id, ego.has_stopped_at_stop_sign) {
         return (gap, delta_v);
     }
 
@@ -872,6 +881,9 @@ fn apply_cross_traffic_leader_effect(
             continue;
         }
         if !edges_are_conflicting_approaches(map, ego_edge, other_edge, tgt_node) {
+            continue;
+        }
+        if !intersections.can_vehicle_proceed(tgt_osm_id, other.has_stopped_at_stop_sign) {
             continue;
         }
 
