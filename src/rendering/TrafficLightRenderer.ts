@@ -11,9 +11,9 @@ import { projectPoint } from '../map/MapLibreSetup';
 const MIN_ZOOM = 13;
 
 /** How far along the edge (0–1) the stop line sits. */
-const STOP_LINE_T = 0.88;
+const STOP_LINE_T = 0.985;
 /** How far along the edge the signal head sits (just before stop line). */
-const SIGNAL_HEAD_T = 0.82;
+const SIGNAL_HEAD_T = 0.965;
 
 /** Radius of signal housing circle at zoom 16. */
 const HOUSING_R_REF = 5;
@@ -31,6 +31,8 @@ const COLOR_GREEN  = 0x22dd55;
 const ZEBRA_STRIPE_W_REF = 4;
 /** Number of zebra stripes. */
 const ZEBRA_STRIPES = 5;
+/** Extra lateral offset so heads sit beside the right road edge, not center. */
+const SIGNAL_SIDE_MARGIN_REF = 9;
 
 // ─── Internal types ───────────────────────────────────────────────────────────
 
@@ -195,6 +197,7 @@ export class TrafficLightRenderer {
       const ry =  ux;
 
       const hw = ap.lanes * HALF_PX_REF * scale; // half-width of road
+      const sideOffset = hw + SIGNAL_SIDE_MARGIN_REF * scale;
 
       if (ap.isPedestrian) {
         // ── Pedestrian crossing: zebra stripes ──────────────────────────────
@@ -224,8 +227,8 @@ export class TrafficLightRenderer {
           .stroke({ width: Math.max(1.5, 2 * scale), color: 0xffffff, alpha: 0.9 });
 
         // ── Car signal head (right side, before stop line) ──────────────────
-        const shx = from.x + ux * len * SIGNAL_HEAD_T + rx * hw * 0.7;
-        const shy = from.y + uy * len * SIGNAL_HEAD_T + ry * hw * 0.7;
+        const shx = from.x + ux * len * SIGNAL_HEAD_T + rx * sideOffset;
+        const shy = from.y + uy * len * SIGNAL_HEAD_T + ry * sideOffset;
         const carGfx = new PIXI.Graphics();
         this.drawSignalHead(carGfx, hr, br, phase);
         carGfx.x = shx; carGfx.y = shy;
@@ -234,8 +237,8 @@ export class TrafficLightRenderer {
         // ── Pedestrian signal head (left side, at crossing) ─────────────────
         // Phase is INVERSE: when cars see RED (phase=0), pedestrians see GREEN
         const pedPhase = phase === 2 ? 0 : (phase === 0 ? 2 : 1);
-        const phx = crossX - rx * hw * 1.2 - ux * ZEBRA_STRIPE_W_REF * scale * ZEBRA_STRIPES;
-        const phy = crossY - ry * hw * 1.2 - uy * ZEBRA_STRIPE_W_REF * scale * ZEBRA_STRIPES;
+        const phx = crossX - rx * (sideOffset + hr * 0.5) - ux * ZEBRA_STRIPE_W_REF * scale * ZEBRA_STRIPES;
+        const phy = crossY - ry * (sideOffset + hr * 0.5) - uy * ZEBRA_STRIPE_W_REF * scale * ZEBRA_STRIPES;
         const pedGfx = new PIXI.Graphics();
         this.drawPedestrianSignal(pedGfx, hr * 1.2, br * 1.2, pedPhase);
         pedGfx.x = phx; pedGfx.y = phy;
@@ -255,8 +258,8 @@ export class TrafficLightRenderer {
           .lineTo(slx + rx * hw, sly + ry * hw)
           .stroke({ width: Math.max(1, 1.5 * scale), color: 0xffffff, alpha: 0.85 });
 
-        const shx = from.x + ux * len * SIGNAL_HEAD_T + rx * hw * 0.6;
-        const shy = from.y + uy * len * SIGNAL_HEAD_T + ry * hw * 0.6;
+        const shx = from.x + ux * len * SIGNAL_HEAD_T + rx * sideOffset;
+        const shy = from.y + uy * len * SIGNAL_HEAD_T + ry * sideOffset;
         const headGfx = new PIXI.Graphics();
         this.drawSignalHead(headGfx, hr, br, phase);
         headGfx.x = shx; headGfx.y = shy;
