@@ -616,6 +616,22 @@ fn apply_vehicle_physics(
         vehicle.lane_change_cooldown = (vehicle.lane_change_cooldown - real_dt_s).max(0.0);
     }
 
+    // ── Lateral-offset smoothing (GTA-style lane glide) ───────────────────
+    // target_lateral_offset tracks the desired lane (== target_lane as f32).
+    // current_lateral_offset glides toward it at LANE_CHANGE_SPEED lane/s.
+    // Using real-time dt keeps the animation speed independent of sim speed.
+    vehicle.target_lateral_offset = vehicle.target_lane as f32;
+    {
+        const LANE_CHANGE_SPEED: f32 = 0.35; // lane-widths per real second (~2.9 s full change)
+        let diff = vehicle.target_lateral_offset - vehicle.current_lateral_offset;
+        let step = LANE_CHANGE_SPEED * real_dt_s;
+        if diff.abs() <= step {
+            vehicle.current_lateral_offset = vehicle.target_lateral_offset;
+        } else {
+            vehicle.current_lateral_offset += step * diff.signum();
+        }
+    }
+
     // ── Advance along route ────────────────────────────────────────────────
     if vehicle.route_pos >= vehicle.route.len() {
         vehicle.despawned = true;
@@ -672,17 +688,17 @@ fn apply_vehicle_physics(
 ///
 /// Per-vehicle layout (32 bytes, 4-byte aligned):
 /// ```text
-///   [0..3]   id:        u32  LE
-///   [4..7]   lat:       f32  LE
-///   [8..11]  lng:       f32  LE
-///   [12..15] angle:     f32  LE
-///   [16..19] speed:     f32  LE
-///   [20]     type:      u8   (0=Car, 1=Van, 2=Bus, 3=Truck, 4=Tram)
-///   [21]     profile:   u8
-///   [22]     trip_kind: u8   (0=local_od, 1=transit, 2=ext_in, 3=ext_out)
-///   [23]     padding:   u8
-///   [24..27] frustration: f32 LE (0=calm, 100=rage)
-///   [28..31] padding2:  u32  LE
+///   [0..3]   id:              u32  LE
+///   [4..7]   lat:             f32  LE
+///   [8..11]  lng:             f32  LE
+///   [12..15] angle:           f32  LE
+///   [16..19] speed:           f32  LE
+///   [20]     type:            u8   (0=Car, 1=Van, 2=Bus, 3=Truck, 4=Tram)
+///   [21]     profile:         u8
+///   [22]     trip_kind:       u8   (0=local_od, 1=transit, 2=ext_in, 3=ext_out)
+///   [23]     current_lane:    u8   (lane index, 0 = closest to centre)
+///   [24..27] frustration:     f32  LE  (0=calm, 100=rage)
+///   [28..31] lateral_offset:  f32  LE  (smooth lane pos: 0.0=lane-0 centre, 1.0=lane-1 …)
 /// ```
 fn serialize_vehicles(vehicles: &[Vehicle], tram_sim: &TramSim) -> Vec<u8> {
     let total = vehicles.len() + tram_sim.trams.len();
@@ -699,7 +715,9 @@ fn serialize_vehicles(vehicles: &[Vehicle], tram_sim: &TramSim) -> Vec<u8> {
             v.vehicle_type as u8,
             v.driver_profile as u8,
             v.trip_kind,
+            v.current_lane,
             v.frustration,
+            v.current_lateral_offset,
         );
     }
 
@@ -714,13 +732,29 @@ fn serialize_vehicles(vehicles: &[Vehicle], tram_sim: &TramSim) -> Vec<u8> {
             crate::vehicles::types::VehicleType::Tram as u8,
             0, // Normal profile placeholder
             t.trip_kind,
+            0, // Trams have fixed track, always lane 0
             t.frustration,
+            0.0, // Trams stay on fixed track, no lateral offset
         );
     }
 
     buf
 }
 
+/// Per-vehicle binary packet layout (32 bytes):
+/// ```text
+///   [0..3]   id:              u32 LE
+///   [4..7]   lat:             f32 LE
+///   [8..11]  lng:             f32 LE
+///   [12..15] angle:           f32 LE
+///   [16..19] speed:           f32 LE
+///   [20]     vehicle_type:    u8
+///   [21]     driver_profile:  u8
+///   [22]     trip_kind:       u8
+///   [23]     current_lane:    u8   (0 = closest to centre)
+///   [24..27] frustration:     f32 LE
+///   [28..31] lateral_offset:  f32 LE (smooth: 0.0=lane-0, 1.0=lane-1, …)
+/// ```
 #[inline]
 fn push_vehicle_packet(
     buf: &mut Vec<u8>,
@@ -732,17 +766,19 @@ fn push_vehicle_packet(
     vtype: u8,
     profile: u8,
     trip_kind: u8,
+    current_lane: u8,
     frustration: f32,
+    lateral_offset: f32,
 ) {
-    buf.extend_from_slice(&id.to_le_bytes());              // [0..3]
-    buf.extend_from_slice(&(lat as f32).to_le_bytes());    // [4..7]
-    buf.extend_from_slice(&(lng as f32).to_le_bytes());    // [8..11]
-    buf.extend_from_slice(&angle.to_le_bytes());           // [12..15]
-    buf.extend_from_slice(&speed.to_le_bytes());           // [16..19]
-    buf.push(vtype);                                       // [20]
-    buf.push(profile);                                     // [21]
-    buf.push(trip_kind);                                   // [22]
-    buf.push(0u8);                                         // [23] padding
-    buf.extend_from_slice(&frustration.to_le_bytes());     // [24..27]
-    buf.extend_from_slice(&0u32.to_le_bytes());            // [28..31] padding2
+    buf.extend_from_slice(&id.to_le_bytes());                  // [0..3]
+    buf.extend_from_slice(&(lat as f32).to_le_bytes());        // [4..7]
+    buf.extend_from_slice(&(lng as f32).to_le_bytes());        // [8..11]
+    buf.extend_from_slice(&angle.to_le_bytes());               // [12..15]
+    buf.extend_from_slice(&speed.to_le_bytes());               // [16..19]
+    buf.push(vtype);                                           // [20]
+    buf.push(profile);                                         // [21]
+    buf.push(trip_kind);                                       // [22]
+    buf.push(current_lane);                                    // [23] lane index
+    buf.extend_from_slice(&frustration.to_le_bytes());         // [24..27]
+    buf.extend_from_slice(&lateral_offset.to_le_bytes());      // [28..31]
 }

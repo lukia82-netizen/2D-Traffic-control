@@ -58,6 +58,12 @@ pub struct Vehicle {
     pub target_lane: u8,
     /// Cooldown in real seconds before the next lane change is allowed.
     pub lane_change_cooldown: f32,
+    /// Smooth lateral position in lane-index units (0.0 = centre of lane 0,
+    /// 1.0 = centre of lane 1, …).  Interpolates toward `target_lateral_offset`
+    /// every tick to produce GTA-style glide instead of an instant jump.
+    pub current_lateral_offset: f32,
+    /// Desired lateral position (== target_lane as f32 once the lane is confirmed).
+    pub target_lateral_offset: f32,
 
     // ── Traffic law compliance ───────────────────────────────────────────────
 
@@ -106,6 +112,8 @@ impl Vehicle {
             current_lane: 0,
             target_lane: 0,
             lane_change_cooldown: 0.0,
+            current_lateral_offset: 0.0,
+            target_lateral_offset: 0.0,
             has_stopped_at_stop_sign: false,
             despawned: false,
         }

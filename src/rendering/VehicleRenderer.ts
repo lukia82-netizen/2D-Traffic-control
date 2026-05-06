@@ -144,9 +144,11 @@ export class VehicleRenderer {
   /** Single Graphics object reused every frame to draw frustration bubbles */
   private bubbleGraphics: PIXI.Graphics | null = null;
 
-  // ── Lerp smoothing (geo space) ───────────────────────────────────────────────
+  // ── Lerp smoothing (geo space + angle) ──────────────────────────────────────
   /** Smoothed geographic positions to eliminate flicker from IPC burst delivery */
   private readonly geoSmoothed: Map<number, { lat: number; lng: number }> = new Map();
+  /** Smoothed headings to eliminate angle jumps at sparse OSM nodes. */
+  private readonly angleSmoothed: Map<number, number> = new Map();
 
   // ── Road-group filtering (sandbox layer visibility) ───────────────────────
   /** Edges indexed for fast vehicle → road-group matching. */
@@ -277,9 +279,12 @@ export class VehicleRenderer {
       const color = frustrationDotColor(v.frustration, DOT_COLORS[typeId] ?? 0x4488ff);
       const px = this.map.project([smooth.lng, smooth.lat]);
 
-      const offsetPx = this.camera.getLaneOffset();
-      const cx = px.x + Math.cos(v.angle) * offsetPx;
-      const cy = px.y + Math.sin(v.angle) * offsetPx;
+      // Per-lane offset using smooth lateralOffset (float lane-index from Rust).
+      // getLaneOffset() = halfLaneWidth; lane n centre = (2n+1) × halfLaneWidth.
+      const angle  = this.smoothAngle(v);
+      const offsetPx = this.camera.getLaneOffset() * (2 * v.lateralOffset + 1);
+      const cx = px.x + Math.cos(angle) * offsetPx;
+      const cy = px.y + Math.sin(angle) * offsetPx;
 
       gfx.circle(cx, cy, radius).fill({ color, alpha: 0.9 });
     }
@@ -391,15 +396,16 @@ export class VehicleRenderer {
       // Rust angle: atan2(dlng, dlat), so angle=0→North, π/2→East.
       // Screen heading vector = (sin θ, −cos θ).
       // Perpendicular 90° clockwise (right lane) = (cos θ, sin θ).
-      const laneOffset = this.camera.getLaneOffset();
-      const offsetX = Math.cos(v.angle) * laneOffset;
-      const offsetY = Math.sin(v.angle) * laneOffset;
+      // Use smooth float lateralOffset for GTA-style glide between lanes.
+      const angle     = this.smoothAngle(v);
+      const laneOffset = this.camera.getLaneOffset() * (2 * v.lateralOffset + 1);
+      const offsetX = Math.cos(angle) * laneOffset;
+      const offsetY = Math.sin(angle) * laneOffset;
 
       sprite.x = px.x + offsetX;
       sprite.y = px.y + offsetY;
-      // Rotation: angle=0 → sprite front (y=0 of texture) points North (up).
-      // PixiJS clockwise rotation=π/2 → front points East. Matches Rust convention.
-      sprite.rotation = v.angle;
+      // Rotation: use smoothed angle so the sprite glides at OSM node crossings.
+      sprite.rotation = angle;
       sprite.width  = dims.w * spriteScale;
       sprite.height = dims.h * spriteScale;
       sprite.anchor.set(0.5, 0.5);
@@ -416,6 +422,7 @@ export class VehicleRenderer {
         this.releaseSprite(id, sprite);
         this.activeSprites.delete(id);
         this.geoSmoothed.delete(id);
+        this.angleSmoothed.delete(id);
         this.vehicleGroupCache.delete(id);
         this.prevVehiclePos.delete(id);
       }
@@ -463,6 +470,27 @@ export class VehicleRenderer {
       if (d2 < bestDist2) { bestDist2 = d2; bestGroup = e.group; }
     }
     return bestGroup;
+  }
+
+  // ─── Angle smoothing (lerp with wrap-around) ──────────────────────────────
+
+  /**
+   * Returns a smoothed heading for vehicle `v`, lerping toward the latest
+   * Rust angle.  Shortest angular path via π wrap prevents spin artefacts
+   * at sparse OSM nodes.
+   */
+  private smoothAngle(v: VehicleState): number {
+    const prev = this.angleSmoothed.get(v.id);
+    if (prev === undefined) {
+      this.angleSmoothed.set(v.id, v.angle);
+      return v.angle;
+    }
+    let diff = v.angle - prev;
+    if (diff >  Math.PI) diff -= 2 * Math.PI;
+    if (diff < -Math.PI) diff += 2 * Math.PI;
+    const next = prev + diff * GEO_LERP;
+    this.angleSmoothed.set(v.id, next);
+    return next;
   }
 
   // ─── Geo smoothing (lerp) ──────────────────────────────────────────────────
@@ -527,5 +555,6 @@ export class VehicleRenderer {
     this.activeSprites.clear();
     this.textures.clear();
     this.geoSmoothed.clear();
+    this.angleSmoothed.clear();
   }
 }

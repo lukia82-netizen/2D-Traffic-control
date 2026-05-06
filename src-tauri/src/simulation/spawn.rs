@@ -146,6 +146,8 @@ impl SpawnSystem {
         let initial_target = compute_vehicle_target_lane(&vehicle, map);
         vehicle.target_lane  = initial_target;
         vehicle.current_lane = initial_target;
+        vehicle.current_lateral_offset = initial_target as f32;
+        vehicle.target_lateral_offset  = initial_target as f32;
 
         Some(vehicle)
     }
@@ -233,6 +235,8 @@ impl SpawnSystem {
         let initial_target = compute_vehicle_target_lane(&vehicle, map);
         vehicle.target_lane  = initial_target;
         vehicle.current_lane = initial_target;
+        vehicle.current_lateral_offset = initial_target as f32;
+        vehicle.target_lateral_offset  = initial_target as f32;
 
         Some(vehicle)
     }

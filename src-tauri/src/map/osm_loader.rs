@@ -110,10 +110,14 @@ pub async fn fetch_osm_data(bbox: [f64; 4]) -> Result<OsmData, String> {
     //  2. (._;>;) — re-union with itself + recurse-down to get ALL member nodes
     //     and ways referenced by the collected elements
     //  3. Output everything in one response
+    // Only fetch the road hierarchy backbone (primary / secondary / tertiary).
+    // This keeps the graph small (~hundreds of nodes vs thousands), makes
+    // intersections clearly spaced, and gives PixiJS ~10× fewer edges to
+    // draw — stable 60 FPS without sacrificing gameplay clarity.
     let query = format!(
         "[out:json][timeout:90];\
         (\
-          way[highway~\"motorway|trunk|primary|secondary|tertiary|residential|service|unclassified|living_street\"]\
+          way[highway~\"^(primary|secondary|tertiary)$\"]\
           ({south},{west},{north},{east});\
           way[building]({south},{west},{north},{east});\
           way[railway=tram]({south},{west},{north},{east});\

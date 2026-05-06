@@ -270,7 +270,36 @@ export class RoadRenderer {
     // ── Pass 5: centre dashes on two-way roads ─────────────────────────────
     for (const r of renderables) {
       if (r.w > 8 && !r.edge.oneway) {
-        this.drawDashes(gfx, r.from, r.dx / r.len, r.dy / r.len, r.len);
+        this.drawDashes(gfx, r.from, r.dx / r.len, r.dy / r.len, r.len, 0, 1, 0xffffff, 0.35);
+      }
+    }
+
+    // ── Pass 6: per-direction lane dividers (multi-lane roads, zoom ≥ 14) ──
+    // Right-hand-traffic: right side = direction A (from→to), left = direction B.
+    // Perpendicular rightward = (-dy/len, dx/len) in screen coords.
+    if (this.camera.zoom >= 14) {
+      for (const r of renderables) {
+        const lanes    = Math.max(1, r.edge.lanes);
+        const dirLanes = r.edge.oneway ? lanes : Math.max(1, Math.floor(lanes / 2));
+        if (dirLanes < 2) continue; // no intra-direction dividers needed
+
+        const nx = -r.dy / r.len; // right-perp unit vector (x)
+        const ny =  r.dx / r.len; // right-perp unit vector (y)
+        const laneStepPx = r.w / dirLanes; // px per direction-lane
+
+        for (let i = 1; i < dirLanes; i++) {
+          const off = laneStepPx * i; // offset from centreline
+
+          // Right side (direction A)
+          const fromR = { x: r.from.x + nx * off, y: r.from.y + ny * off };
+          this.drawDashes(gfx, fromR, r.dx / r.len, r.dy / r.len, r.len, 0, 0.8, 0xffffff, 0.22);
+
+          if (!r.edge.oneway) {
+            // Left side (direction B) — mirror offset
+            const fromL = { x: r.from.x - nx * off, y: r.from.y - ny * off };
+            this.drawDashes(gfx, fromL, r.dx / r.len, r.dy / r.len, r.len, 0, 0.8, 0xffffff, 0.22);
+          }
+        }
       }
     }
   }
@@ -279,15 +308,19 @@ export class RoadRenderer {
     gfx: PIXI.Graphics,
     from: { x: number; y: number },
     ux: number, uy: number, len: number,
+    _unused = 0,
+    width = 1,
+    color = 0xffffff,
+    alpha = 0.3,
   ): void {
     const DASH = 12, GAP = 9, STEP = DASH + GAP;
     const count = Math.floor(len / STEP);
     for (let i = 0; i < count; i++) {
       const d0 = i * STEP + GAP * 0.5;
       gfx
-        .moveTo(from.x + ux * d0,        from.y + uy * d0)
+        .moveTo(from.x + ux * d0,          from.y + uy * d0)
         .lineTo(from.x + ux * (d0 + DASH), from.y + uy * (d0 + DASH))
-        .stroke({ width: 1, color: 0xffffff, alpha: 0.3 });
+        .stroke({ width, color, alpha });
     }
   }
 
