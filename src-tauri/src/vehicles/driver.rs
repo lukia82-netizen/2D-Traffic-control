@@ -56,7 +56,7 @@ impl DriverProfile {
             DriverProfile::Sunday => DriverParams {
                 desired_speed_factor: 0.8,
                 time_headway: 2.5,
-                min_gap: 10.0,
+                min_gap: 12.0,
                 comfort_accel: 0.8,
                 comfort_decel: 1.5,
                 wait_threshold_real_s: 90.0,
@@ -66,7 +66,7 @@ impl DriverProfile {
             DriverProfile::Pirat => DriverParams {
                 desired_speed_factor: 1.4,
                 time_headway: 0.8,
-                min_gap: 8.0,
+                min_gap: 6.0,
                 comfort_accel: 3.0,
                 comfort_decel: 5.0,
                 wait_threshold_real_s: 15.0,
@@ -76,7 +76,7 @@ impl DriverProfile {
             DriverProfile::Cautious => DriverParams {
                 desired_speed_factor: 0.9,
                 time_headway: 2.0,
-                min_gap: 12.0,
+                min_gap: 11.0,
                 comfort_accel: 1.0,
                 comfort_decel: 2.5,
                 wait_threshold_real_s: 60.0,
