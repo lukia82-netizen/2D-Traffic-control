@@ -223,6 +223,15 @@ pub fn set_light_durations(
     send_sim_command(&state, SimCommand::SetLightDurations { intersection_id, green_s, red_s })
 }
 
+/// Set the vehicle tracked by debug overlay (`None` clears selection).
+#[command]
+pub fn set_debug_vehicle(
+    vehicle_id: Option<u32>,
+    state: State<AppState>,
+) -> Result<(), String> {
+    send_sim_command(&state, SimCommand::SetDebugVehicle(vehicle_id))
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 fn send_sim_command(state: &State<AppState>, cmd: SimCommand) -> Result<(), String> {

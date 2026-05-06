@@ -42,6 +42,7 @@ pub enum SimCommand {
         green_s: f32,
         red_s: f32,
     },
+    SetDebugVehicle(Option<u32>),
     Stop,
 }
 

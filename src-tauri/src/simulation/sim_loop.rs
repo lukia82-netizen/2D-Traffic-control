@@ -47,6 +47,7 @@ struct IdmDebugPayload {
     delta_v: f32,
     dist_to_stop_line: f32,
     red_blocking: bool,
+    route_points: Vec<[f64; 2]>,
 }
 
 pub fn run_simulation(
@@ -60,6 +61,7 @@ pub fn run_simulation(
     let mut congestion_timer = 0.0f32;
     let mut high_frustration_timer = 0.0f32;
     let mut idm_debug_timer = 0.0f32;
+    let mut selected_debug_vehicle: Option<u32> = None;
 
     // ── Build subsystems from map ────────────────────────────────────────────
     let (mut intersections, mut spawn_system, mut od_model, mut tram_sim) = {
@@ -111,7 +113,13 @@ pub fn run_simulation(
         // ── Commands ─────────────────────────────────────────────────────────
         loop {
             match command_rx.try_recv() {
-                Ok(cmd) => handle_command(cmd, &mut clock, &mut intersections, &mut spawn_system),
+                Ok(cmd) => handle_command(
+                    cmd,
+                    &mut clock,
+                    &mut intersections,
+                    &mut spawn_system,
+                    &mut selected_debug_vehicle,
+                ),
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     log::info!("Simulation command channel closed, stopping");
@@ -360,10 +368,18 @@ pub fn run_simulation(
             idm_debug_timer += PHYSICS_DT;
             if idm_debug_timer >= 0.2 {
                 idm_debug_timer = 0.0;
-                if let Some((i, ego)) = vehicles
-                    .iter()
-                    .enumerate()
-                    .find(|(_, v)| v.route_pos < v.route.len() && v.vehicle_type as u8 != 4)
+                let debug_target = if let Some(sel_id) = selected_debug_vehicle {
+                    vehicles
+                        .iter()
+                        .enumerate()
+                        .find(|(_, v)| v.id == sel_id && v.route_pos < v.route.len())
+                } else {
+                    vehicles
+                        .iter()
+                        .enumerate()
+                        .find(|(_, v)| v.route_pos < v.route.len() && v.vehicle_type as u8 != 4)
+                };
+                if let Some((i, ego)) = debug_target
                 {
                     let guard = graph_lock.read();
                     if let Some(map) = guard.as_ref() {
@@ -377,6 +393,7 @@ pub fn run_simulation(
                             delta_v,
                             dist_to_stop_line,
                             red_blocking,
+                            route_points: build_route_points(ego, map),
                         };
                         let _ = app_handle.emit("idm_debug", payload);
                     }
@@ -457,6 +474,7 @@ fn handle_command(
     clock: &mut GameClock,
     intersections: &mut IntersectionManager,
     spawn_system: &mut SpawnSystem,
+    selected_debug_vehicle: &mut Option<u32>,
 ) {
     match cmd {
         SimCommand::Pause                  => clock.pause(),
@@ -473,8 +491,26 @@ fn handle_command(
         SimCommand::SetLightDurations { intersection_id, green_s, red_s } => {
             intersections.set_durations(intersection_id, green_s, red_s);
         }
+        SimCommand::SetDebugVehicle(id) => {
+            *selected_debug_vehicle = id;
+        }
         SimCommand::Stop => {}
     }
+}
+
+fn build_route_points(vehicle: &Vehicle, map: &MapData) -> Vec<[f64; 2]> {
+    let mut points = Vec::new();
+    points.push([vehicle.lng, vehicle.lat]);
+    if vehicle.route_pos >= vehicle.route.len() {
+        return points;
+    }
+    for &edge_idx in vehicle.route.iter().skip(vehicle.route_pos) {
+        if let Some((_, tgt)) = map.graph.edge_endpoints(edge_idx) {
+            let n = &map.graph[tgt];
+            points.push([n.lng, n.lat]);
+        }
+    }
+    points
 }
 
 // ── Physics helpers ────────────────────────────────────────────────────────────

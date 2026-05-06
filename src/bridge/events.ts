@@ -138,6 +138,7 @@ export interface IdmDebugPayload {
   deltaV: number;
   distToStopLine: number;
   redBlocking: boolean;
+  routePoints: [number, number][];
 }
 
 /**
