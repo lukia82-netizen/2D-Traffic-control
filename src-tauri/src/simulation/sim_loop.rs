@@ -31,8 +31,8 @@ const CONGESTION_INTERVAL_S: f32 = 0.5;
 const MIN_IDM_GAP_M: f32 = 0.1;
 /// Additional spawn breathing room after bumper gap has been computed.
 const SPAWN_BUFFER_M: f32 = 2.0;
-const DEBUG_VEHICLE_ID: u32 = 2;
-const DEBUG_LOG_INTERVAL_S: f32 = 0.5;
+const DEFAULT_DEBUG_VEHICLE_ID: u32 = 2;
+const DEFAULT_DEBUG_LOG_INTERVAL_S: f32 = 0.5;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -48,6 +48,16 @@ pub fn run_simulation(
     vehicle_channel: Channel<String>,
     app_handle: AppHandle,
 ) {
+    let debug_vehicle_id = std::env::var("IDM_DEBUG_ID")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(DEFAULT_DEBUG_VEHICLE_ID);
+    let debug_log_interval_s = std::env::var("IDM_DEBUG_INTERVAL_S")
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .filter(|v| *v > 0.0)
+        .unwrap_or(DEFAULT_DEBUG_LOG_INTERVAL_S);
+
     let mut clock = GameClock::new();
     let mut vehicles: Vec<Vehicle> = Vec::with_capacity(512);
     let mut congestion_timer = 0.0f32;
@@ -239,13 +249,13 @@ pub fn run_simulation(
                 }
             };
 
-            if idm_debug_timer >= DEBUG_LOG_INTERVAL_S {
+            if idm_debug_timer >= debug_log_interval_s {
                 let guard = graph_lock.read();
                 if let Some(map) = guard.as_ref() {
                     if let Some((ego_idx, ego)) = vehicles
                         .iter()
                         .enumerate()
-                        .find(|(_, v)| v.id == DEBUG_VEHICLE_ID && !v.despawned)
+                        .find(|(_, v)| v.id == debug_vehicle_id && !v.despawned)
                     {
                         let (base_gap, base_dv) =
                             find_leader_arc(ego_idx, ego, &vehicles, &edge_lane_vehicles, map);
