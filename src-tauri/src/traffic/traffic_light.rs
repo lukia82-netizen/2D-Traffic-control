@@ -24,6 +24,7 @@ impl LightPhase {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct LightStateUpdate {
     pub intersection_id: u64,
     pub phase: u8,
@@ -55,14 +56,35 @@ pub struct TrafficLight {
 
 impl TrafficLight {
     pub fn new(intersection_id: u64) -> Self {
+        // Stagger initial phase so not all lights are red simultaneously.
+        // Use intersection_id as a deterministic seed (no rand crate needed).
+        let green_duration  = 30.0_f32;
+        let yellow_duration = 3.0_f32;
+        let red_duration    = 30.0_f32;
+        let cycle           = green_duration + yellow_duration + red_duration; // 63 s
+        // Cheap hash: mix bits of the id
+        let seed = intersection_id
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let offset = (seed % 1_000_000) as f32 / 1_000_000.0 * cycle;
+
+        // Determine which phase we start in
+        let (current_phase, phase_timer) = if offset < green_duration {
+            (LightPhase::Green, offset)
+        } else if offset < green_duration + yellow_duration {
+            (LightPhase::Yellow, offset - green_duration)
+        } else {
+            (LightPhase::Red, offset - green_duration - yellow_duration)
+        };
+
         TrafficLight {
             intersection_id,
             mode: LightControlMode::Auto,
-            current_phase: LightPhase::Red,
-            phase_timer: 0.0,
-            green_duration: 30.0,
-            yellow_duration: 3.0,
-            red_duration: 30.0,
+            current_phase,
+            phase_timer,
+            green_duration,
+            yellow_duration,
+            red_duration,
             queue_count: 0,
         }
     }

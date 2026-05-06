@@ -86,14 +86,21 @@ export interface MapData {
 // ─── Typed invoke wrappers ────────────────────────────────────────────────────
 
 /**
- * Request Rust to parse the PBF file for the given bbox and return graph data.
+ * Request Rust to build and return map data.
  * bbox: [west, south, east, north]
+ *
+ * forceSandbox: when provided, skip Overpass and build the sandbox grid.
+ *   Values: 'mixed' | 'one_lane' | 'two_lane' | 'three_lane'
+ *   Pass null/undefined to use the real OSM map.
  */
 export async function loadMap(
   bbox: [number, number, number, number],
+  forceSandbox?: string | null,
 ): Promise<MapData> {
-  // Pass bbox as [west, south, east, north] array — Rust receives [f64; 4]
-  return invoke<MapData>('load_map', { bbox });
+  return invoke<MapData>('load_map', {
+    bbox,
+    forceSandbox: forceSandbox ?? null,
+  });
 }
 
 /**

@@ -34,6 +34,8 @@ pub struct SpawnSystem {
     pub speed_config: SpeedConfig,
     /// Hard cap on total non-tram vehicles (configurable at runtime)
     pub max_vehicles: usize,
+    /// When true, always spawn `Car` (one size for sandbox/demo maps).
+    pub sandbox_mode: bool,
 }
 
 impl SpawnSystem {
@@ -41,6 +43,7 @@ impl SpawnSystem {
         spawn_points: Vec<NodeIndex>,
         boundary_nodes: Vec<NodeIndex>,
         speed_config: SpeedConfig,
+        sandbox_mode: bool,
     ) -> Self {
         SpawnSystem {
             spawn_points,
@@ -51,6 +54,7 @@ impl SpawnSystem {
             next_id: 1,
             speed_config,
             max_vehicles: DEFAULT_MAX_VEHICLES,
+            sandbox_mode,
         }
     }
 
@@ -306,6 +310,9 @@ impl SpawnSystem {
     // ── Randomisers ───────────────────────────────────────────────────────────
 
     fn random_vehicle_type(&mut self) -> VehicleType {
+        if self.sandbox_mode {
+            return VehicleType::Car;
+        }
         let roll: f32 = self.rng.gen();
         if roll < 0.70      { VehicleType::Car   }
         else if roll < 0.85 { VehicleType::Van   }

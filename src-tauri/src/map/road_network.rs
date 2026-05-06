@@ -101,29 +101,45 @@ pub struct MapData {
     pub restrictions: Vec<TurnRestriction>,
     /// Tram network (empty when no tram data in OSM).
     pub tram_data: TramData,
+    /// True when this is the built-in sandbox demo map (3×3 grid).
+    /// The spawn system uses this to restrict vehicles to a single type.
+    pub is_sandbox: bool,
 }
 
 // ── Demo network ─────────────────────────────────────────────────────────────
 
 /// Build a simple 5×5 grid road network centred on Kraków.
 /// Used as a fallback when the Overpass API is not reachable.
-pub fn build_demo_road_network() -> MapData {
-    const CX: f64 = 19.940;
-    const CY: f64 = 50.060;
-    const STEP_LNG: f64 = 0.004;
-    const STEP_LAT: f64 = 0.003;
-    const COLS: usize = 5;
-    const ROWS: usize = 5;
+/// Build the **sandbox** 3×3 grid road network centred on Kraków.
+///
+/// `grid_type` selects the lane layout:
+///
+/// | value         | horizontal lanes | vertical lanes |
+/// |---|---|---|
+/// | `"mixed"`     | row+1 (1/2/3)    | col+1 (1/2/3)  |
+/// | `"one_lane"`  | 1                | 1              |
+/// | `"two_lane"`  | 2                | 2              |
+/// | `"three_lane"`| 3                | 3              |
+///
+/// All roads bidirectional, all intersections = TrafficLight.
+pub fn build_demo_road_network(grid_type: &str) -> MapData {
+    const CX: f64 = 19.940;        // centre longitude (Kraków)
+    const CY: f64 = 50.060;        // centre latitude
+    const STEP_LNG: f64 = 0.0055;  // ≈ 400 m east–west at 50°N
+    const STEP_LAT: f64 = 0.0036;  // ≈ 400 m north–south
+    const COLS: usize = 3;
+    const ROWS: usize = 3;
 
     let mut graph = RoadGraph::new();
     let mut node_index_map: HashMap<u64, NodeIndex> = HashMap::new();
 
     let nid = |r: usize, c: usize| -> u64 { (r * COLS + c) as u64 };
 
+    // Create 9 intersection nodes
     for r in 0..ROWS {
         for c in 0..COLS {
-            let lat = CY + (r as f64 - (ROWS / 2) as f64) * STEP_LAT;
-            let lng = CX + (c as f64 - (COLS / 2) as f64) * STEP_LNG;
+            let lat = CY + (r as f64 - 1.0) * STEP_LAT;
+            let lng = CX + (c as f64 - 1.0) * STEP_LNG;
             let idx = graph.add_node(RoadNode {
                 osm_id: nid(r, c),
                 lat,
@@ -134,56 +150,95 @@ pub fn build_demo_road_network() -> MapData {
         }
     }
 
-    let add_edge = |graph: &mut RoadGraph, a: NodeIndex, b: NodeIndex| {
-        let src = &graph[a];
-        let tgt = &graph[b];
-        let length_m = haversine_distance_m(src.lat, src.lng, tgt.lat, tgt.lng);
+    // Adds one bidirectional road segment with the given lane count.
+    let add_road = |graph: &mut RoadGraph,
+                    a: NodeIndex,
+                    b: NodeIndex,
+                    lanes: u8,
+                    max_speed_kmh: f32,
+                    road_type: &str| {
+        let length_m = {
+            let src = &graph[a];
+            let tgt = &graph[b];
+            haversine_distance_m(src.lat, src.lng, tgt.lat, tgt.lng)
+        };
+        let max_speed = max_speed_kmh / 3.6;
         let edge = RoadEdge {
             osm_id: 0,
-            lanes: 2,
-            max_speed: 50.0 / 3.6,
+            lanes,
+            max_speed,
             oneway: false,
             infra_type: InfraType::Normal,
             layer: 0,
             length_m,
-            lane_directions: build_lane_directions(2),
+            lane_directions: build_lane_directions(lanes),
             decision_points: [length_m * 0.25, length_m * 0.5, length_m * 0.75],
-            road_type: "residential".to_string(),
+            road_type: road_type.to_string(),
             has_tram_track: false,
         };
         let rev = RoadEdge {
-            lane_directions: build_lane_directions_reversed(2),
+            lane_directions: build_lane_directions_reversed(lanes),
             ..edge.clone()
         };
         graph.add_edge(a, b, edge);
         graph.add_edge(b, a, rev);
     };
 
+    // Helper: resolve lane count for a given axis index.
+    let resolve_lanes = |idx: usize| -> u8 {
+        match grid_type {
+            "one_lane"   => 1,
+            "two_lane"   => 2,
+            "three_lane" => 3,
+            _            => (idx + 1) as u8, // "mixed": row/col index + 1
+        }
+    };
+    let spec = |lanes: u8| -> (f32, &'static str) {
+        match lanes {
+            1 => (50.0_f32, "tertiary"),
+            2 => (70.0_f32, "secondary"),
+            _ => (70.0_f32, "primary"),
+        }
+    };
+
+    // Horizontal segments — lanes determined by row (or grid_type override)
     for r in 0..ROWS {
+        let lanes = resolve_lanes(r);
+        let (speed_kmh, road_type) = spec(lanes);
         for c in 0..(COLS - 1) {
             let a = node_index_map[&nid(r, c)];
             let b = node_index_map[&nid(r, c + 1)];
-            add_edge(&mut graph, a, b);
+            add_road(&mut graph, a, b, lanes, speed_kmh, road_type);
         }
     }
-    for r in 0..(ROWS - 1) {
-        for c in 0..COLS {
+
+    // Vertical segments — lanes determined by col (or grid_type override)
+    for c in 0..COLS {
+        let lanes = resolve_lanes(c);
+        let (speed_kmh, road_type) = spec(lanes);
+        for r in 0..(ROWS - 1) {
             let a = node_index_map[&nid(r, c)];
             let b = node_index_map[&nid(r + 1, c)];
-            add_edge(&mut graph, a, b);
+            add_road(&mut graph, a, b, lanes, speed_kmh, road_type);
         }
     }
 
     let bbox = compute_bbox(&graph);
-    let spawn_points = find_spawn_points(&graph, &bbox);
-    let boundary_nodes = find_boundary_nodes(&graph, &bbox);
+
+    // All 9 nodes are spawn points (each is a junction)
+    let spawn_points: Vec<NodeIndex> = graph.node_indices().collect();
+
+    // Boundary nodes = the 8 outer nodes (all except centre (1,1))
+    let centre_id = nid(1, 1);
+    let boundary_nodes: Vec<NodeIndex> = graph
+        .node_indices()
+        .filter(|&idx| graph[idx].osm_id != centre_id)
+        .collect();
 
     log::info!(
-        "Built DEMO road grid: {} nodes, {} edges, {} spawn points, {} boundary nodes",
+        "Built SANDBOX 3×3 grid: {} nodes, {} directed edges, 1/2/3-lane roads",
         graph.node_count(),
         graph.edge_count(),
-        spawn_points.len(),
-        boundary_nodes.len()
     );
 
     let tram_data = TramData {
@@ -202,6 +257,7 @@ pub fn build_demo_road_network() -> MapData {
         od_buildings: Vec::new(),
         restrictions: Vec::new(),
         tram_data,
+        is_sandbox: true,
     }
 }
 
@@ -307,6 +363,32 @@ pub fn build_road_network(osm_data: OsmData) -> MapData {
         }
     }
 
+    // ── Demote mid-road TrafficLight nodes to Plain ───────────────────────────
+    // A real signalised intersection is where ≥ 2 distinct OSM ways meet.
+    // Pedestrian crossings and standalone `highway=traffic_signals` nodes that
+    // sit in the middle of a single way should not show signal heads.
+    {
+        use std::collections::HashSet;
+        let mut ways_per_node: HashMap<NodeIndex, HashSet<u64>> = HashMap::new();
+        for edge_idx in graph.edge_indices() {
+            if let (Some(w), Some((from, to))) = (
+                graph.edge_weight(edge_idx).map(|e| e.osm_id),
+                graph.edge_endpoints(edge_idx),
+            ) {
+                ways_per_node.entry(from).or_default().insert(w);
+                ways_per_node.entry(to).or_default().insert(w);
+            }
+        }
+        for node_idx in graph.node_indices() {
+            if matches!(graph[node_idx].intersection_type, IntersectionType::TrafficLight) {
+                let way_count = ways_per_node.get(&node_idx).map(|s| s.len()).unwrap_or(0);
+                if way_count < 2 {
+                    graph[node_idx].intersection_type = IntersectionType::Plain;
+                }
+            }
+        }
+    }
+
     let bbox           = compute_bbox(&graph);
     let spawn_points   = find_spawn_points(&graph, &bbox);
     let boundary_nodes = find_boundary_nodes(&graph, &bbox);
@@ -341,6 +423,7 @@ pub fn build_road_network(osm_data: OsmData) -> MapData {
         od_buildings,
         restrictions,
         tram_data,
+        is_sandbox: false,
     }
 }
 
@@ -371,9 +454,7 @@ fn determine_intersection_type(tags: &HashMap<String, String>) -> IntersectionTy
     if tags.contains_key("traffic_signals") {
         return IntersectionType::TrafficLight;
     }
-    if tags.get("highway").map(String::as_str) == Some("crossing") {
-        return IntersectionType::TrafficLight;
-    }
+    // highway=crossing is a pedestrian crossing — not a car traffic signal.
     IntersectionType::Plain
 }
 

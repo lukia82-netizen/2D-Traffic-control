@@ -145,6 +145,8 @@ export class Game {
   private sandboxUI: SandboxUI | null = null;
   private vehiclesVisible = true;
   private currentBbox: [number, number, number, number] = DEFAULT_BBOX;
+  /** null = OSM map; string = sandbox grid type ('mixed'|'one_lane'|…) */
+  private currentGridMode: string | null = 'mixed';
 
   constructor(map: maplibregl.Map, overlay: PixiOverlay) {
     this.map = map;
@@ -244,7 +246,11 @@ export class Game {
         center[0] + dLng, lat + dLat,
       ];
       const cityName = CITY_PRESETS.find(c => c.center[0] === center[0] && c.center[1] === center[1])?.name ?? 'Custom';
-      this.reloadMap(bbox, sizeM, cityName);
+      this.reloadMap(bbox, sizeM, cityName, this.currentGridMode);
+    };
+
+    ui.onMapModeChange = (forceSandbox) => {
+      this.currentGridMode = forceSandbox;
     };
 
     ui.onOsmModeToggle = (enabled) => {
@@ -277,7 +283,7 @@ export class Game {
   private async loadMapData(): Promise<void> {
     this.uiRenderer.showNotification('Loading map data…', 'info');
     try {
-      this.mapData = await loadMap(this.currentBbox);
+      this.mapData = await loadMap(this.currentBbox, this.currentGridMode);
       this.uiRenderer.showNotification(
         `Map loaded – ${this.mapData.nodes.length} nodes, ${this.mapData.edges.length} edges`,
         'info',
@@ -310,14 +316,18 @@ export class Game {
     bbox: [number, number, number, number],
     sizeM: number,
     cityName: string,
+    forceSandbox?: string | null,
   ): Promise<void> {
     this.currentBbox = bbox;
     this.vehicles.clear();
 
-    this.uiRenderer.showNotification(`Reloading map – ${cityName} ${sizeM >= 1000 ? sizeM / 1000 + ' km' : sizeM + ' m'}…`, 'info');
+    const modeLabel = forceSandbox
+      ? `Siatka (${forceSandbox})`
+      : `${cityName} ${sizeM >= 1000 ? sizeM / 1000 + ' km' : sizeM + ' m'}`;
+    this.uiRenderer.showNotification(`Przeładowanie – ${modeLabel}…`, 'info');
 
     try {
-      this.mapData = await loadMap(bbox);
+      this.mapData = await loadMap(bbox, forceSandbox);
       this.uiRenderer.showNotification(
         `Map reloaded – ${this.mapData.nodes.length} nodes, ${this.mapData.edges.length} edges`,
         'info',

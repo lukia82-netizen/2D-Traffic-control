@@ -29,6 +29,20 @@ export type MapBgToggleCb    = (visible: boolean) => void;
 /** center = [lng, lat], sizeM = metres per side */
 export type ReloadMapCb        = (center: [number, number], sizeM: number) => void;
 export type MaxVehiclesCb      = (count: number) => void;
+/**
+ * Called when the user changes the map/grid mode.
+ * null  = use real OSM map
+ * string = sandbox grid type: 'mixed' | 'one_lane' | 'two_lane' | 'three_lane'
+ */
+export type MapModeCb = (forceSandbox: string | null) => void;
+
+/** Grid type label, value, and colour hint. */
+const GRID_TYPES = [
+  { label: 'Mieszana',  value: 'mixed',       hint: '1/2/3 pasy' },
+  { label: '1 pas',     value: 'one_lane',    hint: 'tertiary 50' },
+  { label: '2 pasy',    value: 'two_lane',    hint: 'secondary 70' },
+  { label: '3 pasy',    value: 'three_lane',  hint: 'primary 70' },
+] as const;
 
 // ─── City & size presets ─────────────────────────────────────────────────────
 
@@ -72,6 +86,13 @@ export class SandboxUI {
   private statFps!: HTMLElement;
   private readonly swatches: Map<string, HTMLElement> = new Map();
 
+  // Grid / map-mode state
+  private mapMode: 'osm' | 'sandbox' = 'sandbox';
+  private selectedGridType = 'mixed';
+  private gridTypeBtns: Map<string, HTMLButtonElement> = new Map();
+  private gridSubsection!: HTMLElement;
+  private mapModeBtns: Map<string, HTMLButtonElement> = new Map();
+
   // Callbacks wired by game.ts
   onLayerToggle:       LayerToggleCb    = () => undefined;
   onOsmModeToggle:     OsmModeCb        = () => undefined;
@@ -80,6 +101,8 @@ export class SandboxUI {
   onMapBgToggle:       MapBgToggleCb    = () => undefined;
   onReloadMap:         ReloadMapCb      = () => undefined;
   onMaxVehiclesChange: MaxVehiclesCb    = () => undefined;
+  /** Fires when the user changes the map/grid mode. Triggers on selection (not on reload). */
+  onMapModeChange:     MapModeCb        = () => undefined;
 
   constructor() {
     this.panel = this.buildPanel();
@@ -112,6 +135,7 @@ export class SandboxUI {
     panel.className = 'sandbox-panel';
 
     panel.appendChild(this.buildHeader());
+    panel.appendChild(this.buildMapModeSection());   // ← NEW: OSM vs Sandbox grid
     panel.appendChild(this.buildAreaSection());
     panel.appendChild(this.buildMaxVehiclesSection());
     panel.appendChild(this.buildViewModeSection());
@@ -127,6 +151,61 @@ export class SandboxUI {
     h.className = 'sbx-header';
     h.innerHTML = `<span class="sbx-badge">SANDBOX</span>`;
     return h;
+  }
+
+  // ── Map / grid mode selector ─────────────────────────────────────────────
+
+  /** Returns the current forceSandbox value (null = OSM, string = grid type). */
+  get currentForceSandbox(): string | null {
+    return this.mapMode === 'sandbox' ? this.selectedGridType : null;
+  }
+
+  private buildMapModeSection(): HTMLElement {
+    const sec = this.makeSection('TRYB MAPY');
+
+    // Row 1: OSM Map vs Sandbox Grid toggle
+    const modeRow = document.createElement('div');
+    modeRow.className = 'sbx-toggle-row';
+
+    const makeModeBtn = (id: string, label: string): HTMLButtonElement => {
+      const btn = document.createElement('button');
+      btn.className = 'sbx-view-btn' + (id === this.mapMode ? ' active' : '');
+      btn.textContent = label;
+      btn.addEventListener('click', () => {
+        this.mapMode = id as 'osm' | 'sandbox';
+        this.mapModeBtns.forEach((b, k) => b.classList.toggle('active', k === id));
+        this.gridSubsection.style.display = id === 'sandbox' ? '' : 'none';
+        this.onMapModeChange(this.currentForceSandbox);
+      });
+      this.mapModeBtns.set(id, btn);
+      return btn;
+    };
+
+    modeRow.appendChild(makeModeBtn('osm',     'OSM Mapa'));
+    modeRow.appendChild(makeModeBtn('sandbox', 'Siatka Demo'));
+    sec.appendChild(modeRow);
+
+    // Row 2: Grid type buttons (visible only in sandbox mode)
+    this.gridSubsection = document.createElement('div');
+    this.gridSubsection.className = 'sbx-toggle-row sbx-grid-row';
+    this.gridSubsection.style.display = this.mapMode === 'sandbox' ? '' : 'none';
+
+    for (const gt of GRID_TYPES) {
+      const btn = document.createElement('button');
+      btn.className = 'sbx-grid-btn' + (gt.value === this.selectedGridType ? ' active' : '');
+      btn.textContent = gt.label;
+      btn.title = gt.hint;
+      btn.addEventListener('click', () => {
+        this.selectedGridType = gt.value;
+        this.gridTypeBtns.forEach((b, k) => b.classList.toggle('active', k === gt.value));
+        this.onMapModeChange(this.currentForceSandbox);
+      });
+      this.gridTypeBtns.set(gt.value, btn);
+      this.gridSubsection.appendChild(btn);
+    }
+
+    sec.appendChild(this.gridSubsection);
+    return sec;
   }
 
   // ── Area / city selector ─────────────────────────────────────────────────

@@ -55,12 +55,21 @@ pub fn run_simulation(
         let map   = guard.as_ref().expect("map must be loaded before starting simulation");
 
         let intersections = IntersectionManager::from_graph(&map.graph);
+
+        // Send all initial light states so the frontend shows the correct
+        // staggered phases immediately (instead of defaulting everything to Red).
+        let initial_states = intersections.all_state_updates();
+        if !initial_states.is_empty() {
+            let _ = app_handle.emit("light_state_change", &initial_states);
+        }
+
         let speed_config  = SpeedConfig::default();
 
         let spawn = SpawnSystem::new(
             map.spawn_points.clone(),
             map.boundary_nodes.clone(),
             speed_config,
+            map.is_sandbox,
         );
         let od = OdModel::new(
             map.od_buildings.clone(),
