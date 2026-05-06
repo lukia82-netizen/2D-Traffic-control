@@ -8,6 +8,7 @@ use crate::map::road_network::MapData;
 use crate::simulation::od_model::{OdModel, TripKind};
 use crate::simulation::pathfinding::{find_path, random_destination, REF_SPEED_MS};
 use crate::simulation::speed_config::SpeedConfig;
+use crate::simulation::lane_change::compute_vehicle_target_lane;
 use crate::vehicles::vehicle::Vehicle;
 use crate::vehicles::types::VehicleType;
 use crate::vehicles::driver::DriverProfile;
@@ -127,7 +128,7 @@ impl SpawnSystem {
         let id    = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
 
-        Some(Vehicle::new(
+        let mut vehicle = Vehicle::new(
             id,
             node.lat,
             node.lng,
@@ -137,7 +138,13 @@ impl SpawnSystem {
             personal_compliance,
             route_alpha,
             trip_kind as u8,
-        ))
+        );
+        // Set the initial target lane based on the first planned turn.
+        let initial_target = compute_vehicle_target_lane(&vehicle, map);
+        vehicle.target_lane  = initial_target;
+        vehicle.current_lane = initial_target;
+
+        Some(vehicle)
     }
 
     /// Tick with explicit game hour for OD model trip-type selection.
@@ -209,7 +216,7 @@ impl SpawnSystem {
         let id   = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
 
-        Some(Vehicle::new(
+        let mut vehicle = Vehicle::new(
             id,
             node.lat,
             node.lng,
@@ -219,7 +226,12 @@ impl SpawnSystem {
             personal_compliance,
             route_alpha,
             trip_kind as u8,
-        ))
+        );
+        let initial_target = compute_vehicle_target_lane(&vehicle, map);
+        vehicle.target_lane  = initial_target;
+        vehicle.current_lane = initial_target;
+
+        Some(vehicle)
     }
 
     // ── OD strategies ─────────────────────────────────────────────────────────

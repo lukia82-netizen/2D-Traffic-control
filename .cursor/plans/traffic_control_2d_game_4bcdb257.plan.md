@@ -10,10 +10,10 @@ todos:
     status: completed
   - id: phase3-intersections
     content: "Faza 3: Skrzyżowania (FSM świateł), znaki, pierwszeństwo, strzałki pasów - logika Rust + rendering PixiJS"
-    status: pending
+    status: completed
   - id: phase4-ai
     content: "Faza 4: AI kierowców - profile, lane change model (25/50/75%), respektowanie przepisów - Rust"
-    status: pending
+    status: completed
   - id: phase5-lights-control
     content: "Faza 5: Tryby sterowania światłami (ręczny, półauto, auto, adaptacyjny) - Tauri commands + UI"
     status: pending

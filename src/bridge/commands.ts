@@ -26,6 +26,8 @@ export interface EdgeData {
   layer: number;
   lengthM: number;
   roadType: string;
+  /** Per-lane turn directions: "left" | "straight" | "right" | "uturn" */
+  laneDirections: string[];
 }
 
 export interface BuildingData {

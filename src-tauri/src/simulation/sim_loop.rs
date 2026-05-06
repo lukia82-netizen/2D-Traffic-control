@@ -6,7 +6,7 @@ use rayon::prelude::*;
 use tauri::ipc::Channel;
 use base64::Engine;
 
-use crate::map::road_network::MapData;
+use crate::map::road_network::{MapData, IntersectionType};
 use crate::state::SimCommand;
 use crate::time::game_clock::GameClock;
 use crate::time::day_cycle::DayCycle;
@@ -15,7 +15,7 @@ use crate::vehicles::vehicle::Vehicle;
 use crate::simulation::idm::idm_acceleration;
 use crate::simulation::spatial_grid::SpatialGrid;
 use crate::simulation::spawn::SpawnSystem;
-use crate::simulation::lane_change::decide_lane_change;
+use crate::simulation::lane_change::{decide_lane_change, compute_vehicle_target_lane};
 use crate::simulation::congestion::{compute_congestion, CongestionData};
 use crate::simulation::od_model::OdModel;
 use crate::simulation::speed_config::SpeedConfig;
@@ -25,11 +25,6 @@ use crate::traffic::traffic_light::LightStateUpdate;
 const TARGET_TICK_S: f32 = 1.0 / 60.0;
 const GRID_CELL_DEG: f64 = 0.00045;
 const CONGESTION_INTERVAL_S: f32 = 0.5;
-
-/// High frustration level that triggers game-over candidate window.
-const GAME_OVER_AVG_THRESHOLD: f32 = 80.0;
-/// Real seconds frustration must stay above threshold to lose.
-const GAME_OVER_DURATION_S: f32 = 30.0;
 
 pub fn run_simulation(
     graph_lock: Arc<RwLock<Option<MapData>>>,
@@ -137,6 +132,11 @@ pub fn run_simulation(
         }
 
         // ── Parallel IDM ─────────────────────────────────────────────────────
+        // Snapshot tram positions once so the parallel IDM can read them.
+        let tram_snapshot: Vec<(f64, f64, f32)> = tram_sim.trams.iter()
+            .map(|t| (t.lat, t.lng, t.speed))
+            .collect();
+
         let accel_inputs: Vec<f32> = {
             let guard = graph_lock.read();
             if let Some(map) = guard.as_ref() {
@@ -156,9 +156,13 @@ pub fn run_simulation(
                             None => (1000.0, 0.0),
                         };
 
+                        // Also check trams as potential obstacles (shared track).
+                        let (gap, delta_v) =
+                            apply_tram_leader_effect(v, gap, delta_v, &tram_snapshot);
+
                         let desired = compute_desired_speed(v, map);
                         let (gap, delta_v) =
-                            apply_traffic_light_effect(v, gap, delta_v, &intersections, map);
+                            apply_intersection_effect(v, gap, delta_v, &intersections, map);
 
                         let params = v.driver_profile.params();
                         let vtype  = v.vehicle_type.params();
@@ -351,7 +355,12 @@ fn compute_desired_speed(vehicle: &Vehicle, map: &MapData) -> f32 {
     v0_road.min(vtype_max)
 }
 
-fn apply_traffic_light_effect(
+/// Apply traffic-light, stop-sign, and yield-sign braking effect.
+///
+/// - **Traffic light (red/yellow):** treat the stop-line as a stationary obstacle.
+/// - **Stop sign:** slow to zero if not yet stopped; once stopped, allow proceed.
+/// - **Yield sign:** cap approach speed to a low value within 20 m.
+fn apply_intersection_effect(
     vehicle: &Vehicle,
     gap: f32,
     delta_v: f32,
@@ -365,15 +374,16 @@ fn apply_traffic_light_effect(
         None    => return (gap, delta_v),
     };
     let dist_to_end = edge.length_m * (1.0 - vehicle.edge_progress);
-    if dist_to_end > 30.0 { return (gap, delta_v); }
 
-    let target_osm_id = map
-        .graph
-        .edge_endpoints(edge_idx)
-        .map(|(_, tgt)| map.graph[tgt].osm_id);
+    let (tgt_node_idx, tgt_osm_id) = match map.graph.edge_endpoints(edge_idx) {
+        Some((_, tgt)) => (tgt, map.graph[tgt].osm_id),
+        None           => return (gap, delta_v),
+    };
+    let intersection_type = &map.graph[tgt_node_idx].intersection_type;
 
-    if let Some(osm_id) = target_osm_id {
-        if !intersections.can_proceed(osm_id) {
+    // ── Traffic light ──────────────────────────────────────────────────────
+    if matches!(intersection_type, IntersectionType::TrafficLight) {
+        if dist_to_end <= 30.0 && !intersections.can_proceed(tgt_osm_id) {
             let vgap = dist_to_end.max(0.1);
             let vdv  = vehicle.speed;
             let new_gap = vgap.min(gap);
@@ -381,7 +391,65 @@ fn apply_traffic_light_effect(
             return (new_gap, new_dv);
         }
     }
+
+    // ── Stop sign ──────────────────────────────────────────────────────────
+    // Must decelerate to full stop within 8 m of the stop line.
+    // `has_stopped_at_stop_sign` is set by `apply_vehicle_physics` once the
+    // vehicle reaches speed < 0.3 m/s.  After stopping, the vehicle may proceed.
+    if matches!(intersection_type, IntersectionType::Stop) {
+        if dist_to_end <= 15.0 && !vehicle.has_stopped_at_stop_sign {
+            let vgap = dist_to_end.max(0.1);
+            let new_gap = vgap.min(gap);
+            let new_dv  = vehicle.speed;
+            return (new_gap, new_dv);
+        }
+    }
+
+    // ── Yield / give-way sign ──────────────────────────────────────────────
+    // Slow to ≤ 5 km/h (1.39 m/s) within 20 m of the junction.
+    if matches!(intersection_type, IntersectionType::Yield) {
+        const YIELD_SPEED: f32 = 1.39; // 5 km/h
+        if dist_to_end <= 20.0 && vehicle.speed > YIELD_SPEED {
+            // Treat the junction entry as a slow virtual leader.
+            let virtual_gap = dist_to_end.max(0.5);
+            let virtual_dv  = vehicle.speed - YIELD_SPEED;
+            let new_gap = virtual_gap.min(gap);
+            let new_dv  = if new_gap < gap { virtual_dv } else { delta_v };
+            return (new_gap, new_dv);
+        }
+    }
+
     (gap, delta_v)
+}
+
+/// Check nearby trams as potential IDM obstacles.
+/// Uses a simple proximity scan since there are typically very few trams (< 20).
+/// `trams` is a Vec of (lat, lng, speed) snapshots.
+fn apply_tram_leader_effect(
+    vehicle: &Vehicle,
+    gap: f32,
+    delta_v: f32,
+    trams: &[(f64, f64, f32)],
+) -> (f32, f32) {
+    const TRAM_LENGTH_M: f32 = 20.0;
+    let mut best_gap = gap;
+    let mut best_dv  = delta_v;
+
+    for &(tlat, tlng, tspeed) in trams {
+        let dist = geo_dist_approx(vehicle.lat, vehicle.lng, tlat, tlng) - TRAM_LENGTH_M;
+        let dist = dist.max(0.1);
+
+        // Only treat a tram as our leader if it is in front of us and close.
+        if dist < best_gap && dist < 150.0 {
+            let dv = vehicle.speed - tspeed;
+            if dv > 0.0 || dist < 20.0 {
+                best_gap = dist;
+                best_dv  = dv;
+            }
+        }
+    }
+
+    (best_gap, best_dv)
 }
 
 fn apply_vehicle_physics(
@@ -446,6 +514,24 @@ fn apply_vehicle_physics(
         return;
     }
 
+    // ── Stop-sign: mark when fully stopped near the stop line ─────────────
+    if !vehicle.has_stopped_at_stop_sign && vehicle.speed < 0.3 {
+        if vehicle.route_pos < vehicle.route.len() {
+            let edge_idx = vehicle.route[vehicle.route_pos];
+            if let Some((_, tgt)) = map.graph.edge_endpoints(edge_idx) {
+                if matches!(map.graph[tgt].intersection_type, IntersectionType::Stop) {
+                    let dist_to_end = map.graph
+                        .edge_weight(edge_idx)
+                        .map(|e| e.length_m * (1.0 - vehicle.edge_progress))
+                        .unwrap_or(f32::MAX);
+                    if dist_to_end <= 15.0 {
+                        vehicle.has_stopped_at_stop_sign = true;
+                    }
+                }
+            }
+        }
+    }
+
     // ── Lane change cooldown ───────────────────────────────────────────────
     if vehicle.lane_change_cooldown > 0.0 {
         vehicle.lane_change_cooldown = (vehicle.lane_change_cooldown - real_dt_s).max(0.0);
@@ -475,13 +561,17 @@ fn apply_vehicle_physics(
     }
 
     if vehicle.edge_progress >= 1.0 {
-        vehicle.route_pos    += 1;
-        vehicle.edge_progress = 0.0;
+        vehicle.route_pos             += 1;
+        vehicle.edge_progress          = 0.0;
+        vehicle.has_stopped_at_stop_sign = false; // reset for next edge
 
         if vehicle.route_pos >= vehicle.route.len() {
             vehicle.despawned = true;
             return;
         }
+
+        // Recompute which lane to target based on the upcoming turn.
+        vehicle.target_lane = compute_vehicle_target_lane(vehicle, map);
     }
 
     // Interpolate position

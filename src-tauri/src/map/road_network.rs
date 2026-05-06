@@ -52,6 +52,9 @@ pub struct RoadEdge {
     pub decision_points: [f32; 3],
     /// OSM highway tag value: "primary", "residential", etc.
     pub road_type: String,
+    /// True when at least one lane of this edge is shared with a tram track.
+    /// Vehicles must not change into tram-dedicated lanes on such edges.
+    pub has_tram_track: bool,
 }
 
 /// A building polygon represented as an ordered list of \[lat, lng\] vertices.
@@ -146,6 +149,7 @@ pub fn build_demo_road_network() -> MapData {
             lane_directions: build_lane_directions(2),
             decision_points: [length_m * 0.25, length_m * 0.5, length_m * 0.75],
             road_type: "residential".to_string(),
+            has_tram_track: false,
         };
         let rev = RoadEdge {
             lane_directions: build_lane_directions_reversed(2),
@@ -253,6 +257,8 @@ pub fn build_road_network(osm_data: OsmData) -> MapData {
             .map(|s| parse_turn_lanes(s))
             .unwrap_or_else(|| build_lane_directions(lanes));
         let road_type = highway_type.to_string();
+        // A way tagged with both highway and railway=tram is a shared tram/road segment.
+        let has_tram_track = tags.get("railway").map(String::as_str) == Some("tram");
 
         for window in way.node_refs.windows(2) {
             let from_id = window[0];
@@ -283,6 +289,7 @@ pub fn build_road_network(osm_data: OsmData) -> MapData {
                 lane_directions: lane_directions.clone(),
                 decision_points,
                 road_type: road_type.clone(),
+                has_tram_track,
             };
 
             match oneway {

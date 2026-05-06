@@ -6,7 +6,7 @@ use crate::state::{AppState, SimCommand, SimControl, LightControlMode};
 use crate::map::osm_loader::fetch_osm_data;
 use crate::map::road_network::{
     build_road_network, build_demo_road_network, MapData, IntersectionType, InfraType,
-    RestrictionKind,
+    LaneDirection, RestrictionKind,
 };
 use crate::simulation::sim_loop::run_simulation;
 use crate::simulation::congestion::CongestionData;
@@ -36,6 +36,8 @@ pub struct EdgeData {
     pub layer: i8,
     pub length_m: f32,
     pub road_type: String,
+    /// Per-lane direction hints: "left" | "straight" | "right" | "uturn"
+    pub lane_directions: Vec<String>,
 }
 
 /// Building DTO sent once at startup via `buildings_data` or `load_map` response.
@@ -230,6 +232,13 @@ fn build_map_response(map_data: &MapData) -> MapDataResponse {
         let edge     = edge_ref.weight();
         let from_node = &map_data.graph[edge_ref.source()];
         let to_node   = &map_data.graph[edge_ref.target()];
+        let lane_directions: Vec<String> = edge.lane_directions.iter().map(|d| match d {
+            LaneDirection::Left     => "left",
+            LaneDirection::Straight => "straight",
+            LaneDirection::Right    => "right",
+            LaneDirection::UTurn    => "uturn",
+        }.to_string()).collect();
+
         edges.push(EdgeData {
             from: from_node.osm_id,
             to: to_node.osm_id,
@@ -244,6 +253,7 @@ fn build_map_response(map_data: &MapData) -> MapDataResponse {
             layer: edge.layer,
             length_m: edge.length_m,
             road_type: edge.road_type.clone(),
+            lane_directions,
         });
     }
 

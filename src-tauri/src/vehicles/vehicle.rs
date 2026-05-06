@@ -59,6 +59,13 @@ pub struct Vehicle {
     /// Cooldown in real seconds before the next lane change is allowed.
     pub lane_change_cooldown: f32,
 
+    // ── Traffic law compliance ───────────────────────────────────────────────
+
+    /// Set to `true` once the vehicle has come to a full stop at a stop-sign
+    /// node at the end of the current edge.  Reset when the vehicle advances
+    /// to the next edge.
+    pub has_stopped_at_stop_sign: bool,
+
     /// Set to `true` when the vehicle has reached its destination.
     pub despawned: bool,
 }
@@ -99,6 +106,7 @@ impl Vehicle {
             current_lane: 0,
             target_lane: 0,
             lane_change_cooldown: 0.0,
+            has_stopped_at_stop_sign: false,
             despawned: false,
         }
     }

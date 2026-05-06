@@ -22,6 +22,7 @@ import { InfraRenderer } from './rendering/InfraRenderer';
 import { CongestionRenderer } from './rendering/CongestionRenderer';
 import { UIRenderer } from './rendering/UIRenderer';
 import { TrafficLightUI } from './traffic/TrafficLightUI';
+import { TrafficLightRenderer } from './rendering/TrafficLightRenderer';
 import { GameClockUI } from './time/GameClockUI';
 
 // Kraków Śródmieście – ~1 km × 1 km centred on Rynek Główny (19.9368, 50.0614)
@@ -60,8 +61,9 @@ function buildDemoMapData(): MapData {
   }
 
   const addEdgePair = (a: number, b: number): void => {
-    edges.push({ from: a, to: b, lanes: 2, maxSpeed: 50, oneway: false, infraType: 'normal', layer: 0, lengthM: 300, roadType: 'residential' });
-    edges.push({ from: b, to: a, lanes: 2, maxSpeed: 50, oneway: false, infraType: 'normal', layer: 0, lengthM: 300, roadType: 'residential' });
+    const dirs = ['left', 'straight'];
+    edges.push({ from: a, to: b, lanes: 2, maxSpeed: 50, oneway: false, infraType: 'normal', layer: 0, lengthM: 300, roadType: 'residential', laneDirections: dirs });
+    edges.push({ from: b, to: a, lanes: 2, maxSpeed: 50, oneway: false, infraType: 'normal', layer: 0, lengthM: 300, roadType: 'residential', laneDirections: ['straight', 'right'] });
   };
 
   for (let r = 0; r < ROWS; r++) {
@@ -107,6 +109,7 @@ export class Game {
   private congestionRenderer!: CongestionRenderer;
   private uiRenderer!: UIRenderer;
   private trafficLightUI!: TrafficLightUI;
+  private trafficLightRenderer!: TrafficLightRenderer;
   private gameClockUI!: GameClockUI;
 
   private mapData: MapData | null = null;
@@ -150,6 +153,7 @@ export class Game {
     );
     this.uiRenderer = new UIRenderer();
     this.trafficLightUI = new TrafficLightUI(this.map);
+    this.trafficLightRenderer = new TrafficLightRenderer(this.overlay, this.map);
     this.gameClockUI = new GameClockUI();
 
     // Init vehicle textures
@@ -176,6 +180,7 @@ export class Game {
         this.buildingRenderer.rebuildOnCameraChange(this.mapData);
         this.roadRenderer.rebuildOnCameraChange(this.mapData);
         this.infraRenderer.rebuildOnCameraChange(this.mapData);
+        this.trafficLightRenderer.rebuildOnCameraChange();
       }
     });
 
@@ -205,6 +210,7 @@ export class Game {
     this.roadRenderer.build(this.mapData);
     this.infraRenderer.buildStaticLayer(this.mapData);
     this.trafficLightUI.init(this.mapData.nodes);
+    this.trafficLightRenderer.init(this.mapData.nodes);
   }
 
   // ─── Event subscriptions ───────────────────────────────────────────────────
@@ -256,6 +262,7 @@ export class Game {
 
   private onLightStateChange(data: LightStateUpdate[]): void {
     this.trafficLightUI.updateLightState(data);
+    this.trafficLightRenderer.updateStates(data);
   }
 
   // ─── Main game loop ────────────────────────────────────────────────────────
@@ -305,6 +312,7 @@ export class Game {
     this.roadRenderer.destroy();
     this.vehicleRenderer.destroy();
     this.infraRenderer.destroy();
+    this.trafficLightRenderer.destroy();
     this.congestionRenderer.destroy();
   }
 }

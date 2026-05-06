@@ -12,6 +12,11 @@ const TUNNEL_ALPHA = 0.6;
 const BRIDGE_SHADOW_OFFSET = 4;
 const BRIDGE_SHADOW_ALPHA = 0.35;
 
+/** Minimum zoom to draw per-lane direction arrows. */
+const LANE_ARROW_MIN_ZOOM = 15;
+/** Fraction of edge length at which lane arrows are placed (near intersection end). */
+const LANE_ARROW_T = 0.75;
+
 // ─── InfraRenderer ───────────────────────────────────────────────────────────
 
 /**
@@ -36,6 +41,8 @@ export class InfraRenderer {
 
   /** O(1) node lookup, populated in buildStaticLayer(). */
   private nodeMap: Map<number, NodeData> = new Map();
+  /** Node intersection-type lookup for quick non-plain detection. */
+  private intersectionNodeIds: Set<number> = new Set();
 
   constructor(overlay: PixiOverlay, map: maplibregl.Map, camera: CameraManager) {
     this.overlay = overlay;
@@ -48,12 +55,17 @@ export class InfraRenderer {
   buildStaticLayer(mapData: MapData): void {
     // Build O(1) node lookup so we never use Array.find() per edge
     this.nodeMap.clear();
+    this.intersectionNodeIds.clear();
     for (const n of mapData.nodes) {
       this.nodeMap.set(n.id, n);
+      if (n.intersectionType !== 'plain') {
+        this.intersectionNodeIds.add(n.id);
+      }
     }
     this.rebuildMarkings(mapData);
     this.rebuildTunnelOverlay(mapData);
     this.rebuildArrows(mapData);
+    this.rebuildLaneArrows(mapData);
   }
 
   /** Must be called on map `render` so all markings follow camera pan / zoom. */
@@ -61,6 +73,7 @@ export class InfraRenderer {
     this.rebuildMarkings(mapData);
     this.rebuildTunnelOverlay(mapData);
     this.rebuildArrows(mapData);
+    this.rebuildLaneArrows(mapData);
   }
 
   /**
@@ -216,11 +229,138 @@ export class InfraRenderer {
     gfx.rect(x - 6, y - 4, 12, 8).fill({ color: 0x1a1a2e, alpha: 0.8 });
   }
 
+  // ─── Per-lane direction arrows near intersections ──────────────────────────
+
+  /**
+   * Draw small directional arrows (↑ straight, ↖ left, ↗ right) at ~75% along
+   * each edge that leads to a non-plain intersection node.
+   *
+   * Arrows are placed as live `Graphics` children of `overlay.arrowLayer`.
+   * They are regenerated on each camera change together with the one-way arrows.
+   *
+   * Only drawn at zoom ≥ LANE_ARROW_MIN_ZOOM.
+   */
+  private rebuildLaneArrows(mapData: MapData): void {
+    const zoom = this.map.getZoom();
+    if (zoom < LANE_ARROW_MIN_ZOOM) return;
+
+    const sz = Math.max(5, this.camera.getArrowSize() * 0.8);
+
+    for (const edge of mapData.edges) {
+      // Only draw arrows on edges that lead into a meaningful intersection
+      if (!this.intersectionNodeIds.has(edge.to)) continue;
+      if (!edge.laneDirections || edge.laneDirections.length === 0) continue;
+
+      const fromNode = this.nodeMap.get(edge.from);
+      const toNode   = this.nodeMap.get(edge.to);
+      if (!fromNode || !toNode) continue;
+
+      const from = projectPoint(this.map, fromNode.lng, fromNode.lat);
+      const to   = projectPoint(this.map, toNode.lng,   toNode.lat);
+
+      const dx     = to.x - from.x;
+      const dy     = to.y - from.y;
+      const segLen = Math.hypot(dx, dy);
+      if (segLen < 20) continue;   // too short to draw
+
+      const dirX = dx / segLen;
+      const dirY = dy / segLen;
+      // Perpendicular (right side)
+      const perpX = -dirY;
+      const perpY =  dirX;
+
+      // Position the arrow group at LANE_ARROW_T along the edge
+      const anchorX = from.x + dirX * segLen * LANE_ARROW_T;
+      const anchorY = from.y + dirY * segLen * LANE_ARROW_T;
+
+      const lanes = edge.laneDirections.length;
+      // Lane width in pixels – approximate from road overlay width
+      const laneW = Math.max(5, this.camera.getRoadOverlayWidth(lanes) / lanes);
+
+      // Centre offset: shift the lane group so it's centred on the road axis
+      const groupOffset = -(lanes - 1) * 0.5 * laneW;
+
+      for (let i = 0; i < lanes; i++) {
+        const lateralOffset = groupOffset + i * laneW;
+        const cx = anchorX + perpX * lateralOffset;
+        const cy = anchorY + perpY * lateralOffset;
+
+        const dir = edge.laneDirections[i] ?? 'straight';
+        const gfx = this.makeLaneArrowGlyph(dir, dirX, dirY, perpX, perpY, sz);
+        gfx.x = cx;
+        gfx.y = cy;
+        this.overlay.arrowLayer.addChild(gfx);
+      }
+    }
+  }
+
+  /**
+   * Create a small lane-direction glyph for a single lane.
+   *
+   * @param dir   "left" | "straight" | "right" | "uturn"
+   * @param dirX  Unit vector along the road (forward).
+   * @param dirY  Unit vector along the road (forward).
+   * @param perpX Perpendicular unit vector (right side of road).
+   * @param perpY Perpendicular unit vector (right side of road).
+   * @param sz    Half-size of the arrowhead in pixels.
+   */
+  private makeLaneArrowGlyph(
+    dir: string,
+    dirX: number,
+    dirY: number,
+    perpX: number,
+    perpY: number,
+    sz: number,
+  ): PIXI.Graphics {
+    const gfx  = new PIXI.Graphics();
+    const half = sz * 0.55;
+
+    switch (dir) {
+      case 'left': {
+        // Arrow pointing left (90° CCW from forward)
+        const lx = -perpX;
+        const ly = -perpY;
+        gfx
+          .moveTo(lx * sz,                    ly * sz)
+          .lineTo(-lx * sz + dirX * half,     -ly * sz + dirY * half)
+          .lineTo(-lx * sz - dirX * half,     -ly * sz - dirY * half)
+          .closePath()
+          .fill({ color: 0xffffff, alpha: 0.55 });
+        break;
+      }
+      case 'right': {
+        // Arrow pointing right (90° CW from forward)
+        const rx = perpX;
+        const ry = perpY;
+        gfx
+          .moveTo(rx * sz,                    ry * sz)
+          .lineTo(-rx * sz + dirX * half,     -ry * sz + dirY * half)
+          .lineTo(-rx * sz - dirX * half,     -ry * sz - dirY * half)
+          .closePath()
+          .fill({ color: 0xffffff, alpha: 0.55 });
+        break;
+      }
+      default: {
+        // Straight arrow (forward direction)
+        gfx
+          .moveTo(dirX * sz,                  dirY * sz)
+          .lineTo(-dirX * sz + perpX * half,  -dirY * sz + perpY * half)
+          .lineTo(-dirX * sz - perpX * half,  -dirY * sz - perpY * half)
+          .closePath()
+          .fill({ color: 0xffffff, alpha: 0.55 });
+        break;
+      }
+    }
+
+    return gfx;
+  }
+
   destroy(): void {
     this.staticSprite?.destroy();
     this.staticTexture?.destroy(true);
     this.tunnelSprite?.destroy();
     this.tunnelTexture?.destroy(true);
     this.nodeMap.clear();
+    this.intersectionNodeIds.clear();
   }
 }
