@@ -143,6 +143,9 @@ export class VehicleRenderer {
   // ── Frustration bubbles ──────────────────────────────────────────────────────
   /** Single Graphics object reused every frame to draw frustration bubbles */
   private bubbleGraphics: PIXI.Graphics | null = null;
+  /** Headlight cones drawn only in night mode. */
+  private headlightGraphics: PIXI.Graphics | null = null;
+  private nightMode = false;
 
   // ── Lerp smoothing (geo space + angle) ──────────────────────────────────────
   /** Smoothed geographic positions to eliminate flicker from IPC burst delivery */
@@ -232,6 +235,13 @@ export class VehicleRenderer {
     // Bubble graphics lives in the dedicated frustration layer (above vehicles)
     this.bubbleGraphics = new PIXI.Graphics();
     this.overlay.frustrationLayer.addChild(this.bubbleGraphics);
+    this.headlightGraphics = new PIXI.Graphics();
+    this.overlay.frustrationLayer.addChildAt(this.headlightGraphics, 0);
+  }
+
+  setNightMode(enabled: boolean): void {
+    this.nightMode = enabled;
+    if (!enabled) this.headlightGraphics?.clear();
   }
 
   // ─── Frame update ──────────────────────────────────────────────────────────
@@ -253,6 +263,7 @@ export class VehicleRenderer {
 
     // Draw frustration bubbles regardless of vehicle render mode
     this.renderFrustrationBubbles(vehicles);
+    this.renderHeadlights(vehicles);
   }
 
   // ─── Dot rendering ─────────────────────────────────────────────────────────
@@ -346,6 +357,45 @@ export class VehicleRenderer {
       gfx.circle(cx, cy, radius).fill({ color, alpha: 0.9 });
       // Tiny dot outline for visibility on light backgrounds
       gfx.circle(cx, cy, radius).stroke({ color: 0x000000, alpha: 0.3, width: 0.5 });
+    }
+  }
+
+  private renderHeadlights(vehicles: Map<number, VehicleState>): void {
+    const gfx = this.headlightGraphics;
+    if (!gfx) return;
+    gfx.clear();
+    if (!this.nightMode) return;
+
+    const bounds = this.map.getBounds();
+    for (const v of vehicles.values()) {
+      if (this.isVehicleHidden(v)) continue;
+      const smooth = this.geoSmoothed.get(v.id) ?? { lat: v.lat, lng: v.lng };
+      if (
+        smooth.lng < bounds.getWest() || smooth.lng > bounds.getEast() ||
+        smooth.lat < bounds.getSouth() || smooth.lat > bounds.getNorth()
+      ) continue;
+
+      const px = this.map.project([smooth.lng, smooth.lat]);
+      const angle = this.angleSmoothed.get(v.id) ?? v.angle;
+      const dirX = Math.sin(angle);
+      const dirY = -Math.cos(angle);
+      const perpX = -dirY;
+      const perpY = dirX;
+
+      const near = 5;
+      const far = 24;
+      const widthNear = 2;
+      const widthFar = 10;
+      const ax = px.x + dirX * near + perpX * widthNear;
+      const ay = px.y + dirY * near + perpY * widthNear;
+      const bx = px.x + dirX * near - perpX * widthNear;
+      const by = px.y + dirY * near - perpY * widthNear;
+      const cx = px.x + dirX * far - perpX * widthFar;
+      const cy = px.y + dirY * far - perpY * widthFar;
+      const dx = px.x + dirX * far + perpX * widthFar;
+      const dy = px.y + dirY * far + perpY * widthFar;
+
+      gfx.poly([ax, ay, bx, by, cx, cy, dx, dy]).fill({ color: 0xfff4ba, alpha: 0.16 });
     }
   }
 
@@ -546,6 +596,7 @@ export class VehicleRenderer {
   destroy(): void {
     this.dotGraphics?.destroy();
     this.bubbleGraphics?.destroy();
+    this.headlightGraphics?.destroy();
     for (const sprites of this.spritePools.values()) {
       for (const s of sprites) s.destroy();
     }
