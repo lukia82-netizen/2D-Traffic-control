@@ -74,6 +74,27 @@ pub struct Vehicle {
 
     /// Set to `true` when the vehicle has reached its destination.
     pub despawned: bool,
+
+    // ── Junction turn connector (Bezier) ────────────────────────────────────
+    /// True while the vehicle follows an invisible connector curve through a turn.
+    pub on_turn_connector: bool,
+    /// Normalized progress on the connector curve [0..1].
+    pub turn_t: f32,
+    /// Entry progress on the current edge where the connector starts.
+    pub turn_entry_progress: f32,
+    /// Exit progress on the next edge where the connector ends.
+    pub turn_exit_progress: f32,
+    /// Approximate connector length in meters (for speed->t conversion).
+    pub turn_length_m: f32,
+    /// Quadratic Bezier start point (lat/lng).
+    pub turn_p1_lat: f64,
+    pub turn_p1_lng: f64,
+    /// Quadratic Bezier control point (lat/lng).
+    pub turn_ctrl_lat: f64,
+    pub turn_ctrl_lng: f64,
+    /// Quadratic Bezier end point (lat/lng).
+    pub turn_p2_lat: f64,
+    pub turn_p2_lng: f64,
 }
 
 impl Vehicle {
@@ -116,6 +137,17 @@ impl Vehicle {
             target_lateral_offset: 0.0,
             has_stopped_at_stop_sign: false,
             despawned: false,
+            on_turn_connector: false,
+            turn_t: 0.0,
+            turn_entry_progress: 0.0,
+            turn_exit_progress: 0.0,
+            turn_length_m: 1.0,
+            turn_p1_lat: lat,
+            turn_p1_lng: lng,
+            turn_ctrl_lat: lat,
+            turn_ctrl_lng: lng,
+            turn_p2_lat: lat,
+            turn_p2_lng: lng,
         }
     }
 

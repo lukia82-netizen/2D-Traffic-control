@@ -13,6 +13,8 @@ export interface VehicleState {
   tripKind: number;      // 0=local_od, 1=transit, 2=ext_in, 3=ext_out
   /** Lane index within the current edge's direction (0 = innermost / closest to centreline). */
   currentLane: number;
+  /** True when vehicle currently follows a Bezier turn connector. */
+  onTurnConnector: boolean;
   /** Smooth lateral position in lane-index units (0.0 = lane-0 centre, 1.0 = lane-1, …).
    *  Interpolated by Rust at ~0.35 lanes/s for GTA-style glide. */
   lateralOffset: number;
@@ -60,7 +62,7 @@ export interface LightStateUpdate {
  *   [20]     vehicleType:  u8   (0=Car, 1=Van, 2=Bus, 3=Truck, 4=Tram)
  *   [21]     driverProfile:u8
  *   [22]     tripKind:     u8   (0=local_od, 1=transit, 2=ext_in, 3=ext_out)
- *   [23]     currentLane:   u8   (lane index, 0=innermost)
+ *   [23]     laneFlags:     u8   (bits 0..6: currentLane, bit7: onTurnConnector)
  *   [24..27] frustration:   f32  LE  (0=calm, 100=rage)
  *   [28..31] lateralOffset: f32  LE  (smooth: 0.0=lane-0 centre, 1.0=lane-1 …)
  */
@@ -79,6 +81,7 @@ export function parseVehicleFrame(base64Data: string): VehicleState[] {
 
   for (let i = 0; i < count; i++) {
     const base = i * PACKET_SIZE;
+    const laneFlags = view.getUint8(base + 23);
     vehicles[i] = {
       id:            view.getUint32 (base,      true),
       lat:           view.getFloat32(base + 4,  true),
@@ -88,7 +91,8 @@ export function parseVehicleFrame(base64Data: string): VehicleState[] {
       vehicleType:   view.getUint8  (base + 20),
       driverProfile: view.getUint8  (base + 21),
       tripKind:      view.getUint8  (base + 22),
-      currentLane:   view.getUint8  (base + 23),
+      currentLane:   laneFlags & 0x7f,
+      onTurnConnector: (laneFlags & 0x80) !== 0,
       frustration:   view.getFloat32(base + 24, true),
       lateralOffset: view.getFloat32(base + 28, true),
     };

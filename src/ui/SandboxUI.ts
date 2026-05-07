@@ -26,6 +26,8 @@ export type OsmModeCb        = (enabled: boolean) => void;
 export type VehicleToggleCb  = (visible: boolean) => void;
 export type BuildingToggleCb = (visible: boolean) => void;
 export type MapBgToggleCb    = (visible: boolean) => void;
+export type TurnConnectorsToggleCb = (visible: boolean) => void;
+export type TurnConnectorsActiveOnlyToggleCb = (activeOnly: boolean) => void;
 /** center = [lng, lat], sizeM = metres per side */
 export type ReloadMapCb        = (center: [number, number], sizeM: number) => void;
 export type MaxVehiclesCb      = (count: number) => void;
@@ -101,6 +103,8 @@ export class SandboxUI {
   onVehicleToggle:     VehicleToggleCb  = () => undefined;
   onBuildingToggle:    BuildingToggleCb = () => undefined;
   onMapBgToggle:       MapBgToggleCb    = () => undefined;
+  onTurnConnectorsToggle: TurnConnectorsToggleCb = () => undefined;
+  onTurnConnectorsActiveOnlyToggle: TurnConnectorsActiveOnlyToggleCb = () => undefined;
   onReloadMap:         ReloadMapCb      = () => undefined;
   onMaxVehiclesChange: MaxVehiclesCb    = () => undefined;
   onBboxPickRequest:   BboxPickCb       = () => undefined;
@@ -117,6 +121,11 @@ export class SandboxUI {
   update(vehicleCount: number, fps: number): void {
     this.statVehicles.textContent = String(vehicleCount);
     this.statFps.textContent = fps.toFixed(0);
+  }
+
+  setChecked(id: string, checked: boolean): void {
+    const cb = this.checkboxes.get(id);
+    if (cb) cb.checked = checked;
   }
 
   /** Call after a map reload completes to update status label and reset button. */
@@ -382,6 +391,16 @@ export class SandboxUI {
     sec.appendChild(this.buildCheckRow(
       'buildings', 'Budynki (wolniej)', '#6688aa', false,
       (checked) => this.onBuildingToggle(checked),
+    ));
+
+    // Debug turn connectors
+    sec.appendChild(this.buildCheckRow(
+      'turn-connectors', 'Debug: łuki skrętu', '#22d3ee', false,
+      (checked) => this.onTurnConnectorsToggle(checked),
+    ));
+    sec.appendChild(this.buildCheckRow(
+      'turn-connectors-active-only', 'Tylko aktywne łuki', '#f59e0b', false,
+      (checked) => this.onTurnConnectorsActiveOnlyToggle(checked),
     ));
 
     return sec;

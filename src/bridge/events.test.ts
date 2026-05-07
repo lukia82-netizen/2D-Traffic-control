@@ -9,6 +9,7 @@ function expectVehicleState(actual: VehicleState, expected: VehicleState): void 
   expect(actual.driverProfile).toBe(expected.driverProfile);
   expect(actual.tripKind).toBe(expected.tripKind);
   expect(actual.currentLane).toBe(expected.currentLane);
+  expect(actual.onTurnConnector).toBe(expected.onTurnConnector);
   expect(actual.lat).toBeCloseTo(expected.lat, 5);
   expect(actual.lng).toBeCloseTo(expected.lng, 5);
   expect(actual.angle).toBeCloseTo(expected.angle, 5);
@@ -33,7 +34,8 @@ function vehicleStatesToBase64(vehicles: VehicleState[]): string {
     view.setUint8(base + 20, v.vehicleType);
     view.setUint8(base + 21, v.driverProfile);
     view.setUint8(base + 22, v.tripKind);
-    view.setUint8(base + 23, v.currentLane);
+    const laneFlags = (v.currentLane & 0x7f) | (v.onTurnConnector ? 0x80 : 0);
+    view.setUint8(base + 23, laneFlags);
     view.setFloat32(base + 24, v.frustration, true);
     view.setFloat32(base + 28, v.lateralOffset, true);
   }
@@ -61,6 +63,7 @@ describe('parseVehicleFrame', () => {
       driverProfile: 1,
       tripKind: 0,
       currentLane: 0,
+      onTurnConnector: false,
       frustration: 3.5,
       lateralOffset: 0.25,
     };
@@ -80,6 +83,7 @@ describe('parseVehicleFrame', () => {
       driverProfile: 0,
       tripKind: 0,
       currentLane: 0,
+      onTurnConnector: false,
       frustration: 0,
       lateralOffset: 0,
     };
@@ -91,6 +95,7 @@ describe('parseVehicleFrame', () => {
       speed: 5,
       vehicleType: 4,
       currentLane: 2,
+      onTurnConnector: true,
       frustration: 99.9,
       lateralOffset: 1.75,
     };
@@ -111,6 +116,7 @@ describe('parseVehicleFrame', () => {
       driverProfile: 0,
       tripKind: 0,
       currentLane: 0,
+      onTurnConnector: false,
       frustration: 0,
       lateralOffset: 0,
     };
@@ -124,7 +130,8 @@ describe('parseVehicleFrame', () => {
     view.setUint8(20, full.vehicleType);
     view.setUint8(21, full.driverProfile);
     view.setUint8(22, full.tripKind);
-    view.setUint8(23, full.currentLane);
+    const laneFlags = (full.currentLane & 0x7f) | (full.onTurnConnector ? 0x80 : 0);
+    view.setUint8(23, laneFlags);
     view.setFloat32(24, full.frustration, true);
     view.setFloat32(28, full.lateralOffset, true);
     const bytes = new Uint8Array(buf);

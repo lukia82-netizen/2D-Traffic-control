@@ -40,6 +40,10 @@ const DEFAULT_DEBUG_LOG_INTERVAL_S: f32 = 0.5;
 
 /// Only consider cross-traffic IDM within this distance to the node (meters).
 const CROSS_TRAFFIC_MAX_DIST_M: f32 = 70.0;
+const TURN_CONNECTOR_ENTRY_M: f32 = 10.0;
+const TURN_CONNECTOR_EXIT_M: f32 = 10.0;
+const TURN_CONNECTOR_MIN_ANGLE_RAD: f32 = 0.35;
+const TURN_CONNECTOR_TARGET_SPEED_MPS: f32 = 15.0 / 3.6;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -583,6 +587,22 @@ fn handle_command(
 fn build_route_points(vehicle: &Vehicle, map: &MapData) -> Vec<[f64; 2]> {
     let mut points = Vec::new();
     points.push([vehicle.lng, vehicle.lat]);
+    if vehicle.on_turn_connector {
+        let samples = 12usize;
+        for i in 0..=samples {
+            let t = i as f32 / samples as f32;
+            let (lat, lng) = bezier_point_lat_lng(
+                vehicle.turn_p1_lat,
+                vehicle.turn_p1_lng,
+                vehicle.turn_ctrl_lat,
+                vehicle.turn_ctrl_lng,
+                vehicle.turn_p2_lat,
+                vehicle.turn_p2_lng,
+                t,
+            );
+            points.push([lng, lat]);
+        }
+    }
     if vehicle.route_pos >= vehicle.route.len() {
         return points;
     }
@@ -699,7 +719,11 @@ fn compute_desired_speed(vehicle: &Vehicle, map: &MapData) -> f32 {
 
     let v0_road  = road_max * vehicle.personal_compliance;
     let vtype_max = vehicle.vehicle_type.params().max_speed;
-    v0_road.min(vtype_max)
+    let mut desired = v0_road.min(vtype_max);
+    if vehicle.on_turn_connector {
+        desired = desired.min(TURN_CONNECTOR_TARGET_SPEED_MPS);
+    }
+    desired
 }
 
 /// Apply traffic-light, stop-sign, and yield-sign braking effect.
@@ -1116,6 +1140,61 @@ fn apply_vehicle_physics(
         (edge.length_m, endpoints.0, endpoints.1)
     };
 
+    // ── Turn connector (Bezier) state machine ──────────────────────────────
+    if vehicle.on_turn_connector {
+        let turn_len = vehicle.turn_length_m.max(0.5);
+        let dt = (vehicle.speed * real_dt_s / turn_len).max(0.0);
+        vehicle.turn_t = (vehicle.turn_t + dt).min(1.0);
+
+        // Keep edge_progress monotonic for leader logic while traversing the connector.
+        vehicle.edge_progress =
+            vehicle.turn_entry_progress + (1.0 - vehicle.turn_entry_progress) * vehicle.turn_t;
+
+        let (lat, lng) = bezier_point_lat_lng(
+            vehicle.turn_p1_lat,
+            vehicle.turn_p1_lng,
+            vehicle.turn_ctrl_lat,
+            vehicle.turn_ctrl_lng,
+            vehicle.turn_p2_lat,
+            vehicle.turn_p2_lng,
+            vehicle.turn_t,
+        );
+        vehicle.lat = lat;
+        vehicle.lng = lng;
+
+        let look_t = (vehicle.turn_t + 0.03).min(1.0);
+        let (lat2, lng2) = bezier_point_lat_lng(
+            vehicle.turn_p1_lat,
+            vehicle.turn_p1_lng,
+            vehicle.turn_ctrl_lat,
+            vehicle.turn_ctrl_lng,
+            vehicle.turn_p2_lat,
+            vehicle.turn_p2_lng,
+            look_t,
+        );
+        let dlng = (lng2 - lng) as f32;
+        let dlat = (lat2 - lat) as f32;
+        if dlng.abs() > 1e-6 || dlat.abs() > 1e-6 {
+            vehicle.angle = dlng.atan2(dlat);
+        }
+
+        if vehicle.turn_t >= 1.0 {
+            vehicle.on_turn_connector = false;
+            vehicle.turn_t = 0.0;
+            vehicle.route_pos += 1;
+            vehicle.edge_progress = vehicle.turn_exit_progress;
+            vehicle.has_stopped_at_stop_sign = false;
+
+            if vehicle.route_pos >= vehicle.route.len() {
+                vehicle.despawned = true;
+                return;
+            }
+
+            vehicle.target_lane = compute_vehicle_target_lane(vehicle, map);
+        }
+        return;
+    }
+
     if edge_len > 0.0 {
         vehicle.edge_progress += vehicle.speed * real_dt_s / edge_len;
     }
@@ -1138,6 +1217,23 @@ fn apply_vehicle_physics(
                 vehicle.edge_progress = stop_t;
                 vehicle.speed = vehicle.speed.min(0.2);
             }
+        }
+    }
+
+    if let Some(conn) = planned_turn_connector(vehicle, map) {
+        if vehicle.edge_progress >= conn.entry_progress {
+            vehicle.on_turn_connector = true;
+            vehicle.turn_t = 0.0;
+            vehicle.turn_entry_progress = conn.entry_progress;
+            vehicle.turn_exit_progress = conn.exit_progress;
+            vehicle.turn_length_m = conn.length_m.max(0.5);
+            vehicle.turn_p1_lat = conn.p1_lat;
+            vehicle.turn_p1_lng = conn.p1_lng;
+            vehicle.turn_ctrl_lat = conn.ctrl_lat;
+            vehicle.turn_ctrl_lng = conn.ctrl_lng;
+            vehicle.turn_p2_lat = conn.p2_lat;
+            vehicle.turn_p2_lng = conn.p2_lng;
+            vehicle.edge_progress = conn.entry_progress;
         }
     }
 
@@ -1168,6 +1264,117 @@ fn apply_vehicle_physics(
     vehicle.angle = (dlng as f32).atan2(dlat as f32);
 }
 
+struct PlannedTurnConnector {
+    entry_progress: f32,
+    exit_progress: f32,
+    length_m: f32,
+    p1_lat: f64,
+    p1_lng: f64,
+    ctrl_lat: f64,
+    ctrl_lng: f64,
+    p2_lat: f64,
+    p2_lng: f64,
+}
+
+fn planned_turn_connector(vehicle: &Vehicle, map: &MapData) -> Option<PlannedTurnConnector> {
+    if vehicle.route_pos + 1 >= vehicle.route.len() {
+        return None;
+    }
+    let curr_edge = vehicle.route[vehicle.route_pos];
+    let next_edge = vehicle.route[vehicle.route_pos + 1];
+    let (src, junction) = map.graph.edge_endpoints(curr_edge)?;
+    let (next_src, next_tgt) = map.graph.edge_endpoints(next_edge)?;
+    if junction != next_src {
+        return None;
+    }
+
+    let curr_len = map.graph.edge_weight(curr_edge)?.length_m.max(1.0);
+    let next_len = map.graph.edge_weight(next_edge)?.length_m.max(1.0);
+
+    let src_n = &map.graph[src];
+    let jn = &map.graph[junction];
+    let tgt_n = &map.graph[next_tgt];
+
+    // Incoming direction toward the node, outgoing direction from the node.
+    let in_x = (jn.lng - src_n.lng) as f32;
+    let in_y = (jn.lat - src_n.lat) as f32;
+    let out_x = (tgt_n.lng - jn.lng) as f32;
+    let out_y = (tgt_n.lat - jn.lat) as f32;
+    let in_len = (in_x * in_x + in_y * in_y).sqrt().max(1e-6);
+    let out_len = (out_x * out_x + out_y * out_y).sqrt().max(1e-6);
+    let dot = ((in_x / in_len) * (out_x / out_len) + (in_y / in_len) * (out_y / out_len))
+        .clamp(-1.0, 1.0);
+    let angle = dot.acos();
+    if angle < TURN_CONNECTOR_MIN_ANGLE_RAD {
+        return None;
+    }
+
+    let entry_progress = (1.0 - TURN_CONNECTOR_ENTRY_M / curr_len).clamp(0.0, 1.0);
+    let exit_progress = (TURN_CONNECTOR_EXIT_M / next_len).clamp(0.0, 1.0);
+    if entry_progress <= vehicle.edge_progress {
+        return None;
+    }
+
+    let p1_lat = src_n.lat + (jn.lat - src_n.lat) * entry_progress as f64;
+    let p1_lng = src_n.lng + (jn.lng - src_n.lng) * entry_progress as f64;
+    let p2_lat = jn.lat + (tgt_n.lat - jn.lat) * exit_progress as f64;
+    let p2_lng = jn.lng + (tgt_n.lng - jn.lng) * exit_progress as f64;
+    let ctrl_lat = jn.lat;
+    let ctrl_lng = jn.lng;
+
+    let length_m = bezier_length_m(p1_lat, p1_lng, ctrl_lat, ctrl_lng, p2_lat, p2_lng, 16);
+
+    Some(PlannedTurnConnector {
+        entry_progress,
+        exit_progress,
+        length_m,
+        p1_lat,
+        p1_lng,
+        ctrl_lat,
+        ctrl_lng,
+        p2_lat,
+        p2_lng,
+    })
+}
+
+#[inline]
+fn bezier_point_lat_lng(
+    p1_lat: f64,
+    p1_lng: f64,
+    ctrl_lat: f64,
+    ctrl_lng: f64,
+    p2_lat: f64,
+    p2_lng: f64,
+    t: f32,
+) -> (f64, f64) {
+    let u = (1.0 - t) as f64;
+    let tt = t as f64;
+    let lat = u * u * p1_lat + 2.0 * u * tt * ctrl_lat + tt * tt * p2_lat;
+    let lng = u * u * p1_lng + 2.0 * u * tt * ctrl_lng + tt * tt * p2_lng;
+    (lat, lng)
+}
+
+fn bezier_length_m(
+    p1_lat: f64,
+    p1_lng: f64,
+    ctrl_lat: f64,
+    ctrl_lng: f64,
+    p2_lat: f64,
+    p2_lng: f64,
+    segments: usize,
+) -> f32 {
+    let segs = segments.max(4);
+    let mut total = 0.0f32;
+    let mut prev = bezier_point_lat_lng(p1_lat, p1_lng, ctrl_lat, ctrl_lng, p2_lat, p2_lng, 0.0);
+    for i in 1..=segs {
+        let t = i as f32 / segs as f32;
+        let curr = bezier_point_lat_lng(p1_lat, p1_lng, ctrl_lat, ctrl_lng, p2_lat, p2_lng, t);
+        total += geo_dist_approx(prev.0, prev.1, curr.0, curr.1);
+        prev = curr;
+    }
+    total
+}
+
 // ── Serialisation ─────────────────────────────────────────────────────────────
 
 /// Serialise all vehicles (including trams) into a packed binary buffer.
@@ -1182,7 +1389,7 @@ fn apply_vehicle_physics(
 ///   [20]     type:            u8   (0=Car, 1=Van, 2=Bus, 3=Truck, 4=Tram)
 ///   [21]     profile:         u8
 ///   [22]     trip_kind:       u8   (0=local_od, 1=transit, 2=ext_in, 3=ext_out)
-///   [23]     current_lane:    u8   (lane index, 0 = closest to centre)
+///   [23]     lane_flags:      u8   (bits 0..6 lane index, bit7 on_turn_connector)
 ///   [24..27] frustration:     f32  LE  (0=calm, 100=rage)
 ///   [28..31] lateral_offset:  f32  LE  (smooth lane pos: 0.0=lane-0 centre, 1.0=lane-1 …)
 /// ```
@@ -1202,6 +1409,7 @@ fn serialize_vehicles(vehicles: &[Vehicle], tram_sim: &TramSim) -> Vec<u8> {
             v.driver_profile as u8,
             v.trip_kind,
             v.current_lane,
+            v.on_turn_connector,
             v.frustration,
             v.current_lateral_offset,
         );
@@ -1219,6 +1427,7 @@ fn serialize_vehicles(vehicles: &[Vehicle], tram_sim: &TramSim) -> Vec<u8> {
             0, // Normal profile placeholder
             t.trip_kind,
             0, // Trams have fixed track, always lane 0
+            false,
             t.frustration,
             0.0, // Trams stay on fixed track, no lateral offset
         );
@@ -1237,7 +1446,7 @@ fn serialize_vehicles(vehicles: &[Vehicle], tram_sim: &TramSim) -> Vec<u8> {
 ///   [20]     vehicle_type:    u8
 ///   [21]     driver_profile:  u8
 ///   [22]     trip_kind:       u8
-///   [23]     current_lane:    u8   (0 = closest to centre)
+///   [23]     lane_flags:      u8   (bits 0..6 lane index, bit7 on_turn_connector)
 ///   [24..27] frustration:     f32 LE
 ///   [28..31] lateral_offset:  f32 LE (smooth: 0.0=lane-0, 1.0=lane-1, …)
 /// ```
@@ -1253,6 +1462,7 @@ fn push_vehicle_packet(
     profile: u8,
     trip_kind: u8,
     current_lane: u8,
+    on_turn_connector: bool,
     frustration: f32,
     lateral_offset: f32,
 ) {
@@ -1264,7 +1474,8 @@ fn push_vehicle_packet(
     buf.push(vtype);                                           // [20]
     buf.push(profile);                                         // [21]
     buf.push(trip_kind);                                       // [22]
-    buf.push(current_lane);                                    // [23] lane index
+    let lane_flags = (current_lane & 0x7f) | if on_turn_connector { 0x80 } else { 0 };
+    buf.push(lane_flags);                                      // [23] lane + turn flag
     buf.extend_from_slice(&frustration.to_le_bytes());         // [24..27]
     buf.extend_from_slice(&lateral_offset.to_le_bytes());      // [28..31]
 }

@@ -4,6 +4,7 @@
 
 # --- Paths -------------------------------------------------------------------
 $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$OriginalLocation = Get-Location
 
 # --- Tool paths (adjust if your installation differs) ------------------------
 $NodeDir  = "C:\Users\lukia\AppData\Local\nodejs-portable\node-v20.19.1-win-x64"
@@ -58,8 +59,9 @@ if ($oldPort) {
 # --- Start Vite dev server ---------------------------------------------------
 Write-Host "  [2/3] Starting Vite dev server on port 1420..." -ForegroundColor Yellow
 $viteProc = Start-Process `
-    -FilePath     "node" `
-    -ArgumentList "start-dev.mjs" `
+    -FilePath          "node" `
+    -ArgumentList      "start-dev.mjs" `
+    -WorkingDirectory  $ProjectRoot `
     -PassThru `
     -NoNewWindow
 
@@ -94,5 +96,6 @@ node_modules\.bin\tauri dev
 Write-Host ""
 Write-Host "  Game closed. Stopping Vite..." -ForegroundColor Yellow
 Stop-Process -Id $viteProc.Id -Force -ErrorAction SilentlyContinue
+Set-Location $OriginalLocation
 Write-Host "  Done." -ForegroundColor Cyan
 Write-Host ""
