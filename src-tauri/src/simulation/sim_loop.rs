@@ -40,12 +40,13 @@ const DEFAULT_DEBUG_LOG_INTERVAL_S: f32 = 0.5;
 
 /// Only consider cross-traffic IDM within this distance to the node (meters).
 const CROSS_TRAFFIC_MAX_DIST_M: f32 = 70.0;
-const TURN_CONNECTOR_ENTRY_M: f32 = 35.0;
-const TURN_CONNECTOR_EXIT_M: f32 = 35.0;
+const TURN_CONNECTOR_ENTRY_M: f32 = 30.0;
+const TURN_CONNECTOR_EXIT_M: f32 = 30.0;
 const TURN_CONNECTOR_MIN_ANGLE_RAD: f32 = 0.35;
-const TURN_CONNECTOR_TARGET_SPEED_MPS: f32 = 25.0 / 3.6;
+const TURN_CONNECTOR_TARGET_SPEED_MPS: f32 = 25.0 / 3.6; // 6.94 m/s = 25 km/h on arc
 const GEO_LAT_M: f64 = 111_320.0;
 const GEO_LNG_M: f64 = 71_700.0;
+/// Physical lane half-width in metres used to offset Bezier P1/P2 from the
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -299,6 +300,19 @@ pub fn run_simulation(
                         .par_iter()
                         .enumerate()
                         .map(|(i, v)| {
+                            // On turn connector: skip all leader/intersection effects.
+                            // The synthetic edge_progress on the connector does not
+                            // represent actual Bezier arc distance, so IDM gap
+                            // calculations would be wrong and cause speed oscillation
+                            // (visible as position flickering on the arc).
+                            if v.on_turn_connector {
+                                let desired = compute_desired_speed(v, map);
+                                let params  = v.driver_profile.params();
+                                let vtype   = v.vehicle_type.params();
+                                return idm_acceleration(
+                                    v.speed, desired, 1000.0, 0.0, &params, &vtype,
+                                );
+                            }
                             let (gap, delta_v) =
                                 find_leader_arc(i, v, &vehicles, &edge_lane_vehicles, map);
                             let (gap, delta_v) =
@@ -1159,9 +1173,11 @@ fn apply_vehicle_physics(
     // ── Lateral-offset smoothing (GTA-style lane glide) ───────────────────
     // target_lateral_offset tracks the desired lane (== target_lane as f32).
     // current_lateral_offset glides toward it at LANE_CHANGE_SPEED lane/s.
-    // Using real-time dt keeps the animation speed independent of sim speed.
+    // Frozen on turn connector: target_lane may change mid-turn (compute for
+    // next segment) and would cause current_lateral_offset to oscillate,
+    // which the renderer then shows as perpendicular flicker.
     vehicle.target_lateral_offset = vehicle.target_lane as f32;
-    {
+    if !vehicle.on_turn_connector {
         const LANE_CHANGE_SPEED: f32 = 0.35; // lane-widths per real second (~2.9 s full change)
         let diff = vehicle.target_lateral_offset - vehicle.current_lateral_offset;
         let step = LANE_CHANGE_SPEED * real_dt_s;
@@ -1213,20 +1229,15 @@ fn apply_vehicle_physics(
         vehicle.lat = lat;
         vehicle.lng = lng;
 
-        let look_t = (vehicle.turn_t + 0.03).min(1.0);
-        let (lat2, lng2) = bezier_point_lat_lng(
-            vehicle.turn_p1_lat,
-            vehicle.turn_p1_lng,
-            vehicle.turn_ctrl_lat,
-            vehicle.turn_ctrl_lng,
-            vehicle.turn_p2_lat,
-            vehicle.turn_p2_lng,
-            look_t,
+        // Analytical tangent B'(t) — always exact, zero drift regardless of dt.
+        let (d_lat, d_lng) = bezier_tangent_lat_lng(
+            vehicle.turn_p1_lat, vehicle.turn_p1_lng,
+            vehicle.turn_ctrl_lat, vehicle.turn_ctrl_lng,
+            vehicle.turn_p2_lat, vehicle.turn_p2_lng,
+            vehicle.turn_t,
         );
-        let dlng = (lng2 - lng) as f32;
-        let dlat = (lat2 - lat) as f32;
-        if dlng.abs() > 1e-6 || dlat.abs() > 1e-6 {
-            vehicle.angle = dlng.atan2(dlat);
+        if d_lng.abs() > 1e-12 || d_lat.abs() > 1e-12 {
+            vehicle.angle = (d_lng as f32).atan2(d_lat as f32);
         }
 
         if vehicle.turn_t >= 1.0 {
@@ -1289,6 +1300,10 @@ fn apply_vehicle_physics(
             vehicle.turn_p2_lng = conn.p2_lng;
             vehicle.edge_progress = conn.entry_progress;
 
+            // Snap lateral offset to target immediately so it doesn't drift
+            // perpendicularly to the Bezier while animating during the turn.
+            vehicle.current_lateral_offset = vehicle.target_lateral_offset;
+
             // Immediately place vehicle at Bezier start (avoid 1-frame linear snap).
             let (lat0, lng0) = bezier_point_lat_lng(
                 conn.p1_lat, conn.p1_lng,
@@ -1298,17 +1313,15 @@ fn apply_vehicle_physics(
             );
             vehicle.lat = lat0;
             vehicle.lng = lng0;
-            // Initial heading from Bezier tangent at t≈0.
-            let (lat1, lng1) = bezier_point_lat_lng(
+            // Initial heading from analytical tangent at t=0.
+            let (d_lat0, d_lng0) = bezier_tangent_lat_lng(
                 conn.p1_lat, conn.p1_lng,
                 conn.ctrl_lat, conn.ctrl_lng,
                 conn.p2_lat, conn.p2_lng,
-                0.03,
+                0.0,
             );
-            let dlng = (lng1 - lng0) as f32;
-            let dlat = (lat1 - lat0) as f32;
-            if dlng.abs() > 1e-9 || dlat.abs() > 1e-9 {
-                vehicle.angle = dlng.atan2(dlat);
+            if d_lng0.abs() > 1e-12 || d_lat0.abs() > 1e-12 {
+                vehicle.angle = (d_lng0 as f32).atan2(d_lat0 as f32);
             }
             // Do NOT fall through to linear interpolation — Bezier takes over next tick.
             return;
@@ -1391,6 +1404,8 @@ fn planned_turn_connector(vehicle: &Vehicle, map: &MapData) -> Option<PlannedTur
     let exit_progress = (TURN_CONNECTOR_EXIT_M / next_len).clamp(0.0, 1.0);
     // Do NOT early-return here — the caller decides when to activate based on edge_progress.
 
+    // P1 and P2 on the road centreline — the frontend lane-offset is applied
+    // in screen space and the snapshot interpolation keeps transitions smooth.
     let p1_lat = src_n.lat + (jn.lat - src_n.lat) * entry_progress as f64;
     let p1_lng = src_n.lng + (jn.lng - src_n.lng) * entry_progress as f64;
     let p2_lat = jn.lat + (tgt_n.lat - jn.lat) * exit_progress as f64;
@@ -1423,6 +1438,25 @@ fn planned_turn_connector(vehicle: &Vehicle, map: &MapData) -> Option<PlannedTur
         p2_lat,
         p2_lng,
     })
+}
+
+/// Analytical derivative of a quadratic Bezier in lat/lng space.
+/// Returns (d_lat, d_lng) — the tangent vector at parameter `t`.
+/// B'(t) = 2*(1-t)*(ctrl - p1) + 2*t*(p2 - ctrl)
+#[inline]
+fn bezier_tangent_lat_lng(
+    p1_lat: f64,
+    p1_lng: f64,
+    ctrl_lat: f64,
+    ctrl_lng: f64,
+    p2_lat: f64,
+    p2_lng: f64,
+    t: f32,
+) -> (f64, f64) {
+    let t = t as f64;
+    let d_lat = 2.0 * (1.0 - t) * (ctrl_lat - p1_lat) + 2.0 * t * (p2_lat - ctrl_lat);
+    let d_lng = 2.0 * (1.0 - t) * (ctrl_lng - p1_lng) + 2.0 * t * (p2_lng - ctrl_lng);
+    (d_lat, d_lng)
 }
 
 #[inline]
@@ -1467,23 +1501,23 @@ fn bezier_length_m(
 
 /// Serialise all vehicles (including trams) into a packed binary buffer.
 ///
-/// Per-vehicle layout (32 bytes, 4-byte aligned):
+/// Per-vehicle layout (40 bytes):
 /// ```text
 ///   [0..3]   id:              u32  LE
-///   [4..7]   lat:             f32  LE
-///   [8..11]  lng:             f32  LE
-///   [12..15] angle:           f32  LE
-///   [16..19] speed:           f32  LE
-///   [20]     type:            u8   (0=Car, 1=Van, 2=Bus, 3=Truck, 4=Tram)
-///   [21]     profile:         u8
-///   [22]     trip_kind:       u8   (0=local_od, 1=transit, 2=ext_in, 3=ext_out)
-///   [23]     lane_flags:      u8   (bits 0..6 lane index, bit7 on_turn_connector)
-///   [24..27] frustration:     f32  LE  (0=calm, 100=rage)
-///   [28..31] lateral_offset:  f32  LE  (smooth lane pos: 0.0=lane-0 centre, 1.0=lane-1 …)
+///   [4..11]  lat:             f64  LE  ← full double precision
+///   [12..19] lng:             f64  LE  ← full double precision
+///   [20..23] angle:           f32  LE
+///   [24..27] speed:           f32  LE
+///   [28]     type:            u8   (0=Car, 1=Van, 2=Bus, 3=Truck, 4=Tram)
+///   [29]     profile:         u8
+///   [30]     trip_kind:       u8   (0=local_od, 1=transit, 2=ext_in, 3=ext_out)
+///   [31]     lane_flags:      u8   (bits 0..6 lane index, bit7 on_turn_connector)
+///   [32..35] frustration:     f32  LE  (0=calm, 100=rage)
+///   [36..39] lateral_offset:  f32  LE  (smooth lane pos: 0.0=lane-0 centre, 1.0=lane-1 …)
 /// ```
 fn serialize_vehicles(vehicles: &[Vehicle], tram_sim: &TramSim) -> Vec<u8> {
     let total = vehicles.len() + tram_sim.trams.len();
-    let mut buf = Vec::with_capacity(total * 32);
+    let mut buf = Vec::with_capacity(total * 40);
 
     for v in vehicles {
         push_vehicle_packet(
@@ -1524,19 +1558,19 @@ fn serialize_vehicles(vehicles: &[Vehicle], tram_sim: &TramSim) -> Vec<u8> {
     buf
 }
 
-/// Per-vehicle binary packet layout (32 bytes):
+/// Per-vehicle binary packet layout (40 bytes):
 /// ```text
 ///   [0..3]   id:              u32 LE
-///   [4..7]   lat:             f32 LE
-///   [8..11]  lng:             f32 LE
-///   [12..15] angle:           f32 LE
-///   [16..19] speed:           f32 LE
-///   [20]     vehicle_type:    u8
-///   [21]     driver_profile:  u8
-///   [22]     trip_kind:       u8
-///   [23]     lane_flags:      u8   (bits 0..6 lane index, bit7 on_turn_connector)
-///   [24..27] frustration:     f32 LE
-///   [28..31] lateral_offset:  f32 LE (smooth: 0.0=lane-0, 1.0=lane-1, …)
+///   [4..11]  lat:             f64 LE   ← full double precision, eliminates ~0.4 m f32 quantisation noise
+///   [12..19] lng:             f64 LE   ← full double precision
+///   [20..23] angle:           f32 LE
+///   [24..27] speed:           f32 LE
+///   [28]     vehicle_type:    u8
+///   [29]     driver_profile:  u8
+///   [30]     trip_kind:       u8
+///   [31]     lane_flags:      u8   (bits 0..6 lane index, bit7 on_turn_connector)
+///   [32..35] frustration:     f32 LE
+///   [36..39] lateral_offset:  f32 LE (smooth: 0.0=lane-0, 1.0=lane-1, …)
 /// ```
 #[inline]
 fn push_vehicle_packet(
@@ -1554,16 +1588,16 @@ fn push_vehicle_packet(
     frustration: f32,
     lateral_offset: f32,
 ) {
-    buf.extend_from_slice(&id.to_le_bytes());                  // [0..3]
-    buf.extend_from_slice(&(lat as f32).to_le_bytes());        // [4..7]
-    buf.extend_from_slice(&(lng as f32).to_le_bytes());        // [8..11]
-    buf.extend_from_slice(&angle.to_le_bytes());               // [12..15]
-    buf.extend_from_slice(&speed.to_le_bytes());               // [16..19]
-    buf.push(vtype);                                           // [20]
-    buf.push(profile);                                         // [21]
-    buf.push(trip_kind);                                       // [22]
+    buf.extend_from_slice(&id.to_le_bytes());          // [0..3]
+    buf.extend_from_slice(&lat.to_le_bytes());         // [4..11]  f64
+    buf.extend_from_slice(&lng.to_le_bytes());         // [12..19] f64
+    buf.extend_from_slice(&angle.to_le_bytes());       // [20..23]
+    buf.extend_from_slice(&speed.to_le_bytes());       // [24..27]
+    buf.push(vtype);                                   // [28]
+    buf.push(profile);                                 // [29]
+    buf.push(trip_kind);                               // [30]
     let lane_flags = (current_lane & 0x7f) | if on_turn_connector { 0x80 } else { 0 };
-    buf.push(lane_flags);                                      // [23] lane + turn flag
-    buf.extend_from_slice(&frustration.to_le_bytes());         // [24..27]
-    buf.extend_from_slice(&lateral_offset.to_le_bytes());      // [28..31]
+    buf.push(lane_flags);                              // [31]
+    buf.extend_from_slice(&frustration.to_le_bytes()); // [32..35]
+    buf.extend_from_slice(&lateral_offset.to_le_bytes()); // [36..39]
 }

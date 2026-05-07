@@ -53,18 +53,18 @@ export interface LightStateUpdate {
 /**
  * Decode a base64-encoded binary vehicle frame.
  *
- * Packet layout (32 bytes, 4-byte aligned):
- *   [0..3]   id:           u32  LE
- *   [4..7]   lat:          f32  LE
- *   [8..11]  lng:          f32  LE
- *   [12..15] angle:        f32  LE
- *   [16..19] speed:        f32  LE
- *   [20]     vehicleType:  u8   (0=Car, 1=Van, 2=Bus, 3=Truck, 4=Tram)
- *   [21]     driverProfile:u8
- *   [22]     tripKind:     u8   (0=local_od, 1=transit, 2=ext_in, 3=ext_out)
- *   [23]     laneFlags:     u8   (bits 0..6: currentLane, bit7: onTurnConnector)
- *   [24..27] frustration:   f32  LE  (0=calm, 100=rage)
- *   [28..31] lateralOffset: f32  LE  (smooth: 0.0=lane-0 centre, 1.0=lane-1 …)
+ * Packet layout (40 bytes):
+ *   [0..3]   id:            u32  LE
+ *   [4..11]  lat:           f64  LE  ← double precision, eliminates f32 quantisation jitter
+ *   [12..19] lng:           f64  LE  ← double precision
+ *   [20..23] angle:         f32  LE
+ *   [24..27] speed:         f32  LE
+ *   [28]     vehicleType:   u8   (0=Car, 1=Van, 2=Bus, 3=Truck, 4=Tram)
+ *   [29]     driverProfile: u8
+ *   [30]     tripKind:      u8   (0=local_od, 1=transit, 2=ext_in, 3=ext_out)
+ *   [31]     laneFlags:     u8   (bits 0..6: currentLane, bit7: onTurnConnector)
+ *   [32..35] frustration:   f32  LE  (0=calm, 100=rage)
+ *   [36..39] lateralOffset: f32  LE  (smooth: 0.0=lane-0 centre, 1.0=lane-1 …)
  */
 export function parseVehicleFrame(base64Data: string): VehicleState[] {
   const binaryStr = atob(base64Data);
@@ -74,27 +74,27 @@ export function parseVehicleFrame(base64Data: string): VehicleState[] {
     bytes[i] = binaryStr.charCodeAt(i);
   }
 
-  const PACKET_SIZE = 32;
+  const PACKET_SIZE = 40;
   const count = Math.floor(bytes.byteLength / PACKET_SIZE);
   const view = new DataView(bytes.buffer);
   const vehicles: VehicleState[] = new Array(count);
 
   for (let i = 0; i < count; i++) {
     const base = i * PACKET_SIZE;
-    const laneFlags = view.getUint8(base + 23);
+    const laneFlags = view.getUint8(base + 31);
     vehicles[i] = {
-      id:            view.getUint32 (base,      true),
-      lat:           view.getFloat32(base + 4,  true),
-      lng:           view.getFloat32(base + 8,  true),
-      angle:         view.getFloat32(base + 12, true),
-      speed:         view.getFloat32(base + 16, true),
-      vehicleType:   view.getUint8  (base + 20),
-      driverProfile: view.getUint8  (base + 21),
-      tripKind:      view.getUint8  (base + 22),
-      currentLane:   laneFlags & 0x7f,
+      id:              view.getUint32 (base,      true),
+      lat:             view.getFloat64(base + 4,  true),
+      lng:             view.getFloat64(base + 12, true),
+      angle:           view.getFloat32(base + 20, true),
+      speed:           view.getFloat32(base + 24, true),
+      vehicleType:     view.getUint8  (base + 28),
+      driverProfile:   view.getUint8  (base + 29),
+      tripKind:        view.getUint8  (base + 30),
+      currentLane:     laneFlags & 0x7f,
       onTurnConnector: (laneFlags & 0x80) !== 0,
-      frustration:   view.getFloat32(base + 24, true),
-      lateralOffset: view.getFloat32(base + 28, true),
+      frustration:     view.getFloat32(base + 32, true),
+      lateralOffset:   view.getFloat32(base + 36, true),
     };
   }
 

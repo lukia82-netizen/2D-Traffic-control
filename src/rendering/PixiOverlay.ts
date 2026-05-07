@@ -46,6 +46,9 @@ export class PixiOverlay {
       antialias: true,
       resolution: window.devicePixelRatio ?? 1,
       autoDensity: true,
+      // Disable pixel-snapping: sub-pixel vehicle positions are valid and
+      // rounding them to integers causes visible jitter at low speed.
+      roundPixels: false,
     });
 
     // Mount canvas into the DOM container

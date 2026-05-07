@@ -101,11 +101,13 @@ function buildDemoMapData(): MapData {
 const GAME_START_TIME_S = 6 * 3600;
 const TURN_DEBUG_STORAGE_KEY = 'debug_turn_connectors_visible';
 const TURN_DEBUG_ACTIVE_ONLY_STORAGE_KEY = 'debug_turn_connectors_active_only';
-const TURN_CONNECTOR_ENTRY_M = 35;
-const TURN_CONNECTOR_EXIT_M = 35;
+const TURN_CONNECTOR_ENTRY_M = 30;
+const TURN_CONNECTOR_EXIT_M = 30;
 const TURN_CONNECTOR_MIN_ANGLE_RAD = 0.35;
 const TURN_CONNECTOR_ACTIVE_MAX_DIST_M = 12;
-const TURN_CONNECTOR_DEBUG_LANE_OFFSET_M = 1.75;
+// Debug arcs drawn at road centre (0 offset) — matches where vehicles travel
+// on a connector (laneOffset is zeroed in VehicleRenderer while onTurnConnector).
+const TURN_CONNECTOR_DEBUG_LANE_OFFSET_M = 0;
 
 interface TurnConnectorPath {
   points: [number, number][];
@@ -569,6 +571,7 @@ export class Game {
       if (!frameIds.has(id)) this.vehicles.delete(id);
     }
     for (const v of states) this.vehicles.set(v.id, v);
+
   }
 
   private onCongestionUpdate(data: CongestionData[]): void {
