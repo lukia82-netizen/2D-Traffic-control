@@ -1,7 +1,5 @@
 use std::collections::{HashMap, HashSet};
 
-use petgraph::visit::IntoNodeIdentifiers;
-
 use crate::map::road_network::{IntersectionType, MapData, RoadGraph};
 use crate::state::LightControlMode;
 use crate::traffic::phased_traffic_light::JunctionLayout;
