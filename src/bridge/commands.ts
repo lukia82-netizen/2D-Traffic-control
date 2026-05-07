@@ -17,6 +17,7 @@ export interface NodeData {
 }
 
 export interface EdgeData {
+  id: number;
   from: number;
   to: number;
   lanes: number;
@@ -83,6 +84,17 @@ export interface MapData {
   tramStops: TramStop[];
 }
 
+export interface TopologyFixStats {
+  snappedDeadEnds: number;
+  ghostIntersectionsResolved: number;
+  lowPriorityEdgesRemoved: number;
+}
+
+export interface AutoFixMapResponse {
+  map: MapData;
+  stats: TopologyFixStats;
+}
+
 // ─── Typed invoke wrappers ────────────────────────────────────────────────────
 
 /**
@@ -105,6 +117,13 @@ export async function loadMap(
       north: bbox[3],
     },
   });
+}
+
+export async function autoFixMap(
+  map: MapData,
+  thresholdMeters: number,
+): Promise<AutoFixMapResponse> {
+  return invoke<AutoFixMapResponse>('auto_fix_map', { map, thresholdMeters });
 }
 
 /**

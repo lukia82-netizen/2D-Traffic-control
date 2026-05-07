@@ -1,9 +1,10 @@
-use std::collections::HashMap;
-use petgraph::graph::{DiGraph, NodeIndex};
+use petgraph::graph::{DiGraph, EdgeIndex, NodeIndex};
+use petgraph::visit::EdgeRef;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 
-use crate::map::osm_loader::{OsmData, OsmRelation};
 use crate::map::building_loader::OdBuilding;
+use crate::map::osm_loader::{OsmData, OsmRelation};
 use crate::map::tram_network::TramData;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,6 +112,215 @@ pub struct MapData {
     pub sandbox_simple_cross_tl: bool,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TopologyFixStats {
+    pub snapped_dead_ends: usize,
+    pub ghost_intersections_resolved: usize,
+    pub low_priority_edges_removed: usize,
+}
+
+impl MapData {
+    /// Topology cleaner:
+    /// 1) snap dead-end nodes to nearby roads,
+    /// 2) split geometric edge crossings without a shared node,
+    /// 3) remove low-priority edges that do not serve any building.
+    pub fn heal_connections(&mut self, threshold_meters: f64) -> TopologyFixStats {
+        let mut stats = TopologyFixStats::default();
+        stats.snapped_dead_ends = self.snap_dead_ends(threshold_meters);
+        stats.ghost_intersections_resolved = self.resolve_ghost_intersections();
+        stats.low_priority_edges_removed = self.filter_low_priority_roads();
+        self.rebuild_topology_metadata();
+        stats
+    }
+
+    fn snap_dead_ends(&mut self, threshold_meters: f64) -> usize {
+        let dead_ends: Vec<NodeIndex> = self
+            .graph
+            .node_indices()
+            .filter(|&idx| {
+                self.graph
+                    .edges_directed(idx, petgraph::Direction::Outgoing)
+                    .count()
+                    + self
+                        .graph
+                        .edges_directed(idx, petgraph::Direction::Incoming)
+                        .count()
+                    == 1
+            })
+            .collect();
+        let mut snapped = 0usize;
+
+        for node_idx in dead_ends {
+            if self.graph.node_weight(node_idx).is_none() {
+                continue;
+            }
+            let node = self.graph[node_idx].clone();
+            let mut best: Option<(EdgeIndex, f64, f64, f64, f64)> = None;
+            // (edge_idx, t, dist_m, proj_lat, proj_lng)
+
+            for edge_ref in self.graph.edge_references() {
+                let edge_idx = edge_ref.id();
+                let src = edge_ref.source();
+                let dst = edge_ref.target();
+                if src == node_idx || dst == node_idx {
+                    continue;
+                }
+                let a = &self.graph[src];
+                let b = &self.graph[dst];
+                let ((proj_lat, proj_lng), t, dist_m) =
+                    project_point_on_segment_m(node.lat, node.lng, a.lat, a.lng, b.lat, b.lng);
+                // avoid snapping exactly to segment endpoints
+                if !(0.001..=0.999).contains(&t) || dist_m > threshold_meters {
+                    continue;
+                }
+                if let Some((_, _, best_dist, _, _)) = best {
+                    if dist_m >= best_dist {
+                        continue;
+                    }
+                }
+                best = Some((edge_idx, t, dist_m, proj_lat, proj_lng));
+            }
+
+            if let Some((target_edge, _, _, proj_lat, proj_lng)) = best {
+                self.graph[node_idx].lat = proj_lat;
+                self.graph[node_idx].lng = proj_lng;
+                if split_edge_at_existing_node(&mut self.graph, target_edge, node_idx) {
+                    snapped += 1;
+                }
+            }
+        }
+        snapped
+    }
+
+    fn resolve_ghost_intersections(&mut self) -> usize {
+        let mut resolved = 0usize;
+        loop {
+            let edges: Vec<(EdgeIndex, NodeIndex, NodeIndex, i8, InfraType)> = self
+                .graph
+                .edge_references()
+                .map(|e| {
+                    (
+                        e.id(),
+                        e.source(),
+                        e.target(),
+                        e.weight().layer,
+                        e.weight().infra_type.clone(),
+                    )
+                })
+                .collect();
+            let mut found = None;
+
+            for i in 0..edges.len() {
+                for j in (i + 1)..edges.len() {
+                    let (e1, a1, b1, layer1, infra1) = &edges[i];
+                    let (e2, a2, b2, layer2, infra2) = &edges[j];
+                    if a1 == a2 || a1 == b2 || b1 == a2 || b1 == b2 {
+                        continue;
+                    }
+                    // do not connect bridge/tunnel grade-separated geometry
+                    if layer1 != layer2 || infra1 != infra2 {
+                        continue;
+                    }
+
+                    let n11 = &self.graph[*a1];
+                    let n12 = &self.graph[*b1];
+                    let n21 = &self.graph[*a2];
+                    let n22 = &self.graph[*b2];
+                    if let Some((ilat, ilng, t1, t2)) = segment_intersection_lat_lng(
+                        n11.lat, n11.lng, n12.lat, n12.lng, n21.lat, n21.lng, n22.lat, n22.lng,
+                    ) {
+                        if !(0.001..=0.999).contains(&t1) || !(0.001..=0.999).contains(&t2) {
+                            continue;
+                        }
+                        found = Some((*e1, *e2, ilat, ilng));
+                        break;
+                    }
+                }
+                if found.is_some() {
+                    break;
+                }
+            }
+
+            let Some((e1, e2, ilat, ilng)) = found else {
+                break;
+            };
+
+            let new_node = self.graph.add_node(RoadNode {
+                osm_id: 0,
+                lat: ilat,
+                lng: ilng,
+                intersection_type: IntersectionType::Plain,
+            });
+            let s1 = split_edge_at_existing_node(&mut self.graph, e1, new_node);
+            let s2 = split_edge_at_existing_node(&mut self.graph, e2, new_node);
+            if s1 || s2 {
+                resolved += 1;
+            } else {
+                break;
+            }
+        }
+        resolved
+    }
+
+    fn filter_low_priority_roads(&mut self) -> usize {
+        let building_nodes: HashSet<NodeIndex> = self
+            .od_buildings
+            .iter()
+            .filter_map(|b| b.access_node)
+            .collect();
+        let removable: Vec<EdgeIndex> = self
+            .graph
+            .edge_references()
+            .filter_map(|edge_ref| {
+                let edge = edge_ref.weight();
+                if !matches!(
+                    edge.road_type.as_str(),
+                    "service" | "path" | "footway" | "track" | "pedestrian"
+                ) {
+                    return None;
+                }
+                let src = edge_ref.source();
+                let dst = edge_ref.target();
+                if building_nodes.contains(&src) || building_nodes.contains(&dst) {
+                    return None;
+                }
+                Some(edge_ref.id())
+            })
+            .collect();
+        let mut removed = 0usize;
+        for edge_idx in removable {
+            if self.graph.remove_edge(edge_idx).is_some() {
+                removed += 1;
+            }
+        }
+        removed
+    }
+
+    fn rebuild_topology_metadata(&mut self) {
+        refresh_edge_lengths_and_decision_points(&mut self.graph);
+        self.node_index_map.clear();
+        let mut next_id = self
+            .graph
+            .node_indices()
+            .map(|i| self.graph[i].osm_id)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        for node_idx in self.graph.node_indices() {
+            if self.graph[node_idx].osm_id == 0 {
+                self.graph[node_idx].osm_id = next_id;
+                next_id += 1;
+            }
+            self.node_index_map
+                .insert(self.graph[node_idx].osm_id, node_idx);
+        }
+        self.bbox = compute_bbox(&self.graph);
+        self.spawn_points = find_spawn_points(&self.graph, &self.bbox);
+        self.boundary_nodes = find_boundary_nodes(&self.graph, &self.bbox);
+        crate::map::building_network::link_to_road_nodes(&mut self.od_buildings, &self.graph);
+    }
+}
+
 // ── Demo network ─────────────────────────────────────────────────────────────
 
 /// Build the **sandbox** 3×3 grid road network centred on the supplied bbox.
@@ -196,10 +406,10 @@ pub fn build_demo_road_network(grid_type: &str, bbox: [f64; 4]) -> MapData {
     // Helper: resolve lane count for a given axis index.
     let resolve_lanes = |idx: usize| -> u8 {
         match grid_type {
-            "one_lane"   => 1,
-            "two_lane"   => 2,
+            "one_lane" => 1,
+            "two_lane" => 2,
             "three_lane" => 3,
-            _            => (idx % 3 + 1) as u8, // "mixed": 1, 2, 3
+            _ => (idx % 3 + 1) as u8, // "mixed": 1, 2, 3
         }
     };
     let spec = |lanes: u8| -> (f32, &'static str) {
@@ -292,31 +502,31 @@ pub fn build_single_road_network(bbox: [f64; 4]) -> MapData {
 
     let start_node = graph.add_node(RoadNode {
         osm_id: 0,
-        lat:    cy,
-        lng:    cx - half_lng,
+        lat: cy,
+        lng: cx - half_lng,
         intersection_type: IntersectionType::Plain,
     });
     // Middle node — pedestrian crossing with traffic signals
     let mid_node = graph.add_node(RoadNode {
         osm_id: 100,
-        lat:    cy,
-        lng:    cx,
+        lat: cy,
+        lng: cx,
         intersection_type: IntersectionType::PedestrianCrossing,
     });
     let end_node = graph.add_node(RoadNode {
         osm_id: 1,
-        lat:    cy,
-        lng:    cx + half_lng,
+        lat: cy,
+        lng: cx + half_lng,
         intersection_type: IntersectionType::Plain,
     });
-    node_index_map.insert(0,   start_node);
+    node_index_map.insert(0, start_node);
     node_index_map.insert(100, mid_node);
-    node_index_map.insert(1,   end_node);
+    node_index_map.insert(1, end_node);
 
     let half_m = haversine_distance_m(cy, cx - half_lng, cy, cx);
     let make_edge = |len: f32| RoadEdge {
         osm_id: 0,
-        lanes:  1,
+        lanes: 1,
         max_speed: 13.89, // 50 km/h
         oneway: true,
         infra_type: InfraType::Normal,
@@ -328,13 +538,16 @@ pub fn build_single_road_network(bbox: [f64; 4]) -> MapData {
         has_tram_track: false,
     };
     graph.add_edge(start_node, mid_node, make_edge(half_m));
-    graph.add_edge(mid_node,   end_node, make_edge(half_m));
+    graph.add_edge(mid_node, end_node, make_edge(half_m));
 
     let bbox = compute_bbox(&graph);
-    let spawn_points   = vec![start_node];
+    let spawn_points = vec![start_node];
     let boundary_nodes = vec![end_node];
 
-    log::info!("Built SINGLE-ROAD test: 3 nodes, 2 edges, pedestrian crossing at centre ({:.0} m each)", half_m);
+    log::info!(
+        "Built SINGLE-ROAD test: 3 nodes, 2 edges, pedestrian crossing at centre ({:.0} m each)",
+        half_m
+    );
 
     let tram_data = TramData {
         graph: crate::map::tram_network::TramGraph::new(),
@@ -509,12 +722,13 @@ pub fn build_road_network(osm_data: OsmData) -> MapData {
         }
 
         let oneway = parse_oneway(tags);
-        let highway_type = tags.get("highway").map(String::as_str).unwrap_or("unclassified");
+        let highway_type = tags
+            .get("highway")
+            .map(String::as_str)
+            .unwrap_or("unclassified");
         let lanes = parse_lanes(tags.get("lanes").map(String::as_str), highway_type);
-        let max_speed = parse_max_speed(
-            tags.get("maxspeed").map(String::as_str),
-            Some(highway_type),
-        );
+        let max_speed =
+            parse_max_speed(tags.get("maxspeed").map(String::as_str), Some(highway_type));
         let infra_type = parse_infra_type(tags);
         let layer = parse_layer(tags.get("layer").map(String::as_str));
         let lane_directions = tags
@@ -527,7 +741,7 @@ pub fn build_road_network(osm_data: OsmData) -> MapData {
 
         for window in way.node_refs.windows(2) {
             let from_id = window[0];
-            let to_id   = window[1];
+            let to_id = window[1];
 
             let (from_idx, to_idx) =
                 match (node_index_map.get(&from_id), node_index_map.get(&to_id)) {
@@ -536,11 +750,9 @@ pub fn build_road_network(osm_data: OsmData) -> MapData {
                 };
 
             let from_node = &graph[from_idx];
-            let to_node   = &graph[to_idx];
-            let length_m  = haversine_distance_m(
-                from_node.lat, from_node.lng,
-                to_node.lat,   to_node.lng,
-            );
+            let to_node = &graph[to_idx];
+            let length_m =
+                haversine_distance_m(from_node.lat, from_node.lng, to_node.lat, to_node.lng);
             let decision_points = [length_m * 0.25, length_m * 0.50, length_m * 0.75];
 
             let edge = RoadEdge {
@@ -558,9 +770,13 @@ pub fn build_road_network(osm_data: OsmData) -> MapData {
             };
 
             match oneway {
-                1  => { graph.add_edge(from_idx, to_idx, edge); }
-                -1 => { graph.add_edge(to_idx, from_idx, edge); }
-                _  => {
+                1 => {
+                    graph.add_edge(from_idx, to_idx, edge);
+                }
+                -1 => {
+                    graph.add_edge(to_idx, from_idx, edge);
+                }
+                _ => {
                     graph.add_edge(from_idx, to_idx, edge.clone());
                     let rev = RoadEdge {
                         lane_directions: build_lane_directions_reversed(lanes),
@@ -589,7 +805,10 @@ pub fn build_road_network(osm_data: OsmData) -> MapData {
             }
         }
         for node_idx in graph.node_indices() {
-            if matches!(graph[node_idx].intersection_type, IntersectionType::TrafficLight) {
+            if matches!(
+                graph[node_idx].intersection_type,
+                IntersectionType::TrafficLight
+            ) {
                 let way_count = ways_per_node.get(&node_idx).map(|s| s.len()).unwrap_or(0);
                 if way_count < 2 {
                     graph[node_idx].intersection_type = IntersectionType::Plain;
@@ -598,13 +817,12 @@ pub fn build_road_network(osm_data: OsmData) -> MapData {
         }
     }
 
-    let bbox           = compute_bbox(&graph);
-    let spawn_points   = find_spawn_points(&graph, &bbox);
+    let bbox = compute_bbox(&graph);
+    let spawn_points = find_spawn_points(&graph, &bbox);
     let boundary_nodes = find_boundary_nodes(&graph, &bbox);
 
     // ── OD buildings ─────────────────────────────────────────────────────────
-    let mut od_buildings =
-        crate::map::building_loader::extract_od_buildings(&osm_data);
+    let mut od_buildings = crate::map::building_loader::extract_od_buildings(&osm_data);
     crate::map::building_network::link_to_road_nodes(&mut od_buildings, &graph);
 
     // ── Turn restrictions ────────────────────────────────────────────────────
@@ -645,7 +863,10 @@ pub fn build_road_network(osm_data: OsmData) -> MapData {
 /// keeping intersections clearly separated for traffic-light gameplay.
 #[inline]
 fn is_backbone_road(highway: Option<&str>) -> bool {
-    matches!(highway, Some("primary") | Some("secondary") | Some("tertiary"))
+    matches!(
+        highway,
+        Some("primary") | Some("secondary") | Some("tertiary")
+    )
 }
 
 fn determine_intersection_type(tags: &HashMap<String, String>) -> IntersectionType {
@@ -656,9 +877,9 @@ fn determine_intersection_type(tags: &HashMap<String, String>) -> IntersectionTy
     if let Some(highway) = tags.get("highway") {
         match highway.as_str() {
             "traffic_signals" => return IntersectionType::TrafficLight,
-            "stop"            => return IntersectionType::Stop,
-            "give_way"        => return IntersectionType::Yield,
-            _                 => {}
+            "stop" => return IntersectionType::Stop,
+            "give_way" => return IntersectionType::Yield,
+            _ => {}
         }
     }
     if tags.contains_key("traffic_signals") {
@@ -682,7 +903,7 @@ fn parse_oneway(tags: &HashMap<String, String>) -> i8 {
     // Explicit oneway tag
     match tags.get("oneway").map(String::as_str) {
         Some("yes") | Some("true") | Some("1") => return 1,
-        Some("-1")  | Some("reverse")           => return -1,
+        Some("-1") | Some("reverse") => return -1,
         _ => {}
     }
     // Roundabouts are always one-way (forward)
@@ -702,11 +923,11 @@ fn parse_lanes(value: Option<&str>, highway: &str) -> u8 {
         return n.max(1).min(8);
     }
     match highway {
-        "motorway" | "trunk"                        => 3,
-        "primary"                                   => 2,
-        "secondary" | "tertiary"                    => 2,
+        "motorway" | "trunk" => 3,
+        "primary" => 2,
+        "secondary" | "tertiary" => 2,
         "residential" | "living_street" | "service" => 1,
-        _                                           => 1,
+        _ => 1,
     }
 }
 
@@ -718,7 +939,9 @@ fn parse_max_speed(maxspeed: Option<&str>, highway: Option<&str>) -> f32 {
         } else if let Some(stripped) = s.strip_suffix("mph") {
             stripped.trim().parse::<f32>().ok().map(|v| v * 1.60934)
         } else {
-            s.split_whitespace().next().and_then(|v| v.parse::<f32>().ok())
+            s.split_whitespace()
+                .next()
+                .and_then(|v| v.parse::<f32>().ok())
         };
         if let Some(kmh_val) = kmh {
             return (kmh_val / 3.6).max(1.0);
@@ -726,15 +949,15 @@ fn parse_max_speed(maxspeed: Option<&str>, highway: Option<&str>) -> f32 {
     }
     let kmh: f32 = match highway {
         Some("motorway") | Some("motorway_link") => 120.0,
-        Some("trunk") | Some("trunk_link")       => 90.0,
-        Some("primary") | Some("primary_link")   => 70.0,
+        Some("trunk") | Some("trunk_link") => 90.0,
+        Some("primary") | Some("primary_link") => 70.0,
         Some("secondary") | Some("secondary_link") => 60.0,
         Some("tertiary") | Some("tertiary_link") => 50.0,
-        Some("residential")                      => 30.0,
-        Some("living_street")                    => 10.0,
-        Some("service")                          => 20.0,
+        Some("residential") => 30.0,
+        Some("living_street") => 10.0,
+        Some("service") => 20.0,
         Some("pedestrian") | Some("footway") | Some("path") => 10.0,
-        _                                        => 50.0,
+        _ => 50.0,
     };
     kmh / 3.6
 }
@@ -757,7 +980,11 @@ fn build_lane_directions(lanes: u8) -> Vec<LaneDirection> {
     match lanes {
         0 | 1 => vec![LaneDirection::Straight],
         2 => vec![LaneDirection::Left, LaneDirection::Straight],
-        3 => vec![LaneDirection::Left, LaneDirection::Straight, LaneDirection::Right],
+        3 => vec![
+            LaneDirection::Left,
+            LaneDirection::Straight,
+            LaneDirection::Right,
+        ],
         n => {
             let mut dirs = vec![LaneDirection::Left];
             for _ in 1..(n - 1) {
@@ -780,10 +1007,10 @@ fn parse_turn_lanes(tag: &str) -> Vec<LaneDirection> {
         .map(|lane| {
             let first = lane.split(';').next().unwrap_or("through").trim();
             match first {
-                "left"  | "sharp_left"  | "slight_left"  => LaneDirection::Left,
+                "left" | "sharp_left" | "slight_left" => LaneDirection::Left,
                 "right" | "sharp_right" | "slight_right" => LaneDirection::Right,
-                "reverse"                                 => LaneDirection::UTurn,
-                _                                         => LaneDirection::Straight,
+                "reverse" => LaneDirection::UTurn,
+                _ => LaneDirection::Straight,
             }
         })
         .collect()
@@ -791,15 +1018,15 @@ fn parse_turn_lanes(tag: &str) -> Vec<LaneDirection> {
 
 fn parse_restriction_kind(s: &str) -> Option<RestrictionKind> {
     match s {
-        "no_left_turn"      => Some(RestrictionKind::NoLeftTurn),
-        "no_right_turn"     => Some(RestrictionKind::NoRightTurn),
-        "no_straight_on"    => Some(RestrictionKind::NoStraightOn),
-        "no_u_turn"         => Some(RestrictionKind::NoUTurn),
-        "only_left_turn"    => Some(RestrictionKind::OnlyLeftTurn),
-        "only_right_turn"   => Some(RestrictionKind::OnlyRightTurn),
-        "only_straight_on"  => Some(RestrictionKind::OnlyStraightOn),
-        "no_entry"          => Some(RestrictionKind::NoEntry),
-        _                   => None,
+        "no_left_turn" => Some(RestrictionKind::NoLeftTurn),
+        "no_right_turn" => Some(RestrictionKind::NoRightTurn),
+        "no_straight_on" => Some(RestrictionKind::NoStraightOn),
+        "no_u_turn" => Some(RestrictionKind::NoUTurn),
+        "only_left_turn" => Some(RestrictionKind::OnlyLeftTurn),
+        "only_right_turn" => Some(RestrictionKind::OnlyRightTurn),
+        "only_straight_on" => Some(RestrictionKind::OnlyStraightOn),
+        "no_entry" => Some(RestrictionKind::NoEntry),
+        _ => None,
     }
 }
 
@@ -810,17 +1037,28 @@ fn build_turn_restrictions(relations: &[OsmRelation]) -> Vec<TurnRestriction> {
             let restriction_tag = rel.tags.get("restriction")?;
             let kind = parse_restriction_kind(restriction_tag)?;
 
-            let from_way_id = rel.members.iter()
+            let from_way_id = rel
+                .members
+                .iter()
                 .find(|m| m.role == "from" && m.member_type == "way")
                 .map(|m| m.ref_id)?;
-            let via_node_id = rel.members.iter()
+            let via_node_id = rel
+                .members
+                .iter()
                 .find(|m| m.role == "via" && m.member_type == "node")
                 .map(|m| m.ref_id)?;
-            let to_way_id = rel.members.iter()
+            let to_way_id = rel
+                .members
+                .iter()
                 .find(|m| m.role == "to" && m.member_type == "way")
                 .map(|m| m.ref_id)?;
 
-            Some(TurnRestriction { from_way_id, via_node_id, to_way_id, kind })
+            Some(TurnRestriction {
+                from_way_id,
+                via_node_id,
+                to_way_id,
+                kind,
+            })
         })
         .collect()
 }
@@ -843,10 +1081,18 @@ fn compute_bbox(graph: &RoadGraph) -> [f64; 4] {
 
     for idx in graph.node_indices() {
         let n = &graph[idx];
-        if n.lat < min_lat { min_lat = n.lat; }
-        if n.lat > max_lat { max_lat = n.lat; }
-        if n.lng < min_lng { min_lng = n.lng; }
-        if n.lng > max_lng { max_lng = n.lng; }
+        if n.lat < min_lat {
+            min_lat = n.lat;
+        }
+        if n.lat > max_lat {
+            max_lat = n.lat;
+        }
+        if n.lng < min_lng {
+            min_lng = n.lng;
+        }
+        if n.lng > max_lng {
+            max_lng = n.lng;
+        }
     }
 
     if min_lat == f64::MAX {
@@ -871,7 +1117,9 @@ fn find_spawn_points(graph: &RoadGraph, bbox: &[f64; 4]) -> Vec<NodeIndex> {
             || n.lng > max_lng - lng_range * margin;
 
         let degree = graph.edges(idx).count()
-            + graph.edges_directed(idx, petgraph::Direction::Incoming).count();
+            + graph
+                .edges_directed(idx, petgraph::Direction::Incoming)
+                .count();
         let is_junction = degree >= 3;
 
         if near_boundary || is_junction {
@@ -907,4 +1155,138 @@ fn find_boundary_nodes(graph: &RoadGraph, bbox: &[f64; 4]) -> Vec<NodeIndex> {
     } else {
         boundary
     }
+}
+
+fn split_edge_at_existing_node(
+    graph: &mut RoadGraph,
+    edge_idx: EdgeIndex,
+    at_node: NodeIndex,
+) -> bool {
+    let (src, dst) = match graph.edge_endpoints(edge_idx) {
+        Some(v) => v,
+        None => return false,
+    };
+    if src == at_node || dst == at_node {
+        return false;
+    }
+    let original = match graph.edge_weight(edge_idx) {
+        Some(e) => e.clone(),
+        None => return false,
+    };
+    let src_n = graph[src].clone();
+    let mid_n = graph[at_node].clone();
+    let dst_n = graph[dst].clone();
+    let len1 = haversine_distance_m(src_n.lat, src_n.lng, mid_n.lat, mid_n.lng);
+    let len2 = haversine_distance_m(mid_n.lat, mid_n.lng, dst_n.lat, dst_n.lng);
+    if len1 < 0.2 || len2 < 0.2 {
+        return false;
+    }
+    graph.remove_edge(edge_idx);
+
+    let mut e1 = original.clone();
+    e1.length_m = len1;
+    e1.decision_points = [len1 * 0.25, len1 * 0.50, len1 * 0.75];
+    let mut e2 = original;
+    e2.length_m = len2;
+    e2.decision_points = [len2 * 0.25, len2 * 0.50, len2 * 0.75];
+    graph.add_edge(src, at_node, e1);
+    graph.add_edge(at_node, dst, e2);
+    true
+}
+
+fn refresh_edge_lengths_and_decision_points(graph: &mut RoadGraph) {
+    let edge_indices: Vec<EdgeIndex> = graph.edge_indices().collect();
+    for edge_idx in edge_indices {
+        let Some((src, dst)) = graph.edge_endpoints(edge_idx) else {
+            continue;
+        };
+        let len = haversine_distance_m(
+            graph[src].lat,
+            graph[src].lng,
+            graph[dst].lat,
+            graph[dst].lng,
+        );
+        if let Some(edge) = graph.edge_weight_mut(edge_idx) {
+            edge.length_m = len;
+            edge.decision_points = [len * 0.25, len * 0.50, len * 0.75];
+        }
+    }
+}
+
+fn project_point_on_segment_m(
+    p_lat: f64,
+    p_lng: f64,
+    a_lat: f64,
+    a_lng: f64,
+    b_lat: f64,
+    b_lng: f64,
+) -> ((f64, f64), f64, f64) {
+    let cos_lat = p_lat.to_radians().cos().abs().max(0.01);
+    let lng_scale = 111_320.0 * cos_lat;
+    let lat_scale = 111_320.0;
+    let px = p_lng * lng_scale;
+    let py = p_lat * lat_scale;
+    let ax = a_lng * lng_scale;
+    let ay = a_lat * lat_scale;
+    let bx = b_lng * lng_scale;
+    let by = b_lat * lat_scale;
+    let abx = bx - ax;
+    let aby = by - ay;
+    let denom = abx * abx + aby * aby;
+    if denom <= 1e-9 {
+        return (
+            (a_lat, a_lng),
+            0.0,
+            ((px - ax).powi(2) + (py - ay).powi(2)).sqrt(),
+        );
+    }
+    let t = (((px - ax) * abx + (py - ay) * aby) / denom).clamp(0.0, 1.0);
+    let qx = ax + t * abx;
+    let qy = ay + t * aby;
+    let dist = ((px - qx).powi(2) + (py - qy).powi(2)).sqrt();
+    ((qy / lat_scale, qx / lng_scale), t, dist)
+}
+
+fn segment_intersection_lat_lng(
+    a1_lat: f64,
+    a1_lng: f64,
+    a2_lat: f64,
+    a2_lng: f64,
+    b1_lat: f64,
+    b1_lng: f64,
+    b2_lat: f64,
+    b2_lng: f64,
+) -> Option<(f64, f64, f64, f64)> {
+    let c_lat = (a1_lat + a2_lat + b1_lat + b2_lat) * 0.25;
+    let cos_lat = c_lat.to_radians().cos().abs().max(0.01);
+    let lng_scale = 111_320.0 * cos_lat;
+    let lat_scale = 111_320.0;
+
+    let ax = a1_lng * lng_scale;
+    let ay = a1_lat * lat_scale;
+    let bx = a2_lng * lng_scale;
+    let by = a2_lat * lat_scale;
+    let cx = b1_lng * lng_scale;
+    let cy = b1_lat * lat_scale;
+    let dx = b2_lng * lng_scale;
+    let dy = b2_lat * lat_scale;
+
+    let r_x = bx - ax;
+    let r_y = by - ay;
+    let s_x = dx - cx;
+    let s_y = dy - cy;
+    let denom = r_x * s_y - r_y * s_x;
+    if denom.abs() < 1e-9 {
+        return None;
+    }
+    let qp_x = cx - ax;
+    let qp_y = cy - ay;
+    let t = (qp_x * s_y - qp_y * s_x) / denom;
+    let u = (qp_x * r_y - qp_y * r_x) / denom;
+    if !(0.0..=1.0).contains(&t) || !(0.0..=1.0).contains(&u) {
+        return None;
+    }
+    let ix = ax + t * r_x;
+    let iy = ay + t * r_y;
+    Some((iy / lat_scale, ix / lng_scale, t, u))
 }
