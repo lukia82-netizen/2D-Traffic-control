@@ -105,6 +105,7 @@ const TURN_CONNECTOR_ENTRY_M = 35;
 const TURN_CONNECTOR_EXIT_M = 35;
 const TURN_CONNECTOR_MIN_ANGLE_RAD = 0.35;
 const TURN_CONNECTOR_ACTIVE_MAX_DIST_M = 12;
+const TURN_CONNECTOR_DEBUG_LANE_OFFSET_M = 1.75;
 
 interface TurnConnectorPath {
   points: [number, number][];
@@ -204,8 +205,8 @@ export class Game {
     this.gameClockUI = new GameClockUI();
     this.debugRouteGfx = new PIXI.Graphics();
     this.turnConnectorGfx = new PIXI.Graphics();
-    this.overlay.trafficLights.addChild(this.debugRouteGfx);
-    this.overlay.trafficLights.addChild(this.turnConnectorGfx);
+    this.overlay.congestionLayer.addChild(this.debugRouteGfx);
+    this.overlay.congestionLayer.addChild(this.turnConnectorGfx);
 
     // Init vehicle textures
     await this.vehicleRenderer.init();
@@ -762,24 +763,65 @@ export class Game {
   ): TurnConnectorPath {
     const entryT = Math.max(0, Math.min(1, 1 - TURN_CONNECTOR_ENTRY_M / Math.max(inLenM, 1)));
     const exitT = Math.max(0, Math.min(1, TURN_CONNECTOR_EXIT_M / Math.max(outLenM, 1)));
-    const p1Lng = inSrc.lng + (junction.lng - inSrc.lng) * entryT;
-    const p1Lat = inSrc.lat + (junction.lat - inSrc.lat) * entryT;
-    const p2Lng = junction.lng + (outTgt.lng - junction.lng) * exitT;
-    const p2Lat = junction.lat + (outTgt.lat - junction.lat) * exitT;
+    const p1BaseLng = inSrc.lng + (junction.lng - inSrc.lng) * entryT;
+    const p1BaseLat = inSrc.lat + (junction.lat - inSrc.lat) * entryT;
+    const p2BaseLng = junction.lng + (outTgt.lng - junction.lng) * exitT;
+    const p2BaseLat = junction.lat + (outTgt.lat - junction.lat) * exitT;
+
+    const lngM = 71_700;
+    const latM = 111_320;
+    const inFxRaw = (junction.lng - inSrc.lng) * lngM;
+    const inFyRaw = (junction.lat - inSrc.lat) * latM;
+    const outFxRaw = (outTgt.lng - junction.lng) * lngM;
+    const outFyRaw = (outTgt.lat - junction.lat) * latM;
+    const inLen = Math.hypot(inFxRaw, inFyRaw) || 1e-9;
+    const outLen = Math.hypot(outFxRaw, outFyRaw) || 1e-9;
+    const inFx = inFxRaw / inLen;
+    const inFy = inFyRaw / inLen;
+    const outFx = outFxRaw / outLen;
+    const outFy = outFyRaw / outLen;
+
+    // Right-hand lane center offset for debug curve visualization.
+    const inRx = inFy;
+    const inRy = -inFx;
+    const outRx = outFy;
+    const outRy = -outFx;
+    const p1Lng = p1BaseLng + (inRx * TURN_CONNECTOR_DEBUG_LANE_OFFSET_M) / lngM;
+    const p1Lat = p1BaseLat + (inRy * TURN_CONNECTOR_DEBUG_LANE_OFFSET_M) / latM;
+    const p2Lng = p2BaseLng + (outRx * TURN_CONNECTOR_DEBUG_LANE_OFFSET_M) / lngM;
+    const p2Lat = p2BaseLat + (outRy * TURN_CONNECTOR_DEBUG_LANE_OFFSET_M) / latM;
+
+    // Build control point from tangent-line intersection for smoother entry/exit heading.
+    const p1x = p1Lng * lngM;
+    const p1y = p1Lat * latM;
+    const p2x = p2Lng * lngM;
+    const p2y = p2Lat * latM;
+    const det = inFx * (-outFy) - inFy * (-outFx);
+    let ctrlLng = junction.lng;
+    let ctrlLat = junction.lat;
+    if (Math.abs(det) > 1e-9) {
+      const dx = p2x - p1x;
+      const dy = p2y - p1y;
+      const t = (dx * (-outFy) - dy * (-outFx)) / det;
+      const cx = p1x + t * inFx;
+      const cy = p1y + t * inFy;
+      ctrlLng = cx / lngM;
+      ctrlLat = cy / latM;
+    }
 
     const points: [number, number][] = [];
     const samples = 14;
     for (let i = 0; i <= samples; i++) {
       const t = i / samples;
       const u = 1 - t;
-      const lng = u * u * p1Lng + 2 * u * t * junction.lng + t * t * p2Lng;
-      const lat = u * u * p1Lat + 2 * u * t * junction.lat + t * t * p2Lat;
+      const lng = u * u * p1Lng + 2 * u * t * ctrlLng + t * t * p2Lng;
+      const lat = u * u * p1Lat + 2 * u * t * ctrlLat + t * t * p2Lat;
       points.push([lng, lat]);
     }
     return {
       points,
       p1: [p1Lng, p1Lat],
-      ctrl: [junction.lng, junction.lat],
+      ctrl: [ctrlLng, ctrlLat],
       p2: [p2Lng, p2Lat],
     };
   }

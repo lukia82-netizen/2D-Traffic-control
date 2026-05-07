@@ -102,14 +102,17 @@ export class UIRenderer {
     deltaV: number;
     distToStopLine: number;
     redBlocking: boolean;
+    onCurve: boolean;
+    turnT: number;
   }): void {
     this.idmDebugLine.textContent = `vehicle: ${data.vehicleId}`;
     this.idmDebugLine2.textContent =
       `v: ${data.speed.toFixed(1)} m/s | gap: ${data.gap.toFixed(1)} m`;
     this.idmDebugLine3.textContent =
       `dv: ${data.deltaV.toFixed(1)} m/s | stop: ${data.distToStopLine.toFixed(1)} m`;
-    this.idmDebugLine4.textContent = `red: ${data.redBlocking ? 'YES' : 'NO'}`;
-    this.idmDebugLine4.style.color = data.redBlocking ? '#ff6b6b' : '#7fffb0';
+    this.idmDebugLine4.textContent =
+      `red: ${data.redBlocking ? 'YES' : 'NO'} | curve: ${data.onCurve ? 'YES' : 'NO'} | t: ${data.turnT.toFixed(3)}`;
+    this.idmDebugLine4.style.color = data.redBlocking ? '#ff6b6b' : (data.onCurve ? '#67e8f9' : '#7fffb0');
   }
 
   /**

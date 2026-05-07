@@ -40,10 +40,12 @@ const DEFAULT_DEBUG_LOG_INTERVAL_S: f32 = 0.5;
 
 /// Only consider cross-traffic IDM within this distance to the node (meters).
 const CROSS_TRAFFIC_MAX_DIST_M: f32 = 70.0;
-const TURN_CONNECTOR_ENTRY_M: f32 = 10.0;
-const TURN_CONNECTOR_EXIT_M: f32 = 10.0;
+const TURN_CONNECTOR_ENTRY_M: f32 = 35.0;
+const TURN_CONNECTOR_EXIT_M: f32 = 35.0;
 const TURN_CONNECTOR_MIN_ANGLE_RAD: f32 = 0.35;
-const TURN_CONNECTOR_TARGET_SPEED_MPS: f32 = 15.0 / 3.6;
+const TURN_CONNECTOR_TARGET_SPEED_MPS: f32 = 25.0 / 3.6;
+const GEO_LAT_M: f64 = 111_320.0;
+const GEO_LNG_M: f64 = 71_700.0;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -62,6 +64,8 @@ struct IdmDebugPayload {
     delta_v: f32,
     dist_to_stop_line: f32,
     red_blocking: bool,
+    on_curve: bool,
+    turn_t: f32,
     route_points: Vec<[f64; 2]>,
 }
 
@@ -479,6 +483,8 @@ pub fn run_simulation(
                             delta_v,
                             dist_to_stop_line,
                             red_blocking,
+                            on_curve: ego.on_turn_connector,
+                            turn_t: ego.turn_t,
                             route_points: build_route_points(ego, map),
                         };
                         let _ = app_handle.emit("idm_debug", payload);
@@ -701,9 +707,50 @@ fn bumper_gap(center_dist_m: f32, ego: &Vehicle, leader: &Vehicle) -> f32 {
 
 #[inline]
 fn geo_dist_approx(lat1: f64, lng1: f64, lat2: f64, lng2: f64) -> f32 {
-    let dlat = (lat2 - lat1) * 111_320.0;
-    let dlng = (lng2 - lng1) * 71_700.0;
+    let dlat = (lat2 - lat1) * GEO_LAT_M;
+    let dlng = (lng2 - lng1) * GEO_LNG_M;
     ((dlat * dlat + dlng * dlng) as f32).sqrt()
+}
+
+#[inline]
+fn geo_to_m_xy(lat: f64, lng: f64) -> (f64, f64) {
+    (lng * GEO_LNG_M, lat * GEO_LAT_M)
+}
+
+#[inline]
+fn m_xy_to_geo(x_m: f64, y_m: f64) -> (f64, f64) {
+    (y_m / GEO_LAT_M, x_m / GEO_LNG_M)
+}
+
+#[inline]
+fn normalize_xy(x: f64, y: f64) -> (f64, f64) {
+    let len = (x * x + y * y).sqrt();
+    if len <= 1e-9 {
+        (0.0, 0.0)
+    } else {
+        (x / len, y / len)
+    }
+}
+
+#[inline]
+fn line_intersection(
+    p1x: f64,
+    p1y: f64,
+    d1x: f64,
+    d1y: f64,
+    p2x: f64,
+    p2y: f64,
+    d2x: f64,
+    d2y: f64,
+) -> Option<(f64, f64)> {
+    let det = d1x * d2y - d1y * d2x;
+    if det.abs() < 1e-9 {
+        return None;
+    }
+    let dx = p2x - p1x;
+    let dy = p2y - p1y;
+    let t = (dx * d2y - dy * d2x) / det;
+    Some((p1x + t * d1x, p1y + t * d1y))
 }
 
 /// Desired speed = road max_speed × personal_compliance, capped by vehicle type max.
@@ -739,6 +786,8 @@ fn apply_intersection_effect(
     map: &MapData,
 ) -> (f32, f32) {
     if vehicle.route_pos >= vehicle.route.len() { return (gap, delta_v); }
+    // Vehicle already past the stop line — Bezier path owns its motion.
+    if vehicle.on_turn_connector { return (gap, delta_v); }
     let edge_idx = vehicle.route[vehicle.route_pos];
     let edge = match map.graph.edge_weight(edge_idx) {
         Some(e) => e,
@@ -926,6 +975,8 @@ fn apply_cross_traffic_leader_effect(
     if ego.route_pos >= ego.route.len() {
         return (gap, delta_v);
     }
+    // Already on the connector — cross-traffic braking not applicable.
+    if ego.on_turn_connector { return (gap, delta_v); }
     let ego_edge = ego.route[ego.route_pos];
     let ego_edge_len = match map.graph.edge_weight(ego_edge) {
         Some(e) => e.length_m,
@@ -1201,6 +1252,8 @@ fn apply_vehicle_physics(
 
     // Hard red-line guard: never let a vehicle cross the stop line on red/yellow.
     // IDM does the smooth braking; this guard prevents rare frame-step overshoot.
+    // Skip entirely when the vehicle is already on a turn connector (past the stop line).
+    if !vehicle.on_turn_connector {
     if let Some((_, tgt)) = map.graph.edge_endpoints(edge_idx) {
         let tgt_osm_id = map.graph[tgt].osm_id;
         let itype = &map.graph[tgt].intersection_type;
@@ -1219,6 +1272,7 @@ fn apply_vehicle_physics(
             }
         }
     }
+    } // end !on_turn_connector guard
 
     if let Some(conn) = planned_turn_connector(vehicle, map) {
         if vehicle.edge_progress >= conn.entry_progress {
@@ -1234,6 +1288,30 @@ fn apply_vehicle_physics(
             vehicle.turn_p2_lat = conn.p2_lat;
             vehicle.turn_p2_lng = conn.p2_lng;
             vehicle.edge_progress = conn.entry_progress;
+
+            // Immediately place vehicle at Bezier start (avoid 1-frame linear snap).
+            let (lat0, lng0) = bezier_point_lat_lng(
+                conn.p1_lat, conn.p1_lng,
+                conn.ctrl_lat, conn.ctrl_lng,
+                conn.p2_lat, conn.p2_lng,
+                0.0,
+            );
+            vehicle.lat = lat0;
+            vehicle.lng = lng0;
+            // Initial heading from Bezier tangent at t≈0.
+            let (lat1, lng1) = bezier_point_lat_lng(
+                conn.p1_lat, conn.p1_lng,
+                conn.ctrl_lat, conn.ctrl_lng,
+                conn.p2_lat, conn.p2_lng,
+                0.03,
+            );
+            let dlng = (lng1 - lng0) as f32;
+            let dlat = (lat1 - lat0) as f32;
+            if dlng.abs() > 1e-9 || dlat.abs() > 1e-9 {
+                vehicle.angle = dlng.atan2(dlat);
+            }
+            // Do NOT fall through to linear interpolation — Bezier takes over next tick.
+            return;
         }
     }
 
@@ -1251,7 +1329,7 @@ fn apply_vehicle_physics(
         vehicle.target_lane = compute_vehicle_target_lane(vehicle, map);
     }
 
-    // Interpolate position
+    // Linear position interpolation (straight road segments only).
     let src = &map.graph[src_idx];
     let tgt = &map.graph[tgt_idx];
     let t   = vehicle.edge_progress as f64;
@@ -1311,18 +1389,28 @@ fn planned_turn_connector(vehicle: &Vehicle, map: &MapData) -> Option<PlannedTur
 
     let entry_progress = (1.0 - TURN_CONNECTOR_ENTRY_M / curr_len).clamp(0.0, 1.0);
     let exit_progress = (TURN_CONNECTOR_EXIT_M / next_len).clamp(0.0, 1.0);
-    if entry_progress <= vehicle.edge_progress {
-        return None;
-    }
+    // Do NOT early-return here — the caller decides when to activate based on edge_progress.
 
     let p1_lat = src_n.lat + (jn.lat - src_n.lat) * entry_progress as f64;
     let p1_lng = src_n.lng + (jn.lng - src_n.lng) * entry_progress as f64;
     let p2_lat = jn.lat + (tgt_n.lat - jn.lat) * exit_progress as f64;
     let p2_lng = jn.lng + (tgt_n.lng - jn.lng) * exit_progress as f64;
-    let ctrl_lat = jn.lat;
-    let ctrl_lng = jn.lng;
 
-    let length_m = bezier_length_m(p1_lat, p1_lng, ctrl_lat, ctrl_lng, p2_lat, p2_lng, 16);
+    // Tangent-continuous control point: intersection of the two road tangents.
+    let (in_fx, in_fy) = normalize_xy((jn.lng - src_n.lng) * GEO_LNG_M, (jn.lat - src_n.lat) * GEO_LAT_M);
+    let (out_fx, out_fy) =
+        normalize_xy((tgt_n.lng - jn.lng) * GEO_LNG_M, (tgt_n.lat - jn.lat) * GEO_LAT_M);
+    let (p1x, p1y) = geo_to_m_xy(p1_lat, p1_lng);
+    let (p2x, p2y) = geo_to_m_xy(p2_lat, p2_lng);
+    let (ctrl_lat, ctrl_lng) = if let Some((cx, cy)) =
+        line_intersection(p1x, p1y, in_fx, in_fy, p2x, p2y, -out_fx, -out_fy)
+    {
+        m_xy_to_geo(cx, cy)
+    } else {
+        (jn.lat, jn.lng)
+    };
+
+    let length_m = bezier_length_m(p1_lat, p1_lng, ctrl_lat, ctrl_lng, p2_lat, p2_lng, 24);
 
     Some(PlannedTurnConnector {
         entry_progress,
