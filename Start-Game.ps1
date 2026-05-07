@@ -6,14 +6,18 @@
 $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 # --- Tool paths (adjust if your installation differs) ------------------------
-$NodeDir  = "C:\Users\lnowak\AppData\Local\nodejs-portable\node-v20.19.1-win-x64"
-$CargoDir = "C:\Users\lnowak\.cargo\bin"
-$MinGWDir = "C:\Users\lnowak\AppData\Local\mingw64\mingw64\bin"
+$NodeDir  = "C:\Users\lukia\AppData\Local\nodejs-portable\node-v20.19.1-win-x64"
+$CargoDir = "C:\Users\lukia\.cargo\bin"
+$MinGWDir = "C:\Users\lukia\AppData\Local\mingw64\mingw64\bin"
 
 # --- Environment -------------------------------------------------------------
 $env:PATH        = "$MinGWDir;$CargoDir;$NodeDir;" + $env:PATH
-$env:RUSTUP_HOME = "C:\Users\lnowak\.rustup"
-$env:CARGO_HOME  = "C:\Users\lnowak\.cargo"
+$env:RUSTUP_HOME = "C:\Users\lukia\.rustup"
+$env:CARGO_HOME  = "C:\Users\lukia\.cargo"
+# Rust / env_logger: richer backend logs in this console (override before running script if needed).
+if (-not $env:RUST_LOG) {
+    $env:RUST_LOG = "debug"
+}
 
 # --- Virtual drive T: (avoids spaces-in-path issues for cargo/gcc) -----------
 subst T: $ProjectRoot 2>$null | Out-Null
