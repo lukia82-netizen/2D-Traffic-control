@@ -230,9 +230,18 @@ pub struct EditorHistory {
 }
 
 #[derive(Default, Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct MapOverrides {
     pub node_positions: HashMap<u64, [f64; 2]>,
     pub added_edges: Vec<[u64; 2]>,
     pub deleted_edges: Vec<[u64; 2]>,
+    pub edge_tag_overrides: HashMap<String, EdgeTagOverride>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct EdgeTagOverride {
+    pub lanes: u8,
+    pub oneway: bool,
+    pub lane_directions: Vec<String>,
 }
 

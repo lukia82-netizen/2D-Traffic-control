@@ -13,6 +13,7 @@ import {
   editorConnect,
   editorExtrude,
   editorDeleteEdge,
+  editorUpdateEdgeTags,
   editorUndo,
   editorRedo,
   saveMapOverrides,
@@ -204,6 +205,7 @@ export class Game {
   private connectFromNodeId: number | null = null;
   private nextCustomNodeId = 1_000_000;
   private edgeEditorPanel: HTMLDivElement | null = null;
+  private toolSwitchPanel: HTMLDivElement | null = null;
 
   constructor(map: maplibregl.Map, overlay: PixiOverlay) {
     this.map = map;
@@ -298,6 +300,7 @@ export class Game {
     this.bindEditorPointerHandlers();
     this.bindEditorKeyboardHandlers();
     this.initEdgeEditorPanel();
+    this.initToolSwitchPanel();
 
     // Start the PixiJS ticker
     this.overlay.app.ticker.add((ticker) => this.gameLoop(ticker));
@@ -1000,6 +1003,10 @@ export class Game {
     if (idx !== null) {
       const edge = this.mapData.edges[idx];
       this.updateEdgeEditorPanel(edge);
+      if (this.editorTool === 'delete') {
+        void editorDeleteEdge(edge.from, edge.to).then((m) => this.applyCustomMapData(m));
+        return true;
+      }
       this.uiRenderer.showNotification(`Edge lanes=${edge.lanes} dir=${edge.oneway ? 'oneway' : 'both'}`, 'info');
       return true;
     }
@@ -1010,9 +1017,40 @@ export class Game {
   private initEdgeEditorPanel(): void {
     const panel = document.createElement('div');
     panel.className = 'edge-editor-panel';
-    panel.innerHTML = '<div class="edge-editor-title">Edge Selection</div><div class="edge-editor-content">No edge selected</div>';
+    panel.innerHTML = `
+      <div class="edge-editor-title">Edge Selection</div>
+      <div class="edge-editor-content">No edge selected</div>
+      <div class="edge-editor-form hidden">
+        <label>Lanes <input id="edge-lanes" type="number" min="1" max="8" value="2" /></label>
+        <label>Direction
+          <select id="edge-direction">
+            <option value="both">both</option>
+            <option value="oneway">oneway</option>
+          </select>
+        </label>
+        <label>Lane directions (csv)
+          <input id="edge-lane-directions" type="text" value="left,straight" />
+        </label>
+        <button id="edge-apply-btn">Apply tags</button>
+      </div>
+    `;
     document.body.appendChild(panel);
     this.edgeEditorPanel = panel;
+    panel.querySelector('#edge-apply-btn')?.addEventListener('click', () => {
+      if (!this.mapData || this.selectedEdgeIndex === null) return;
+      const edge = this.mapData.edges[this.selectedEdgeIndex];
+      if (!edge) return;
+      const lanes = Number((panel.querySelector('#edge-lanes') as HTMLInputElement).value || '2');
+      const dir = (panel.querySelector('#edge-direction') as HTMLSelectElement).value;
+      const laneDirections = (panel.querySelector('#edge-lane-directions') as HTMLInputElement)
+        .value
+        .split(',')
+        .map((s) => s.trim().toLowerCase())
+        .filter(Boolean);
+      editorUpdateEdgeTags(edge.from, edge.to, lanes, dir === 'oneway', laneDirections)
+        .then((m) => this.applyCustomMapData(m))
+        .catch(console.error);
+    });
   }
 
   private updateEdgeEditorPanel(edge: MapData['edges'][number] | null): void {
@@ -1021,14 +1059,46 @@ export class Game {
     if (!content) return;
     if (!edge) {
       content.innerHTML = 'No edge selected';
+      this.edgeEditorPanel.querySelector('.edge-editor-form')?.classList.add('hidden');
       return;
     }
+    this.edgeEditorPanel.querySelector('.edge-editor-form')?.classList.remove('hidden');
+    (this.edgeEditorPanel.querySelector('#edge-lanes') as HTMLInputElement).value = String(edge.lanes);
+    (this.edgeEditorPanel.querySelector('#edge-direction') as HTMLSelectElement).value = edge.oneway ? 'oneway' : 'both';
+    (this.edgeEditorPanel.querySelector('#edge-lane-directions') as HTMLInputElement).value = edge.laneDirections.join(',');
     content.innerHTML = `
       <div>Lanes: ${edge.lanes}</div>
       <div>Direction: ${edge.oneway ? 'oneway' : 'both'}</div>
       <div>Road type: ${edge.roadType}</div>
       <div>Max speed: ${(edge.maxSpeed * 3.6).toFixed(0)} km/h</div>
     `;
+  }
+
+  private initToolSwitchPanel(): void {
+    const panel = document.createElement('div');
+    panel.className = 'tool-switch-panel';
+    panel.innerHTML = `
+      <button data-tool="move_node">Move</button>
+      <button data-tool="add_road">Add</button>
+      <button data-tool="delete">Delete</button>
+      <button data-tool="select">Select</button>
+    `;
+    document.body.appendChild(panel);
+    this.toolSwitchPanel = panel;
+    const buttons = [...panel.querySelectorAll('button')];
+    const refresh = (): void => {
+      buttons.forEach((btn) => {
+        btn.classList.toggle('active', btn.getAttribute('data-tool') === this.editorTool);
+      });
+    };
+    buttons.forEach((btn) => {
+      btn.addEventListener('click', () => {
+        this.editorTool = btn.getAttribute('data-tool') as typeof this.editorTool;
+        void setEditorTool(this.editorTool);
+        refresh();
+      });
+    });
+    refresh();
   }
 
   private findNearestNodeId(x: number, y: number, maxDistPx: number): number | null {

@@ -271,6 +271,16 @@ pub struct ExtrudePayload {
     pub lng: f64,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateEdgeTagsPayload {
+    pub from_node_id: u64,
+    pub to_node_id: u64,
+    pub lanes: u8,
+    pub oneway: bool,
+    pub lane_directions: Vec<String>,
+}
+
 #[command]
 pub fn set_editor_tool(tool: EditorTool, state: State<AppState>) -> Result<(), String> {
     *state.editor_tool.write() = tool;
@@ -400,6 +410,42 @@ pub fn save_map_overrides(state: State<AppState>) -> Result<(), String> {
     let overrides = build_overrides(map);
     let body = serde_json::to_string_pretty(&overrides).map_err(|e| e.to_string())?;
     std::fs::write("map_overrides.json", body).map_err(|e| e.to_string())
+}
+
+#[command]
+pub fn editor_update_edge_tags(
+    payload: UpdateEdgeTagsPayload,
+    state: State<AppState>,
+) -> Result<MapDataResponse, String> {
+    let mut graph_guard = state.road_graph.write();
+    let map = graph_guard.as_mut().ok_or_else(|| "Map not loaded".to_string())?;
+    let mut updated = false;
+    let lanes = payload.lanes.max(1);
+    let lane_directions = payload
+        .lane_directions
+        .iter()
+        .map(|d| parse_lane_direction(d))
+        .collect::<Vec<_>>();
+    let edge_ids: Vec<_> = map
+        .graph
+        .edge_references()
+        .filter(|e| map.graph[e.source()].osm_id == payload.from_node_id && map.graph[e.target()].osm_id == payload.to_node_id)
+        .map(|e| e.id())
+        .collect();
+    for edge_id in edge_ids {
+        if let Some(edge) = map.graph.edge_weight_mut(edge_id) {
+            edge.lanes = lanes;
+            edge.oneway = payload.oneway;
+            edge.lane_directions = lane_directions.clone();
+            updated = true;
+        }
+    }
+    if !updated {
+        return Err("Edge not found".to_string());
+    }
+    map.rebuild_geometry(payload.from_node_id);
+    map.rebuild_geometry(payload.to_node_id);
+    Ok(build_map_response(map))
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -610,6 +656,29 @@ fn apply_overrides_from_disk(map: &mut MapData) -> Result<(), String> {
             map.graph.remove_edge(id);
         }
     }
+    for (key, tags) in parsed.edge_tag_overrides {
+        let Some((from, to)) = decode_edge_key(&key) else {
+            continue;
+        };
+        let lane_directions = tags
+            .lane_directions
+            .iter()
+            .map(|d| parse_lane_direction(d))
+            .collect::<Vec<_>>();
+        let edge_ids: Vec<_> = map
+            .graph
+            .edge_references()
+            .filter(|e| map.graph[e.source()].osm_id == from && map.graph[e.target()].osm_id == to)
+            .map(|e| e.id())
+            .collect();
+        for edge_id in edge_ids {
+            if let Some(edge) = map.graph.edge_weight_mut(edge_id) {
+                edge.lanes = tags.lanes.max(1);
+                edge.oneway = tags.oneway;
+                edge.lane_directions = lane_directions.clone();
+            }
+        }
+    }
     Ok(())
 }
 
@@ -628,5 +697,51 @@ fn build_overrides(map: &MapData) -> MapOverrides {
             .map(|e| [map.graph[e.source()].osm_id, map.graph[e.target()].osm_id])
             .collect(),
         deleted_edges: Vec::new(),
+        edge_tag_overrides: map
+            .graph
+            .edge_references()
+            .map(|e| {
+                let from = map.graph[e.source()].osm_id;
+                let to = map.graph[e.target()].osm_id;
+                let lane_directions = e
+                    .weight()
+                    .lane_directions
+                    .iter()
+                    .map(|d| match d {
+                        LaneDirection::Left => "left",
+                        LaneDirection::Straight => "straight",
+                        LaneDirection::Right => "right",
+                        LaneDirection::UTurn => "uturn",
+                    }
+                    .to_string())
+                    .collect::<Vec<_>>();
+                (
+                    encode_edge_key(from, to),
+                    crate::map::world_editor::EdgeTagOverride {
+                        lanes: e.weight().lanes,
+                        oneway: e.weight().oneway,
+                        lane_directions,
+                    },
+                )
+            })
+            .collect(),
     }
+}
+
+fn parse_lane_direction(value: &str) -> LaneDirection {
+    match value {
+        "left" => LaneDirection::Left,
+        "right" => LaneDirection::Right,
+        "uturn" => LaneDirection::UTurn,
+        _ => LaneDirection::Straight,
+    }
+}
+
+fn encode_edge_key(from: u64, to: u64) -> String {
+    format!("{}->{}", from, to)
+}
+
+fn decode_edge_key(key: &str) -> Option<(u64, u64)> {
+    let (a, b) = key.split_once("->")?;
+    Some((a.parse().ok()?, b.parse().ok()?))
 }

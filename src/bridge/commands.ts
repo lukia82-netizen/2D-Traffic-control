@@ -295,6 +295,18 @@ export async function editorDeleteEdge(fromNodeId: number, toNodeId: number): Pr
   return invoke<MapData>('editor_delete_edge', { payload: { fromNodeId, toNodeId } });
 }
 
+export async function editorUpdateEdgeTags(
+  fromNodeId: number,
+  toNodeId: number,
+  lanes: number,
+  oneway: boolean,
+  laneDirections: string[],
+): Promise<MapData> {
+  return invoke<MapData>('editor_update_edge_tags', {
+    payload: { fromNodeId, toNodeId, lanes, oneway, laneDirections },
+  });
+}
+
 export async function editorUndo(): Promise<MapData> {
   return invoke<MapData>('editor_undo');
 }
