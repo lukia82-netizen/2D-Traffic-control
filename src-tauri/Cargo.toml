@@ -26,6 +26,8 @@ log = "0.4"
 env_logger = "0.11"
 base64 = "0.22"
 parking_lot = "0.12"
+glam = { version = "0.32.1", features = ["serde"] }
+lyon_geom = "1.0.19"
 
 [profile.release]
 opt-level = 3
