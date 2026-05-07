@@ -4,6 +4,7 @@ import { Channel } from '@tauri-apps/api/core';
 import type { MapData } from './bridge/commands';
 import {
   loadMap,
+  autoFixMap,
   startSimulation,
   setTimeScale,
   setMaxVehicles,
@@ -74,8 +75,9 @@ function buildDemoMapData(): MapData {
 
   const addEdgePair = (a: number, b: number): void => {
     const dirs = ['left', 'straight'];
-    edges.push({ from: a, to: b, lanes: 2, maxSpeed: 50, oneway: false, infraType: 'normal', layer: 0, lengthM: 300, roadType: 'residential', laneDirections: dirs });
-    edges.push({ from: b, to: a, lanes: 2, maxSpeed: 50, oneway: false, infraType: 'normal', layer: 0, lengthM: 300, roadType: 'residential', laneDirections: ['straight', 'right'] });
+    const baseId = edges.length;
+    edges.push({ id: baseId, from: a, to: b, lanes: 2, maxSpeed: 50, oneway: false, infraType: 'normal', layer: 0, lengthM: 300, roadType: 'residential', laneDirections: dirs });
+    edges.push({ id: baseId + 1, from: b, to: a, lanes: 2, maxSpeed: 50, oneway: false, infraType: 'normal', layer: 0, lengthM: 300, roadType: 'residential', laneDirections: ['straight', 'right'] });
   };
 
   for (let r = 0; r < ROWS; r++) {
@@ -327,6 +329,9 @@ export class Game {
     ui.onMapModeChange = (forceSandbox) => {
       this.currentGridMode = forceSandbox;
     };
+    ui.onAutoFixMap = () => {
+      void this.runAutoFixMap();
+    };
 
     ui.onOsmModeToggle = (enabled) => {
       this.roadRenderer.setOsmMode(enabled);
@@ -497,6 +502,37 @@ export class Game {
     this.gameClockUI.setTimeScaleValue(scenario.timeScale);
     if (this.tauriAvailable) {
       setMaxVehicles(scenario.maxVehicles).catch(console.error);
+    }
+  }
+
+  private async runAutoFixMap(): Promise<void> {
+    if (!this.mapData || !this.tauriAvailable) return;
+    this.uiRenderer.showNotification('Topology Cleaner: poprawiam mapę…', 'info');
+    try {
+      const res = await autoFixMap(this.mapData, 25);
+      this.mapData = res.map;
+      this.roadRenderer.build(this.mapData);
+      this.infraRenderer.buildStaticLayer(this.mapData);
+      this.vehicleRenderer.setEdgeIndex(this.mapData);
+      if (this.overlay.buildings.visible) {
+        this.buildingRenderer.build(this.mapData);
+      }
+      const hiddenNodes = this.computeHiddenNodeIds();
+      this.trafficLightRenderer.setHiddenNodeIds(hiddenNodes);
+      this.trafficLightUI.setHiddenNodeIds(hiddenNodes);
+      this.trafficLightUI.init(this.mapData.nodes);
+      this.trafficLightRenderer.init(this.mapData.nodes, this.mapData.edges);
+      // Rebuilds turn connector geometry (Bezier paths + LUT usage downstream).
+      this.rebuildTurnConnectorPaths();
+      this.redrawTurnConnectors();
+      this.mapScenarioEditorUI?.setMapData(this.mapData);
+      this.uiRenderer.showNotification(
+        `Auto-Fix: snap=${res.stats.snappedDeadEnds}, ghost=${res.stats.ghostIntersectionsResolved}, removed=${res.stats.lowPriorityEdgesRemoved}`,
+        'info',
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.uiRenderer.showNotification(`Auto-Fix failed: ${message}`, 'error');
     }
   }
 

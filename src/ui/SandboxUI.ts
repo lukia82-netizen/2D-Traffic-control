@@ -32,6 +32,7 @@ export type TurnConnectorsActiveOnlyToggleCb = (activeOnly: boolean) => void;
 export type ReloadMapCb        = (center: [number, number], sizeM: number) => void;
 export type MaxVehiclesCb      = (count: number) => void;
 export type BboxPickCb         = () => void;
+export type AutoFixMapCb       = () => void;
 /**
  * Called when the user changes the map/grid mode.
  * null  = use real OSM map
@@ -108,6 +109,7 @@ export class SandboxUI {
   onReloadMap:         ReloadMapCb      = () => undefined;
   onMaxVehiclesChange: MaxVehiclesCb    = () => undefined;
   onBboxPickRequest:   BboxPickCb       = () => undefined;
+  onAutoFixMap:        AutoFixMapCb     = () => undefined;
   /** Fires when the user changes the map/grid mode. Triggers on selection (not on reload). */
   onMapModeChange:     MapModeCb        = () => undefined;
 
@@ -149,6 +151,7 @@ export class SandboxUI {
     panel.appendChild(this.buildHeader());
     panel.appendChild(this.buildMapModeSection());   // ← NEW: OSM vs Sandbox grid
     panel.appendChild(this.buildAreaSection());
+    panel.appendChild(this.buildAutoFixSection());
     panel.appendChild(this.buildMaxVehiclesSection());
     panel.appendChild(this.buildViewModeSection());
     panel.appendChild(this.buildLayerSection());
@@ -315,6 +318,16 @@ export class SandboxUI {
     row.appendChild(input);
     row.appendChild(applyBtn);
     sec.appendChild(row);
+    return sec;
+  }
+
+  private buildAutoFixSection(): HTMLElement {
+    const sec = this.makeSection('TOPOLOGY CLEANER');
+    const btn = document.createElement('button');
+    btn.className = 'sbx-reload-btn';
+    btn.textContent = 'Auto-Fix Map';
+    btn.addEventListener('click', () => this.onAutoFixMap());
+    sec.appendChild(btn);
     return sec;
   }
 

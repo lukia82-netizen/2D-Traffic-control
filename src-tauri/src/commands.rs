@@ -1,14 +1,15 @@
-use tauri::{command, State, AppHandle};
-use tauri::ipc::Channel;
 use serde::{Deserialize, Serialize};
+use tauri::ipc::Channel;
+use tauri::{command, AppHandle, State};
 
-use crate::state::{AppState, SimCommand, SimControl, LightControlMode};
 use crate::map::road_network::{
-    build_single_intersection_network, MapData, IntersectionType, InfraType,
-    LaneDirection, RestrictionKind,
+    build_single_intersection_network, InfraType, IntersectionType, LaneDirection, MapData,
+    RestrictionKind, RoadEdge, RoadGraph, RoadNode, TopologyFixStats,
 };
+use crate::map::building_loader::{BuildingType, OdBuilding};
 use crate::simulation::sim_loop::run_simulation;
 use crate::simulation::speed_config::SpeedConfig;
+use crate::state::{AppState, LightControlMode, SimCommand, SimControl};
 
 // ── Response DTOs ─────────────────────────────────────────────────────────────
 
@@ -87,27 +88,55 @@ pub struct MapDataResponse {
     pub tram_stops: Vec<TramStopData>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoFixMapResponse {
+    pub map: MapDataResponse,
+    pub stats: TopologyFixStats,
+}
+
 // ── Commands ──────────────────────────────────────────────────────────────────
 
 /// Load a map from Overpass API or build a sandbox grid.
 /// `force_sandbox`: when `Some`, skip Overpass.
 ///   Values: `"mixed"` | `"one_lane"` | `"two_lane"` | `"three_lane"`
 #[command]
-pub async fn load_map(
-    bbox: BBox,
-    state: State<'_, AppState>,
-) -> Result<MapDataResponse, String> {
-    log::info!("load_map called with bbox: west={}, south={}, east={}, north={}", bbox.west, bbox.south, bbox.east, bbox.north);
+pub async fn load_map(bbox: BBox, state: State<'_, AppState>) -> Result<MapDataResponse, String> {
+    log::info!(
+        "load_map called with bbox: west={}, south={}, east={}, north={}",
+        bbox.west,
+        bbox.south,
+        bbox.east,
+        bbox.north
+    );
 
     // Temporary default for physics tuning:
     // always start from a deterministic minimal map (one junction, one signal set).
     // This keeps traffic behaviour reproducible while core vehicle logic is tuned.
-    let map_data = build_single_intersection_network([bbox.west, bbox.south, bbox.east, bbox.north]);
+    let map_data =
+        build_single_intersection_network([bbox.west, bbox.south, bbox.east, bbox.north]);
 
     let response = build_map_response(&map_data);
     let mut guard = state.road_graph.write();
     *guard = Some(map_data);
     Ok(response)
+}
+
+#[command]
+pub fn auto_fix_map(
+    map: MapDataResponse,
+    threshold_meters: f64,
+    state: State<'_, AppState>,
+) -> Result<AutoFixMapResponse, String> {
+    let mut map_data = map_response_to_map_data(map)?;
+    let stats = map_data.heal_connections(threshold_meters);
+    let response_map = build_map_response(&map_data);
+    let mut guard = state.road_graph.write();
+    *guard = Some(map_data);
+    Ok(AutoFixMapResponse {
+        map: response_map,
+        stats,
+    })
 }
 
 #[command]
@@ -135,12 +164,7 @@ pub fn start_simulation(
     std::thread::Builder::new()
         .name("sim_loop".to_string())
         .spawn(move || {
-            run_simulation(
-                graph_arc_for_thread,
-                cmd_rx,
-                channel,
-                app_handle,
-            );
+            run_simulation(graph_arc_for_thread, cmd_rx, channel, app_handle);
         })
         .map_err(|e| format!("Failed to spawn simulation thread: {}", e))?;
 
@@ -175,13 +199,19 @@ pub fn set_traffic_light_mode(
     state: State<AppState>,
 ) -> Result<(), String> {
     let light_mode = match mode.as_str() {
-        "manual"    => LightControlMode::Manual,
+        "manual" => LightControlMode::Manual,
         "semi_auto" => LightControlMode::SemiAuto,
-        "auto"      => LightControlMode::Auto,
-        "adaptive"  => LightControlMode::Adaptive,
+        "auto" => LightControlMode::Auto,
+        "adaptive" => LightControlMode::Adaptive,
         _ => return Err(format!("Unknown light mode: {}", mode)),
     };
-    send_sim_command(&state, SimCommand::SetLightMode { intersection_id, mode: light_mode })
+    send_sim_command(
+        &state,
+        SimCommand::SetLightMode {
+            intersection_id,
+            mode: light_mode,
+        },
+    )
 }
 
 #[command]
@@ -190,17 +220,20 @@ pub fn set_traffic_light_phase(
     phase: u8,
     state: State<AppState>,
 ) -> Result<(), String> {
-    send_sim_command(&state, SimCommand::SetLightPhase { intersection_id, phase })
+    send_sim_command(
+        &state,
+        SimCommand::SetLightPhase {
+            intersection_id,
+            phase,
+        },
+    )
 }
 
 /// Update the speed / compliance / route / rage configuration at runtime.
 /// Changes affect newly spawned vehicles; existing vehicles keep their
 /// `personal_compliance` and `route_alpha` for the duration of their trip.
 #[command]
-pub fn set_speed_config(
-    config: SpeedConfig,
-    state: State<AppState>,
-) -> Result<(), String> {
+pub fn set_speed_config(config: SpeedConfig, state: State<AppState>) -> Result<(), String> {
     send_sim_command(&state, SimCommand::SetSpeedConfig(config))
 }
 
@@ -220,15 +253,19 @@ pub fn set_light_durations(
     red_s: f32,
     state: State<AppState>,
 ) -> Result<(), String> {
-    send_sim_command(&state, SimCommand::SetLightDurations { intersection_id, green_s, red_s })
+    send_sim_command(
+        &state,
+        SimCommand::SetLightDurations {
+            intersection_id,
+            green_s,
+            red_s,
+        },
+    )
 }
 
 /// Set the vehicle tracked by debug overlay (`None` clears selection).
 #[command]
-pub fn set_debug_vehicle(
-    vehicle_id: Option<u32>,
-    state: State<AppState>,
-) -> Result<(), String> {
+pub fn set_debug_vehicle(vehicle_id: Option<u32>, state: State<AppState>) -> Result<(), String> {
     send_sim_command(&state, SimCommand::SetDebugVehicle(vehicle_id))
 }
 
@@ -259,27 +296,35 @@ fn build_map_response(map_data: &MapData) -> MapDataResponse {
             lat: node.lat,
             lng: node.lng,
             intersection_type: match node.intersection_type {
-                IntersectionType::Plain              => "plain",
-                IntersectionType::TrafficLight       => "traffic_light",
+                IntersectionType::Plain => "plain",
+                IntersectionType::TrafficLight => "traffic_light",
                 IntersectionType::PedestrianCrossing => "pedestrian_crossing",
-                IntersectionType::Stop               => "stop",
-                IntersectionType::Yield              => "yield",
-                IntersectionType::Roundabout         => "roundabout",
-            }.to_string(),
+                IntersectionType::Stop => "stop",
+                IntersectionType::Yield => "yield",
+                IntersectionType::Roundabout => "roundabout",
+            }
+            .to_string(),
         });
     }
 
     let mut edges = Vec::new();
     for edge_ref in map_data.graph.edge_references() {
-        let edge     = edge_ref.weight();
+        let edge = edge_ref.weight();
         let from_node = &map_data.graph[edge_ref.source()];
-        let to_node   = &map_data.graph[edge_ref.target()];
-        let lane_directions: Vec<String> = edge.lane_directions.iter().map(|d| match d {
-            LaneDirection::Left     => "left",
-            LaneDirection::Straight => "straight",
-            LaneDirection::Right    => "right",
-            LaneDirection::UTurn    => "uturn",
-        }.to_string()).collect();
+        let to_node = &map_data.graph[edge_ref.target()];
+        let lane_directions: Vec<String> = edge
+            .lane_directions
+            .iter()
+            .map(|d| {
+                match d {
+                    LaneDirection::Left => "left",
+                    LaneDirection::Straight => "straight",
+                    LaneDirection::Right => "right",
+                    LaneDirection::UTurn => "uturn",
+                }
+                .to_string()
+            })
+            .collect();
 
         edges.push(EdgeData {
             id: edge_ref.id().index() as u64,
@@ -292,7 +337,8 @@ fn build_map_response(map_data: &MapData) -> MapDataResponse {
                 InfraType::Normal => "normal",
                 InfraType::Bridge => "bridge",
                 InfraType::Tunnel => "tunnel",
-            }.to_string(),
+            }
+            .to_string(),
             layer: edge.layer,
             length_m: edge.length_m,
             road_type: edge.road_type.clone(),
@@ -327,15 +373,16 @@ fn build_map_response(map_data: &MapData) -> MapDataResponse {
             via_node_id: r.via_node_id,
             to_way_id: r.to_way_id,
             kind: match r.kind {
-                RestrictionKind::NoLeftTurn     => "no_left_turn",
-                RestrictionKind::NoRightTurn    => "no_right_turn",
-                RestrictionKind::NoStraightOn   => "no_straight_on",
-                RestrictionKind::NoUTurn        => "no_u_turn",
-                RestrictionKind::OnlyLeftTurn   => "only_left_turn",
-                RestrictionKind::OnlyRightTurn  => "only_right_turn",
+                RestrictionKind::NoLeftTurn => "no_left_turn",
+                RestrictionKind::NoRightTurn => "no_right_turn",
+                RestrictionKind::NoStraightOn => "no_straight_on",
+                RestrictionKind::NoUTurn => "no_u_turn",
+                RestrictionKind::OnlyLeftTurn => "only_left_turn",
+                RestrictionKind::OnlyRightTurn => "only_right_turn",
                 RestrictionKind::OnlyStraightOn => "only_straight_on",
-                RestrictionKind::NoEntry        => "no_entry",
-            }.to_string(),
+                RestrictionKind::NoEntry => "no_entry",
+            }
+            .to_string(),
         })
         .collect();
 
@@ -368,4 +415,151 @@ fn build_map_response(map_data: &MapData) -> MapDataResponse {
         restrictions,
         tram_stops,
     }
+}
+
+fn map_response_to_map_data(map: MapDataResponse) -> Result<MapData, String> {
+    let mut graph = RoadGraph::new();
+    let mut node_index_map = std::collections::HashMap::new();
+
+    for n in &map.nodes {
+        let idx = graph.add_node(RoadNode {
+            osm_id: n.id,
+            lat: n.lat,
+            lng: n.lng,
+            intersection_type: parse_intersection_type(&n.intersection_type)?,
+        });
+        node_index_map.insert(n.id, idx);
+    }
+
+    for e in &map.edges {
+        let Some(&from_idx) = node_index_map.get(&e.from) else {
+            continue;
+        };
+        let Some(&to_idx) = node_index_map.get(&e.to) else {
+            continue;
+        };
+        graph.add_edge(
+            from_idx,
+            to_idx,
+            RoadEdge {
+                osm_id: e.id,
+                lanes: e.lanes.max(1),
+                max_speed: e.max_speed,
+                oneway: e.oneway,
+                infra_type: parse_infra_type(&e.infra_type)?,
+                layer: e.layer,
+                length_m: e.length_m,
+                lane_directions: e
+                    .lane_directions
+                    .iter()
+                    .map(|d| parse_lane_direction(d))
+                    .collect(),
+                decision_points: [e.length_m * 0.25, e.length_m * 0.50, e.length_m * 0.75],
+                road_type: e.road_type.clone(),
+                has_tram_track: false,
+            },
+        );
+    }
+
+    let spawn_points = map
+        .spawn_points
+        .iter()
+        .filter_map(|[lat, lng]| nearest_node_idx(&graph, *lat, *lng))
+        .collect();
+    let boundary_nodes = spawn_points.clone();
+
+    Ok(MapData {
+        graph,
+        node_index_map,
+        bbox: map.bbox,
+        spawn_points,
+        boundary_nodes,
+        od_buildings: map
+            .buildings
+            .iter()
+            .map(|b| OdBuilding {
+                id: b.id,
+                polygon: b.polygon.clone(),
+                centroid: polygon_centroid(&b.polygon),
+                building_type: parse_building_type(&b.building_type),
+                access_node: None,
+            })
+            .collect(),
+        restrictions: Vec::new(),
+        tram_data: crate::map::tram_network::TramData {
+            graph: crate::map::tram_network::TramGraph::new(),
+            node_index_map: std::collections::HashMap::new(),
+            stops: Vec::new(),
+            lines: Vec::new(),
+        },
+        is_sandbox: false,
+        sandbox_simple_cross_tl: false,
+    })
+}
+
+fn parse_intersection_type(v: &str) -> Result<IntersectionType, String> {
+    match v {
+        "plain" => Ok(IntersectionType::Plain),
+        "traffic_light" => Ok(IntersectionType::TrafficLight),
+        "pedestrian_crossing" => Ok(IntersectionType::PedestrianCrossing),
+        "stop" => Ok(IntersectionType::Stop),
+        "yield" => Ok(IntersectionType::Yield),
+        "roundabout" => Ok(IntersectionType::Roundabout),
+        _ => Err(format!("Unknown intersection type: {}", v)),
+    }
+}
+
+fn parse_infra_type(v: &str) -> Result<InfraType, String> {
+    match v {
+        "normal" => Ok(InfraType::Normal),
+        "bridge" => Ok(InfraType::Bridge),
+        "tunnel" => Ok(InfraType::Tunnel),
+        _ => Err(format!("Unknown infra type: {}", v)),
+    }
+}
+
+fn parse_lane_direction(v: &str) -> LaneDirection {
+    match v {
+        "left" => LaneDirection::Left,
+        "right" => LaneDirection::Right,
+        "uturn" => LaneDirection::UTurn,
+        _ => LaneDirection::Straight,
+    }
+}
+
+fn nearest_node_idx(graph: &RoadGraph, lat: f64, lng: f64) -> Option<petgraph::graph::NodeIndex> {
+    let mut best = None;
+    for idx in graph.node_indices() {
+        let n = &graph[idx];
+        let d = crate::map::road_network::haversine_distance_m(lat, lng, n.lat, n.lng) as f64;
+        if let Some((_, best_d)) = best {
+            if d >= best_d {
+                continue;
+            }
+        }
+        best = Some((idx, d));
+    }
+    best.map(|(idx, _)| idx)
+}
+
+fn parse_building_type(v: &str) -> BuildingType {
+    match v {
+        "residential" => BuildingType::Residential,
+        "commercial" => BuildingType::Commercial,
+        "office" => BuildingType::Office,
+        _ => BuildingType::Other,
+    }
+}
+
+fn polygon_centroid(poly: &[[f64; 2]]) -> [f64; 2] {
+    if poly.is_empty() {
+        return [0.0, 0.0];
+    }
+    let mut lng_sum = 0.0;
+    let mut lat_sum = 0.0;
+    for [lng, lat] in poly {
+        lng_sum += *lng;
+        lat_sum += *lat;
+    }
+    [lng_sum / poly.len() as f64, lat_sum / poly.len() as f64]
 }
