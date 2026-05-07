@@ -1,3 +1,4 @@
+pub mod bezier_smooth;
 pub mod congestion;
 pub mod idm;
 pub mod lane_change;
