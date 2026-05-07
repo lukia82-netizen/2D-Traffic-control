@@ -1,6 +1,7 @@
 //! Multi-phase vehicle traffic-light programs (opposing straight greens, clearance yellow, all-red).
 
 use petgraph::graph::{EdgeIndex, NodeIndex};
+use petgraph::visit::EdgeRef;
 use petgraph::Direction;
 
 use std::collections::HashMap;
@@ -22,7 +23,7 @@ pub struct JunctionLayout {
 impl JunctionLayout {
     pub fn build(graph: &RoadGraph, junction: NodeIndex) -> Option<Self> {
         let mut inbound: Vec<EdgeIndex> = graph
-            .edges_directed(junction, Incoming)
+            .edges_directed(junction, Direction::Incoming)
             .map(|e| e.id())
             .collect();
         if inbound.is_empty() {
@@ -461,5 +462,97 @@ pub fn build_steps_for_layout(
             // 5+ arms: safe round-robin (no geometry pairing).
             build_sequential_arms(n, g_str, y, ar)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::map::road_network::LaneDirection;
+    use crate::state::LightControlMode;
+    use crate::traffic::traffic_light::LightPhase;
+    use petgraph::graph::EdgeIndex;
+
+    #[test]
+    fn combine_movements_sets_expected_bits() {
+        let m = combine_movements(0, &[LaneDirection::Straight, LaneDirection::Left]);
+        assert!(mask_allows(m, 0, LaneDirection::Straight));
+        assert!(mask_allows(m, 0, LaneDirection::Left));
+        assert!(!mask_allows(m, 0, LaneDirection::Right));
+        assert!(!mask_allows(m, 1, LaneDirection::Straight));
+    }
+
+    #[test]
+    fn build_steps_four_arms_has_axis_phases() {
+        let steps = build_steps_for_layout(4, 10.0, 8.0, 3.0, 2.5);
+        assert_eq!(steps.len(), 12);
+        assert!(matches!(
+            steps[0].kind,
+            ProgramStepKind::Go { .. }
+        ));
+        assert!(matches!(steps[1].kind, ProgramStepKind::Caution { .. }));
+        assert!(matches!(steps[2].kind, ProgramStepKind::AllRed));
+    }
+
+    #[test]
+    fn build_steps_two_arms_is_sequential() {
+        let steps = build_steps_for_layout(2, 10.0, 8.0, 3.0, 2.5);
+        assert_eq!(steps.len(), 6);
+    }
+
+    fn four_arm_layout() -> JunctionLayout {
+        let arms: Vec<EdgeIndex> = (0..4).map(EdgeIndex::new).collect();
+        let mut edge_to_arm = HashMap::new();
+        for (i, e) in arms.iter().enumerate() {
+            edge_to_arm.insert(*e, i as u8);
+        }
+        JunctionLayout {
+            arms,
+            edge_to_arm,
+        }
+    }
+
+    #[test]
+    fn first_green_allows_opposing_straight_pair_only() {
+        let layout = four_arm_layout();
+        let mut ph = PhasedVehicleLight::new(42, layout);
+        ph.step_index = 0;
+        ph.timer = 0.0;
+        let e0 = EdgeIndex::new(0);
+        let e1 = EdgeIndex::new(1);
+        assert_eq!(ph.signal_for(e0, LaneDirection::Straight), LightPhase::Green);
+        assert_eq!(ph.signal_for(e1, LaneDirection::Straight), LightPhase::Red);
+    }
+
+    #[test]
+    fn manual_mode_does_not_advance_timer() {
+        let layout = four_arm_layout();
+        let mut ph = PhasedVehicleLight::new(1, layout);
+        ph.set_mode(LightControlMode::Manual);
+        let idx_before = ph.step_index;
+        let t_before = ph.timer;
+        ph.update(5.0);
+        assert_eq!(ph.step_index, idx_before);
+        assert!((ph.timer - t_before).abs() < 1e-5);
+    }
+
+    #[test]
+    fn adaptive_mode_increases_time_remaining_for_go_step() {
+        let layout = four_arm_layout();
+        let mut ph_auto = PhasedVehicleLight::new(3, layout.clone());
+        ph_auto.set_mode(LightControlMode::Auto);
+        ph_auto.step_index = 0;
+        ph_auto.timer = 0.0;
+
+        let mut ph_adapt = PhasedVehicleLight::new(3, layout);
+        ph_adapt.set_mode(LightControlMode::Adaptive);
+        ph_adapt.queue_count = 80;
+        ph_adapt.step_index = 0;
+        ph_adapt.timer = 0.0;
+
+        assert!(
+            ph_adapt.current_time_remaining() > ph_auto.current_time_remaining(),
+            "adaptive go phase should last longer with high queue"
+        );
     }
 }
