@@ -81,6 +81,14 @@ export interface MapData {
   buildings: BuildingData[];
   restrictions: TurnRestriction[];
   tramStops: TramStop[];
+  turnConnectors: TurnConnector[];
+}
+
+export interface TurnConnector {
+  fromNodeId: number;
+  viaNodeId: number;
+  toNodeId: number;
+  bezierLut: [number, number][];
 }
 
 // ─── Typed invoke wrappers ────────────────────────────────────────────────────
@@ -253,4 +261,48 @@ export async function setLightDurations(
   redS: number,
 ): Promise<void> {
   return invoke<void>('set_light_durations', { intersectionId, greenS, redS });
+}
+
+export type EditorTool = 'none' | 'move_node' | 'add_road' | 'delete' | 'select';
+
+export async function setEditorTool(tool: EditorTool): Promise<void> {
+  return invoke<void>('set_editor_tool', { tool });
+}
+
+export async function editorMoveNode(
+  nodeId: number,
+  lat: number,
+  lng: number,
+  finalCommit: boolean,
+): Promise<MapData> {
+  return invoke<MapData>('editor_move_node', { payload: { nodeId, lat, lng, finalCommit } });
+}
+
+export async function editorExtrude(
+  fromNodeId: number,
+  newNodeId: number,
+  lat: number,
+  lng: number,
+): Promise<MapData> {
+  return invoke<MapData>('editor_extrude', { payload: { fromNodeId, newNodeId, lat, lng } });
+}
+
+export async function editorConnect(fromNodeId: number, toNodeId: number): Promise<MapData> {
+  return invoke<MapData>('editor_connect', { payload: { fromNodeId, toNodeId } });
+}
+
+export async function editorDeleteEdge(fromNodeId: number, toNodeId: number): Promise<MapData> {
+  return invoke<MapData>('editor_delete_edge', { payload: { fromNodeId, toNodeId } });
+}
+
+export async function editorUndo(): Promise<MapData> {
+  return invoke<MapData>('editor_undo');
+}
+
+export async function editorRedo(): Promise<MapData> {
+  return invoke<MapData>('editor_redo');
+}
+
+export async function saveMapOverrides(): Promise<void> {
+  return invoke<void>('save_map_overrides');
 }

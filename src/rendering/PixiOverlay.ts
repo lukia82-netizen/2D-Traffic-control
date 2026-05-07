@@ -30,6 +30,7 @@ export class PixiOverlay {
   frustrationLayer!: PIXI.Container;
   trafficLights!: PIXI.Container;
   congestionLayer!: PIXI.Container;
+  editorOverlay!: PIXI.Container;
 
   private readonly containerId: string;
 
@@ -70,6 +71,7 @@ export class PixiOverlay {
     this.frustrationLayer = new PIXI.Container();
     this.trafficLights   = new PIXI.Container();
     this.congestionLayer = new PIXI.Container();
+    this.editorOverlay = new PIXI.Container();
 
     this.app.stage.addChild(this.buildings);
     this.app.stage.addChild(this.roads);
@@ -82,6 +84,7 @@ export class PixiOverlay {
     this.app.stage.addChild(this.frustrationLayer);
     this.app.stage.addChild(this.trafficLights);
     this.app.stage.addChild(this.congestionLayer);
+    this.app.stage.addChild(this.editorOverlay);
 
     window.addEventListener('resize', () => this.resize());
   }

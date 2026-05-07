@@ -10,7 +10,9 @@ use state::AppState;
 use commands::{
     load_map, start_simulation, pause_simulation, resume_simulation,
     set_time_scale, set_traffic_light_mode, set_traffic_light_phase, set_speed_config,
-    set_light_durations, set_max_vehicles, set_debug_vehicle,
+    set_light_durations, set_max_vehicles, set_debug_vehicle, set_editor_tool,
+    editor_move_node, editor_extrude, editor_connect, editor_delete_edge, editor_undo, editor_redo,
+    save_map_overrides,
 };
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -31,6 +33,14 @@ pub fn run() {
             set_light_durations,
             set_max_vehicles,
             set_debug_vehicle,
+            set_editor_tool,
+            editor_move_node,
+            editor_extrude,
+            editor_connect,
+            editor_delete_edge,
+            editor_undo,
+            editor_redo,
+            save_map_overrides,
         ])
         .setup(|app| {
             log::info!("Traffic Control app started");

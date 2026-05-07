@@ -1262,3 +1262,29 @@ html, body {
   height: 1px;
   background: rgba(255, 255, 255, 0.1);
 }
+
+.edge-editor-panel {
+  position: fixed;
+  right: 12px;
+  top: 280px;
+  z-index: 122;
+  width: 180px;
+  background: rgba(12, 12, 24, 0.92);
+  border: 1px solid rgba(90, 130, 255, 0.3);
+  border-radius: 10px;
+  padding: 10px;
+  color: #d8defa;
+  font-size: 12px;
+}
+
+.edge-editor-title {
+  font-size: 11px;
+  color: #9ab5ff;
+  font-weight: 700;
+  margin-bottom: 6px;
+}
+
+.edge-editor-content {
+  display: grid;
+  gap: 4px;
+}
