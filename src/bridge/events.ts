@@ -55,7 +55,7 @@ export interface LightStateUpdate {
 /**
  * Decode a base64-encoded binary vehicle frame.
  *
- * Packet layout (48 bytes):
+ * Packet layout (v3, 48 bytes):
  *   [0..3]   id:            u32  LE
  *   [4..11]  lat:           f64  LE  ← double precision, eliminates f32 quantisation jitter
  *   [12..19] lng:           f64  LE  ← double precision
@@ -68,6 +68,9 @@ export interface LightStateUpdate {
  *   [32..35] frustration:   f32  LE  (0=calm, 100=rage)
  *   [36..39] lateralOffset: f32  LE  (smooth: 0.0=lane-0 centre, 1.0=lane-1 …)
  *   [40..47] currentLaneId: u64  LE  (u64::MAX => null)
+ *
+ * Backward compatibility:
+ * - v2 packets (40 bytes) are still accepted; `currentLaneId` is set to `null`.
  */
 export function parseVehicleFrame(base64Data: string): VehicleState[] {
   const binaryStr = atob(base64Data);
@@ -77,15 +80,24 @@ export function parseVehicleFrame(base64Data: string): VehicleState[] {
     bytes[i] = binaryStr.charCodeAt(i);
   }
 
-  const PACKET_SIZE = 48;
-  const count = Math.floor(bytes.byteLength / PACKET_SIZE);
+  const PACKET_V3 = 48;
+  const PACKET_V2 = 40;
+  const packetSize =
+    bytes.byteLength % PACKET_V3 === 0 ? PACKET_V3
+    : bytes.byteLength % PACKET_V2 === 0 ? PACKET_V2
+    : PACKET_V3;
+  const count = Math.floor(bytes.byteLength / packetSize);
   const view = new DataView(bytes.buffer);
   const vehicles: VehicleState[] = new Array(count);
+  const U64_NONE = BigInt('18446744073709551615');
 
   for (let i = 0; i < count; i++) {
-    const base = i * PACKET_SIZE;
+    const base = i * packetSize;
     const laneFlags = view.getUint8(base + 31);
-    const laneId = view.getBigUint64(base + 40, true);
+    const laneId =
+      packetSize >= PACKET_V3
+        ? view.getBigUint64(base + 40, true)
+        : U64_NONE;
     vehicles[i] = {
       id:              view.getUint32 (base,      true),
       lat:             view.getFloat64(base + 4,  true),
@@ -99,7 +111,7 @@ export function parseVehicleFrame(base64Data: string): VehicleState[] {
       onTurnConnector: (laneFlags & 0x80) !== 0,
       frustration:     view.getFloat32(base + 32, true),
       lateralOffset:   view.getFloat32(base + 36, true),
-      currentLaneId:   laneId === BigInt('18446744073709551615') ? null : Number(laneId),
+      currentLaneId:   laneId === U64_NONE ? null : Number(laneId),
     };
   }
 
