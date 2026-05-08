@@ -7,8 +7,9 @@ use petgraph::graph::NodeIndex;
 use streets_reader::osm_to_street_network;
 
 use crate::map::road_network::{
-    InfraType, IntersectionType, MapData, RoadEdge, RoadGraph, RoadNode, TramData,
+    InfraType, IntersectionType, MapData, RoadEdge, RoadGraph, RoadNode,
 };
+use crate::map::tram_network::TramData;
 use crate::simulation::bezier_smooth::BezierPath;
 
 pub struct CityLanePath {
