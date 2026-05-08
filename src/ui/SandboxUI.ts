@@ -42,6 +42,7 @@ export type MapModeCb = (forceSandbox: string | null) => void;
 
 /** Grid type label, value, and colour hint. */
 const GRID_TYPES = [
+  { label: 'Skrzyżowanie', value: 'single_intersection', hint: '2 drogi bez świateł' },
   { label: 'Jedna droga',  value: 'single_road',  hint: '1 droga IDM test' },
   { label: 'Mieszana',     value: 'mixed',         hint: '1/2/3 pasy 3x3' },
   { label: '1 pas',        value: 'one_lane',      hint: 'tertiary 50' },
@@ -93,7 +94,7 @@ export class SandboxUI {
 
   // Grid / map-mode state
   private mapMode: 'osm' | 'sandbox' = 'sandbox';
-  private selectedGridType = 'mixed';
+  private selectedGridType = 'single_intersection';
   private gridTypeBtns: Map<string, HTMLButtonElement> = new Map();
   private gridSubsection!: HTMLElement;
   private mapModeBtns: Map<string, HTMLButtonElement> = new Map();

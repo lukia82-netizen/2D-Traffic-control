@@ -122,7 +122,7 @@ export interface TurnConnector {
  */
 export async function loadMap(
   bbox: [number, number, number, number],
-  _forceSandbox?: string | null,
+  forceSandbox?: string | null,
 ): Promise<MapData> {
   return invoke<MapData>('load_map', {
     bbox: {
@@ -131,6 +131,7 @@ export async function loadMap(
       east: bbox[2],
       north: bbox[3],
     },
+    forceSandbox: forceSandbox ?? null,
   });
 }
 

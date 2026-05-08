@@ -417,7 +417,7 @@ pub fn build_single_road_network(bbox: [f64; 4]) -> MapData {
 }
 
 /// Build the default **single-intersection** sandbox map:
-/// one traffic-light-controlled crossing with one lane per approach.
+/// one unsignalized crossing with one lane per approach.
 ///
 /// Layout:
 ///            N
@@ -441,7 +441,7 @@ pub fn build_single_intersection_network(bbox: [f64; 4]) -> MapData {
         osm_id: 100,
         lat: cy,
         lng: cx,
-        intersection_type: IntersectionType::TrafficLight,
+        intersection_type: IntersectionType::Plain,
     });
     let north = graph.add_node(RoadNode {
         osm_id: 101,
@@ -525,7 +525,7 @@ pub fn build_single_intersection_network(bbox: [f64; 4]) -> MapData {
         restrictions: Vec::new(),
         tram_data,
         is_sandbox: true,
-        sandbox_simple_cross_tl: true,
+        sandbox_simple_cross_tl: false,
         turn_connectors: Vec::new(),
         lanes: HashMap::new(),
         conflict_areas: HashMap::new(),

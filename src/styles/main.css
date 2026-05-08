@@ -56,6 +56,31 @@ html, body {
   pointer-events: auto;
 }
 
+#app-mode-toggle {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  z-index: 20;
+  padding: 8px 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(10, 10, 30, 0.78);
+  color: #c7d2fe;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+  cursor: pointer;
+}
+
+#app-mode-toggle:hover {
+  background: rgba(26, 32, 64, 0.86);
+  color: #e0e7ff;
+}
+
+body.editor-only-app #app-mode-toggle {
+  right: 380px; /* avoid overlap with scenario/editor panel */
+}
+
 /* ============================================================
    Glassmorphism utility
    ============================================================ */

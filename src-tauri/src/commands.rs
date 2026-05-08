@@ -5,7 +5,8 @@ use tauri::{command, AppHandle, State};
 
 use crate::map::city_map::build_city_map_from_bbox;
 use crate::map::road_network::{
-    build_single_intersection_network, InfraType, IntersectionType, LaneDirection, MapData,
+    build_demo_road_network, build_single_intersection_network, build_single_road_network,
+    InfraType, IntersectionType, LaneDirection, MapData,
     RestrictionKind,
 };
 use crate::map::world_editor::{EditorTool, GraphChange, MapOverrides};
@@ -127,9 +128,13 @@ pub struct TurnConnectorData {
 
 /// Load a map from Overpass API or build a sandbox grid.
 /// `force_sandbox`: when `Some`, skip Overpass.
-///   Values: `"mixed"` | `"one_lane"` | `"two_lane"` | `"three_lane"`
+///   Values: `"mixed"` | `"one_lane"` | `"two_lane"` | `"three_lane"` | `"single_road"` | `"single_intersection"`
 #[command]
-pub async fn load_map(bbox: BBox, state: State<'_, AppState>) -> Result<MapDataResponse, String> {
+pub async fn load_map(
+    bbox: BBox,
+    force_sandbox: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<MapDataResponse, String> {
     log::info!(
         "load_map called with bbox: west={}, south={}, east={}, north={}",
         bbox.west,
@@ -138,7 +143,23 @@ pub async fn load_map(bbox: BBox, state: State<'_, AppState>) -> Result<MapDataR
         bbox.north
     );
 
-    let (_city_map, mut map_data) =
+    let (_city_map, mut map_data) = if let Some(mode) = force_sandbox.as_deref() {
+        log::info!("load_map forced sandbox mode={}", mode);
+        let map = if mode == "single_road" {
+            build_single_road_network([bbox.west, bbox.south, bbox.east, bbox.north])
+        } else if mode == "single_intersection" {
+            build_single_intersection_network([bbox.west, bbox.south, bbox.east, bbox.north])
+        } else {
+            build_demo_road_network(mode, [bbox.west, bbox.south, bbox.east, bbox.north])
+        };
+        (
+            crate::map::city_map::CityMap {
+                lanes: Vec::new(),
+                intersections: Vec::new(),
+            },
+            map,
+        )
+    } else {
         build_city_map_from_bbox([bbox.west, bbox.south, bbox.east, bbox.north])
             .await
             .unwrap_or_else(|err| {
@@ -155,7 +176,8 @@ pub async fn load_map(bbox: BBox, state: State<'_, AppState>) -> Result<MapDataR
                         bbox.west, bbox.south, bbox.east, bbox.north,
                     ]),
                 )
-            });
+            })
+    };
     apply_overrides_from_disk(&mut map_data)?;
     map_data.rebuild_all_geometry();
     crate::map::road_network::populate_lane_graph(&mut map_data);

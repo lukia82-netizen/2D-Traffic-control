@@ -45,10 +45,16 @@ impl MapData {
         let edge_ids: Vec<_> = self.graph.edges(idx).map(|e| e.id()).collect();
         for edge_id in edge_ids {
             if let Some((a, b)) = self.graph.edge_endpoints(edge_id) {
-                let na = &self.graph[a];
-                let nb = &self.graph[b];
+                let (a_lat, a_lng) = {
+                    let n = &self.graph[a];
+                    (n.lat, n.lng)
+                };
+                let (b_lat, b_lng) = {
+                    let n = &self.graph[b];
+                    (n.lat, n.lng)
+                };
+                let len = haversine_distance_m(a_lat, a_lng, b_lat, b_lng);
                 if let Some(edge) = self.graph.edge_weight_mut(edge_id) {
-                    let len = haversine_distance_m(na.lat, na.lng, nb.lat, nb.lng);
                     edge.length_m = len;
                     edge.decision_points = [len * 0.25, len * 0.5, len * 0.75];
                 }

@@ -147,6 +147,11 @@ interface TurnConnectorPath {
 }
 
 type ObbDebugMode = 'visual' | 'physical';
+type AppMode = 'game' | 'editor' | 'sandbox';
+interface GameOptions {
+  editorOnly?: boolean;
+  appMode?: AppMode;
+}
 
 // ─── Game ─────────────────────────────────────────────────────────────────────
 
@@ -220,10 +225,10 @@ export class Game {
   private mapScenarioEditorUI: MapScenarioEditorUI | null = null;
   private vehiclesVisible = true;
   private currentBbox: [number, number, number, number] = DEFAULT_BBOX;
-  /** null = real OSM data; string = sandbox grid type ('mixed'|'one_lane'|'single_road'|…) */
-  private currentGridMode: string | null = 'single_road';
+  /** null = real OSM data; string = sandbox grid type ('mixed'|'one_lane'|'single_intersection'|…) */
+  private currentGridMode: string | null = null;
   private bboxPicker: MapBboxPicker | null = null;
-  private editorMode = true;
+  private editorMode = false;
   private editorTool: 'select' | 'move_node' | 'add_road' | 'delete' = 'move_node';
   private selectedEdgeIndex: number | null = null;
   private dragNodeId: number | null = null;
@@ -232,11 +237,19 @@ export class Game {
   private nextCustomNodeId = 1_000_000;
   private edgeEditorPanel: HTMLDivElement | null = null;
   private toolSwitchPanel: HTMLDivElement | null = null;
+  private readonly editorOnly: boolean;
+  private readonly appMode: AppMode;
 
-  constructor(map: maplibregl.Map, overlay: PixiOverlay) {
+  constructor(map: maplibregl.Map, overlay: PixiOverlay, options: GameOptions = {}) {
     this.map = map;
     this.overlay = overlay;
     this.bboxPicker = new MapBboxPicker(this.map);
+    this.editorOnly = options.editorOnly ?? false;
+    this.appMode = options.appMode ?? (this.editorOnly ? 'editor' : 'game');
+    this.editorMode = this.appMode === 'editor';
+    if (this.appMode === 'sandbox') {
+      this.currentGridMode = 'single_intersection';
+    }
   }
 
   // ─── Initialisation ────────────────────────────────────────────────────────
@@ -295,13 +308,21 @@ export class Game {
 
     // Init HUD controls
     this.gameClockUI.init();
+    this.enableHudPanelDragging();
+    if (this.editorOnly) {
+      this.hideSimulationHud();
+    }
 
     // ── Sandbox UI ────────────────────────────────────────────────────────
     if (SANDBOX_MODE) {
       this.sandboxUI = new SandboxUI();
       this.wireSandboxUI();
-      this.mapScenarioEditorUI = new MapScenarioEditorUI();
-      this.wireMapScenarioEditorUI();
+      this.enableHudPanelDragging();
+      if (this.editorMode) {
+        this.mapScenarioEditorUI = new MapScenarioEditorUI();
+        this.wireMapScenarioEditorUI();
+        this.enableHudPanelDragging();
+      }
     }
     this.showTurnConnectors = localStorage.getItem(TURN_DEBUG_STORAGE_KEY) === '1';
     this.showTurnConnectorsActiveOnly =
@@ -311,10 +332,17 @@ export class Game {
     }
 
     if (this.tauriAvailable) {
-      await setEditorTool(this.editorTool);
+      if (this.editorMode) {
+        await setEditorTool(this.editorTool);
+      }
       await this.loadMapData();
-      await this.subscribeToEvents();
-      await this.startRustSimulation();
+      if (!this.editorOnly) {
+        await this.subscribeToEvents();
+        await this.startRustSimulation();
+      } else {
+        this.vehicles.clear();
+        this.uiRenderer.showNotification('Editor mode active: simulation disabled', 'info');
+      }
     } else {
       this.uiRenderer.showNotification(
         'Running in browser – Tauri backend not available',
@@ -350,10 +378,12 @@ export class Game {
       if (consumed) return;
       void this.selectVehicleAtScreenPoint(e.point.x, e.point.y);
     });
-    this.bindEditorPointerHandlers();
-    this.bindEditorKeyboardHandlers();
-    this.initEdgeEditorPanel();
-    this.initToolSwitchPanel();
+    if (this.editorMode) {
+      this.bindEditorPointerHandlers();
+      this.bindEditorKeyboardHandlers();
+      this.initEdgeEditorPanel();
+      this.initToolSwitchPanel();
+    }
 
     // Start the PixiJS ticker
     this.overlay.app.ticker.add((ticker) => this.gameLoop(ticker));
@@ -378,12 +408,12 @@ export class Game {
     };
 
     ui.onMaxVehiclesChange = (count) => {
-      if (this.tauriAvailable) {
+      if (this.tauriAvailable && !this.editorOnly) {
         setMaxVehicles(count).catch(console.error);
       }
     };
     // Apply the UI's default immediately so the backend cap matches the displayed value.
-    if (this.tauriAvailable) {
+    if (this.tauriAvailable && !this.editorOnly) {
       setMaxVehicles(20).catch(console.error);
     }
 
@@ -416,7 +446,15 @@ export class Game {
     };
 
     ui.onMapModeChange = (forceSandbox) => {
-      this.currentGridMode = forceSandbox;
+      if (this.appMode === 'sandbox') {
+        this.currentGridMode = 'single_intersection';
+      } else {
+        this.currentGridMode = forceSandbox;
+      }
+      // Auto-reload so changing mode instantly rebuilds the road network.
+      const sizeM = this.estimateCurrentBboxSizeM();
+      const cityName = this.estimateCurrentCityName();
+      void this.reloadMap(this.currentBbox, sizeM, cityName, this.currentGridMode);
     };
 
     ui.onOsmModeToggle = (enabled) => {
@@ -566,6 +604,24 @@ export class Game {
     this.mapScenarioEditorUI?.setMapData(this.mapData);
 
     this.sandboxUI?.setLoadingDone(cityName, sizeM);
+  }
+
+  private estimateCurrentBboxSizeM(): number {
+    const [west, south, east, north] = this.currentBbox;
+    const centerLat = (south + north) * 0.5;
+    const latSizeM = (north - south) * 111_320;
+    const lngSizeM = (east - west) * 111_320 * Math.cos(centerLat * Math.PI / 180);
+    return Math.max(100, Math.round(Math.max(latSizeM, lngSizeM)));
+  }
+
+  private estimateCurrentCityName(): string {
+    const [west, south, east, north] = this.currentBbox;
+    const centerLng = (west + east) * 0.5;
+    const centerLat = (south + north) * 0.5;
+    return CITY_PRESETS.find((c) =>
+      Math.abs(c.center[0] - centerLng) < 0.02 &&
+      Math.abs(c.center[1] - centerLat) < 0.02,
+    )?.name ?? 'Custom';
   }
 
   private applyCustomMapData(mapData: MapData): void {
@@ -1358,20 +1414,19 @@ export class Game {
   }
 
   private bindEditorPointerHandlers(): void {
-    const canvas = this.overlay.app.canvas as HTMLCanvasElement;
-    canvas.style.pointerEvents = 'auto';
-    canvas.addEventListener('pointerdown', (e) => {
+    this.map.on('mousedown', (e) => {
       if (!this.editorMode || !this.mapData) return;
-      const nodeId = this.findNearestNodeId(e.clientX, e.clientY, 12);
+      const nodeId = this.findNearestNodeId(e.point.x, e.point.y, 12);
       if (this.editorTool === 'move_node' && nodeId !== null) {
         this.dragNodeId = nodeId;
+        this.map.dragPan.disable();
       } else if (this.editorTool === 'add_road' && nodeId !== null) {
         this.connectFromNodeId = nodeId;
       }
     });
-    canvas.addEventListener('pointermove', (e) => {
+    this.map.on('mousemove', (e) => {
       if (!this.editorMode || !this.mapData || this.dragNodeId === null) return;
-      const lngLat = this.map.unproject([e.clientX, e.clientY]);
+      const lngLat = e.lngLat;
       const node = this.mapData.nodes.find((n) => n.id === this.dragNodeId);
       if (!node) return;
       const guide = this.findAlignmentGuide(node.id, lngLat.lng, lngLat.lat);
@@ -1388,12 +1443,13 @@ export class Game {
           .catch(console.error);
       }
     });
-    canvas.addEventListener('pointerup', (e) => {
+    this.map.on('mouseup', (e) => {
       if (!this.editorMode || !this.mapData) return;
       if (this.dragNodeId !== null) {
-        const lngLat = this.map.unproject([e.clientX, e.clientY]);
+        const lngLat = e.lngLat;
         const nodeId = this.dragNodeId;
         this.dragNodeId = null;
+        this.map.dragPan.enable();
         this.editorOverlay.clearGuides();
         editorMoveNode(nodeId, lngLat.lat, lngLat.lng, true)
           .then((m) => this.applyCustomMapData(m))
@@ -1403,11 +1459,11 @@ export class Game {
       if (this.editorTool === 'add_road' && this.connectFromNodeId !== null) {
         const fromNodeId = this.connectFromNodeId;
         this.connectFromNodeId = null;
-        const targetNode = this.findNearestNodeId(e.clientX, e.clientY, 12);
+        const targetNode = this.findNearestNodeId(e.point.x, e.point.y, 12);
         if (targetNode !== null && targetNode !== fromNodeId) {
           editorConnect(fromNodeId, targetNode).then((m) => this.applyCustomMapData(m)).catch(console.error);
         } else {
-          const ll = this.map.unproject([e.clientX, e.clientY]);
+          const ll = e.lngLat;
           editorExtrude(fromNodeId, this.nextCustomNodeId++, ll.lat, ll.lng)
             .then((m) => this.applyCustomMapData(m))
             .catch(console.error);
@@ -1474,6 +1530,7 @@ export class Game {
     `;
     document.body.appendChild(panel);
     this.edgeEditorPanel = panel;
+    this.makePanelDraggable(panel, '.edge-editor-title', 'edge-editor-panel');
     panel.querySelector('#edge-apply-btn')?.addEventListener('click', () => {
       if (!this.mapData || this.selectedEdgeIndex === null) return;
       const edge = this.mapData.edges[this.selectedEdgeIndex];
@@ -1523,6 +1580,7 @@ export class Game {
     `;
     document.body.appendChild(panel);
     this.toolSwitchPanel = panel;
+    this.makePanelDraggable(panel, undefined, 'tool-switch-panel');
     const buttons = [...panel.querySelectorAll('button')];
     const refresh = (): void => {
       buttons.forEach((btn) => {
@@ -1552,6 +1610,103 @@ export class Game {
       }
     }
     return best;
+  }
+
+  private enableHudPanelDragging(): void {
+    const targets: Array<{ selector: string; handle?: string; storageKey: string }> = [
+      { selector: '#sandbox-panel', handle: '.sbx-header', storageKey: 'sandbox-panel' },
+      { selector: '.editor-panel', handle: '.editor-titlebar', storageKey: 'editor-panel' },
+      { selector: '#control-panel', handle: '#control-panel-header', storageKey: 'control-panel' },
+      { selector: '#light-control-panel', handle: '#light-panel-header', storageKey: 'light-control-panel' },
+      { selector: '#idm-debug-panel', storageKey: 'idm-debug-panel' },
+      { selector: '#vehicle-telemetry-panel', storageKey: 'vehicle-telemetry-panel' },
+      { selector: '#satisfaction-bar', storageKey: 'satisfaction-bar' },
+      { selector: '#score-display', storageKey: 'score-display' },
+      { selector: '#clock-display', storageKey: 'clock-display' },
+    ];
+    for (const t of targets) {
+      const panel = document.querySelector(t.selector) as HTMLElement | null;
+      if (!panel) continue;
+      this.makePanelDraggable(panel, t.handle, t.storageKey);
+    }
+  }
+
+  private makePanelDraggable(panel: HTMLElement, handleSelector?: string, storageKey?: string): void {
+    if (panel.dataset.draggableInit === '1') return;
+    panel.dataset.draggableInit = '1';
+
+    const handle = handleSelector
+      ? (panel.querySelector(handleSelector) as HTMLElement | null) ?? panel
+      : panel;
+    handle.style.cursor = 'move';
+
+    const storageSlot = storageKey
+      ? `hud-panel-pos:${storageKey}`
+      : `hud-panel-pos:${panel.id || panel.className || 'panel'}`;
+    this.restorePanelPosition(panel, storageSlot);
+
+    let dragging = false;
+    let offsetX = 0;
+    let offsetY = 0;
+
+    const onMove = (ev: MouseEvent): void => {
+      if (!dragging) return;
+      panel.style.left = `${Math.max(0, ev.clientX - offsetX)}px`;
+      panel.style.top = `${Math.max(0, ev.clientY - offsetY)}px`;
+    };
+    const onUp = (): void => {
+      dragging = false;
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+      this.persistPanelPosition(panel, storageSlot);
+    };
+
+    handle.addEventListener('mousedown', (ev: MouseEvent) => {
+      const target = ev.target as HTMLElement | null;
+      if (target?.closest('button, input, textarea, select, label, a')) return;
+
+      const rect = panel.getBoundingClientRect();
+      panel.style.position = 'fixed';
+      panel.style.left = `${rect.left}px`;
+      panel.style.top = `${rect.top}px`;
+      panel.style.right = 'auto';
+      panel.style.bottom = 'auto';
+      panel.style.margin = '0';
+
+      dragging = true;
+      offsetX = ev.clientX - rect.left;
+      offsetY = ev.clientY - rect.top;
+      window.addEventListener('mousemove', onMove);
+      window.addEventListener('mouseup', onUp);
+      ev.preventDefault();
+    });
+  }
+
+  private restorePanelPosition(panel: HTMLElement, storageSlot: string): void {
+    try {
+      const raw = localStorage.getItem(storageSlot);
+      if (!raw) return;
+      const parsed = JSON.parse(raw) as { left?: number; top?: number };
+      if (typeof parsed.left !== 'number' || typeof parsed.top !== 'number') return;
+      panel.style.position = 'fixed';
+      panel.style.left = `${Math.max(0, parsed.left)}px`;
+      panel.style.top = `${Math.max(0, parsed.top)}px`;
+      panel.style.right = 'auto';
+      panel.style.bottom = 'auto';
+      panel.style.margin = '0';
+    } catch {
+      // Ignore invalid localStorage value.
+    }
+  }
+
+  private persistPanelPosition(panel: HTMLElement, storageSlot: string): void {
+    const rect = panel.getBoundingClientRect();
+    const payload = { left: Math.max(0, rect.left), top: Math.max(0, rect.top) };
+    try {
+      localStorage.setItem(storageSlot, JSON.stringify(payload));
+    } catch {
+      // Ignore storage write errors (e.g. quota/private mode).
+    }
   }
 
   private findNearestEdgeIndex(x: number, y: number, maxDistPx: number): number | null {
@@ -1659,6 +1814,20 @@ export class Game {
     this.uiRenderer.updateScore(this.score);
   }
 
+  private hideSimulationHud(): void {
+    const hideById = (id: string) => {
+      const el = document.getElementById(id);
+      if (el) el.style.display = 'none';
+    };
+    hideById('clock-display');
+    hideById('control-panel');
+    hideById('score-display');
+    hideById('satisfaction-bar');
+    hideById('idm-debug-panel');
+    hideById('vehicle-telemetry-panel');
+    hideById('light-control-panel');
+  }
+
   // ─── Cleanup ───────────────────────────────────────────────────────────────
 
   destroy(): void {
@@ -1674,6 +1843,10 @@ export class Game {
     this.debugConflictLabels?.destroy();
     this.turnConnectorGfx?.destroy();
     this.mapScenarioEditorUI?.destroy();
+    this.edgeEditorPanel?.remove();
+    this.toolSwitchPanel?.remove();
+    this.edgeEditorPanel = null;
+    this.toolSwitchPanel = null;
     this.buildingRenderer.destroy();
     this.roadRenderer.destroy();
     this.vehicleRenderer.destroy();
