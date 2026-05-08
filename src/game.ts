@@ -103,7 +103,17 @@ function buildDemoMapData(): MapData {
     spawnPoints.push([nodes[nid(r, COLS - 1)].lat, nodes[nid(r, COLS - 1)].lng]);
   }
 
-  return { nodes, edges, spawnPoints, bbox: DEFAULT_BBOX, buildings: [], restrictions: [], tramStops: [] };
+  return {
+    nodes,
+    edges,
+    spawnPoints,
+    bbox: DEFAULT_BBOX,
+    buildings: [],
+    restrictions: [],
+    tramStops: [],
+    lanes: [],
+    conflictAreas: [],
+  };
 }
 
 // Simulation starts at 06:00 (game seconds since midnight)

@@ -16,9 +16,10 @@ function expectVehicleState(actual: VehicleState, expected: VehicleState): void 
   expect(actual.speed).toBeCloseTo(expected.speed, 5);
   expect(actual.frustration).toBeCloseTo(expected.frustration, 5);
   expect(actual.lateralOffset).toBeCloseTo(expected.lateralOffset, 5);
+  expect(actual.currentLaneId).toBe(expected.currentLaneId);
 }
 
-// Packet layout v2 (40 bytes):
+// Packet layout v3 (48 bytes):
 //   [0..3]   id:            u32 LE
 //   [4..11]  lat:           f64 LE
 //   [12..19] lng:           f64 LE
@@ -30,7 +31,8 @@ function expectVehicleState(actual: VehicleState, expected: VehicleState): void 
 //   [31]     laneFlags:     u8
 //   [32..35] frustration:   f32 LE
 //   [36..39] lateralOffset: f32 LE
-const PACKET_SIZE = 40;
+//   [40..47] currentLaneId: u64 LE
+const PACKET_SIZE = 48;
 
 function vehicleStatesToBase64(vehicles: VehicleState[]): string {
   const buf = new ArrayBuffer(vehicles.length * PACKET_SIZE);
@@ -50,6 +52,7 @@ function vehicleStatesToBase64(vehicles: VehicleState[]): string {
     view.setUint8(base + 31, laneFlags);
     view.setFloat32(base + 32, v.frustration,   true);
     view.setFloat32(base + 36, v.lateralOffset, true);
+    view.setBigUint64(base + 40, BigInt(v.currentLaneId ?? '18446744073709551615'), true);
   }
   const bytes = new Uint8Array(buf);
   let binary = '';
@@ -64,7 +67,7 @@ describe('parseVehicleFrame', () => {
     expect(parseVehicleFrame('')).toEqual([]);
   });
 
-  it('decodes a single 40-byte vehicle packet', () => {
+  it('decodes a single 48-byte vehicle packet', () => {
     const expected: VehicleState = {
       id: 4242,
       lat: 52.2297,
@@ -78,6 +81,7 @@ describe('parseVehicleFrame', () => {
       onTurnConnector: false,
       frustration: 3.5,
       lateralOffset: 0.25,
+      currentLaneId: 1001,
     };
     const decoded = parseVehicleFrame(vehicleStatesToBase64([expected]));
     expect(decoded).toHaveLength(1);
@@ -98,6 +102,7 @@ describe('parseVehicleFrame', () => {
       onTurnConnector: false,
       frustration: 0,
       lateralOffset: 0,
+      currentLaneId: 10,
     };
     const b: VehicleState = {
       ...a,
@@ -110,6 +115,7 @@ describe('parseVehicleFrame', () => {
       onTurnConnector: true,
       frustration: 99.9,
       lateralOffset: 1.75,
+      currentLaneId: 22,
     };
     const decoded = parseVehicleFrame(vehicleStatesToBase64([a, b]));
     expect(decoded).toHaveLength(2);
@@ -131,6 +137,7 @@ describe('parseVehicleFrame', () => {
       onTurnConnector: false,
       frustration: 0,
       lateralOffset: 0,
+      currentLaneId: null,
     };
     const buf = new ArrayBuffer(PACKET_SIZE + 10);
     const view = new DataView(buf);
@@ -146,6 +153,7 @@ describe('parseVehicleFrame', () => {
     view.setUint8(31, laneFlags);
     view.setFloat32(32, full.frustration,   true);
     view.setFloat32(36, full.lateralOffset, true);
+    view.setBigUint64(40, BigInt('18446744073709551615'), true);
     const bytes = new Uint8Array(buf);
     let binary = '';
     for (let i = 0; i < bytes.length; i++) {

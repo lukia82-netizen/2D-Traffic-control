@@ -1,6 +1,7 @@
 use petgraph::graph::EdgeIndex;
 use super::types::VehicleType;
 use super::driver::DriverProfile;
+use crate::map::road_network::LaneId;
 
 #[derive(Debug, Clone)]
 pub struct Vehicle {
@@ -55,6 +56,13 @@ pub struct Vehicle {
     pub route_pos: usize,
     /// Progress along the current edge: 0.0 = start, 1.0 = end.
     pub edge_progress: f32,
+
+    /// Lane-centric route (full cutover target). When populated, simulation
+    /// should prefer this over edge-based fields.
+    pub lane_route: Vec<LaneId>,
+    pub lane_route_pos: usize,
+    pub lane_progress_m: f32,
+    pub current_lane_id: Option<LaneId>,
 
     // ── Lane management ──────────────────────────────────────────────────────
 
@@ -140,6 +148,10 @@ impl Vehicle {
             route,
             route_pos: 0,
             edge_progress: 0.0,
+            lane_route: Vec::new(),
+            lane_route_pos: 0,
+            lane_progress_m: 0.0,
+            current_lane_id: None,
             current_lane: 0,
             target_lane: 0,
             lane_change_cooldown: 0.0,

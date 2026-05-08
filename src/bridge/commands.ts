@@ -73,6 +73,23 @@ export interface TramEdge {
   trackType: string;
 }
 
+export interface LaneData {
+  id: number;
+  width: number;
+  connections: number[];
+  conflictAreas: number[];
+  points: [number, number][];
+  lengthM: number;
+}
+
+export interface ConflictAreaData {
+  id: number;
+  centerLat: number;
+  centerLng: number;
+  radiusM: number;
+  laneIds: number[];
+}
+
 export interface MapData {
   nodes: NodeData[];
   edges: EdgeData[];
@@ -81,6 +98,8 @@ export interface MapData {
   buildings: BuildingData[];
   restrictions: TurnRestriction[];
   tramStops: TramStop[];
+  lanes: LaneData[];
+  conflictAreas: ConflictAreaData[];
 }
 
 // ─── Typed invoke wrappers ────────────────────────────────────────────────────
