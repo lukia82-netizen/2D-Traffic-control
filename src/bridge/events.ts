@@ -188,6 +188,7 @@ export interface DebugVehicleThreat {
   yieldToVehicleLngLat: [number, number] | null;
   yieldToVehicleId: number | null;
   reservationPath: [number, number][] | null;
+  routeConflictPointIds: number[];
   comfortBrakeEndLngLat: [number, number];
   emergencyBrakeEndLngLat: [number, number];
   emergencyBrakingActive: boolean;
@@ -200,7 +201,14 @@ export interface DebugVehicleThreat {
   debugState: string | null;
 }
 
+export interface DebugLanePath {
+  lanePathId: string;
+  colorIdx: number;
+  points: [number, number][];
+}
+
 export interface DebugVisualizationPayload {
+  lanePaths: DebugLanePath[];
   conflictPoints: DebugConflictPoint[];
   vehicleThreats: DebugVehicleThreat[];
 }

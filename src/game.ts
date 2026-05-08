@@ -732,9 +732,8 @@ export class Game {
       if (!v) return null;
       const s = { lng: v.lng, lat: v.lat, angle: v.angle };
       const px = this.map.project([s.lng, s.lat]);
-      const laneOffset = this.camera.getLaneOffset() * (2 * v.lateralOffset + 1);
-      const cx = px.x + Math.cos(s.angle) * laneOffset;
-      const cy = px.y + Math.sin(s.angle) * laneOffset;
+      const cx = px.x;
+      const cy = px.y;
       const laneWidthPx = this.camera.getLaneOffset() * 2;
       const widthFill = VEHICLE_WIDTH_FILL[v.vehicleType] ?? VEHICLE_WIDTH_FILL[0];
       const lengthFactor = VEHICLE_LENGTH_FACTOR[v.vehicleType] ?? VEHICLE_LENGTH_FACTOR[0];
@@ -751,11 +750,61 @@ export class Game {
       };
     };
     const touchedConflictIds = new Set<number>();
+    let selectedRouteCpIds: Set<number> | null = null;
+    if (this.selectedVehicleId != null) {
+      const thSel = DATA.vehicleThreats.find((t) => t.vehicleId === this.selectedVehicleId);
+      if (thSel) selectedRouteCpIds = new Set(thSel.routeConflictPointIds ?? []);
+    }
     for (const th of DATA.vehicleThreats) {
       for (const id of th.collidingConflictPointIds ?? []) touchedConflictIds.add(id);
     }
+    const laneColor = 0x22ff22;
+    const laneLegend = new Map<string, { color: number; label: string }>();
+    for (const lp of DATA.lanePaths ?? []) {
+      if (!lp.points || lp.points.length < 2) continue;
+      const pts = lp.points.map(([lng, lat]) => this.map.project([lng, lat]));
+      const c = laneColor;
+      if (!laneLegend.has(lp.lanePathId)) {
+        const parts = lp.lanePathId.split(':');
+        const label = parts.length === 4
+          ? `${parts[0]}->${parts[1]} | L${parts[2]}->L${parts[3]}`
+          : lp.lanePathId;
+        laneLegend.set(lp.lanePathId, { color: c, label });
+      }
+      gfx.moveTo(pts[0].x, pts[0].y);
+      for (let i = 1; i < pts.length; i++) gfx.lineTo(pts[i].x, pts[i].y);
+      gfx.stroke({ color: c, alpha: 0.8, width: 1.4 });
+    }
+    if (laneLegend.size > 0) {
+      const title = new PIXI.Text({
+        text: 'Lane Paths (color legend)',
+        style: { fontFamily: 'Inter, Segoe UI, sans-serif', fontSize: 10, fill: 0xe5e7eb },
+      });
+      title.x = 12;
+      title.y = 10;
+      title.alpha = 0.95;
+      lbl.addChild(title);
+      let row = 0;
+      for (const item of laneLegend.values()) {
+        if (row >= 12) break; // keep overlay readable
+        const y = 26 + row * 14;
+        gfx.moveTo(12, y + 5);
+        gfx.lineTo(28, y + 5);
+        gfx.stroke({ color: item.color, alpha: 0.95, width: 2.2 });
+        const tx = new PIXI.Text({
+          text: item.label,
+          style: { fontFamily: 'Inter, Segoe UI, sans-serif', fontSize: 9, fill: 0xcbd5e1 },
+        });
+        tx.x = 34;
+        tx.y = y - 1;
+        tx.alpha = 0.94;
+        lbl.addChild(tx);
+        row++;
+      }
+    }
 
     for (const cp of DATA.conflictPoints) {
+      if (selectedRouteCpIds && !selectedRouteCpIds.has(cp.id)) continue;
       const p = this.map.project([cp.lng, cp.lat]);
       const reserved = cp.reservedBy !== null && cp.reservedBy !== undefined;
       const touchingObb = cp.collidingWithObb || touchedConflictIds.has(cp.id);

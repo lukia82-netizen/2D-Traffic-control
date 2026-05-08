@@ -115,6 +115,14 @@ struct DebugConflictPointPayload {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct DebugLanePathPayload {
+    lane_path_id: String,
+    color_idx: u8,
+    points: Vec<[f64; 2]>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct DebugVehicleThreatPayload {
     vehicle_id: u32,
     center_lng_lat: [f64; 2],
@@ -127,6 +135,7 @@ struct DebugVehicleThreatPayload {
     yield_to_vehicle_lng_lat: Option<[f64; 2]>,
     yield_to_vehicle_id: Option<u32>,
     reservation_path: Option<Vec<[f64; 2]>>,
+    route_conflict_point_ids: Vec<u64>,
     comfort_brake_end_lng_lat: [f64; 2],
     emergency_brake_end_lng_lat: [f64; 2],
     emergency_braking_active: bool,
@@ -142,12 +151,22 @@ struct DebugVehicleThreatPayload {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DebugVisualizationPayload {
+    lane_paths: Vec<DebugLanePathPayload>,
     conflict_points: Vec<DebugConflictPointPayload>,
     vehicle_threats: Vec<DebugVehicleThreatPayload>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct LaneMovementKey {
+    in_edge: EdgeIndex,
+    out_edge: EdgeIndex,
+    in_lane: u8,
+    out_lane: u8,
+}
+
 #[derive(Debug, Clone)]
 struct ConflictPoint {
+    id: u64,
     pos: DVec2,
     distance_on_path: f32,
     radius_m: f32,
@@ -165,7 +184,7 @@ struct ConflictPath {
 
 #[derive(Debug, Clone)]
 struct IntersectionConflictData {
-    by_movement: HashMap<(EdgeIndex, EdgeIndex), ConflictPath>,
+    by_movement: HashMap<LaneMovementKey, ConflictPath>,
     incoming_cw: Vec<EdgeIndex>,
     deadlock_timer_s: f32,
     deadlock_first_move: Option<u32>,
@@ -511,6 +530,7 @@ pub fn run_simulation(
             {
                 let guard = graph_lock.read();
                 if let Some(map) = guard.as_ref() {
+                    let lane_paths = conflict_system.debug_lane_paths_snapshot();
                     let mut conflict_points = conflict_system.debug_conflict_points_snapshot();
                     let vehicle_threats: Vec<DebugVehicleThreatPayload> = vehicles
                         .iter()
@@ -569,6 +589,18 @@ pub fn run_simulation(
                             } else {
                                 None
                             };
+                            let route_conflict_point_ids = if let Some((movement, _)) = vehicle_next_movement(v, map) {
+                                if let Some((_, node_idx)) = map.graph.edge_endpoints(movement.0) {
+                                    conflict_system.route_conflict_point_ids(
+                                        lane_movement_key_for_vehicle(v, movement),
+                                        node_idx,
+                                    )
+                                } else {
+                                    Vec::new()
+                                }
+                            } else {
+                                Vec::new()
+                            };
                             if s.obstacle.kind == ObstacleKind::PriorityStopLine {
                                 yield_to_pos = s.obstacle.point_lng_lat;
                                 yield_to_id = s.obstacle.leader_vehicle_id;
@@ -608,6 +640,7 @@ pub fn run_simulation(
                                 yield_to_vehicle_lng_lat: yield_to_pos,
                                 yield_to_vehicle_id: yield_to_id,
                                 reservation_path,
+                                route_conflict_point_ids,
                                 comfort_brake_end_lng_lat: brake_projection_from_hood(v, comfort_d),
                                 emergency_brake_end_lng_lat: brake_projection_from_hood(v, emergency_d),
                                 emergency_braking_active,
@@ -633,6 +666,7 @@ pub fn run_simulation(
                     let _ = app_handle.emit(
                         "debug_visualization",
                         &DebugVisualizationPayload {
+                            lane_paths,
                             conflict_points,
                             vehicle_threats,
                         },
@@ -1176,13 +1210,14 @@ fn apply_connector_conflict_obstacle(
         return base_obstacle;
     };
     let movement = (in_e, out_e);
+    let lane_key = lane_movement_key_for_vehicle(vehicle, movement);
     let half_len = vehicle.vehicle_type.params().length_m * 0.5;
     let s_front_arc = (vehicle.turn_dist_m as f32 + half_len).max(0.0);
     let vr = vehicle_path_radius_m(vehicle);
     let look_ahead = conflict_scan_distance_m(vehicle).max(CONFLICT_LOOKAHEAD_M);
     let Some((block_dist, pt, owner)) = conflict_system.first_blocking_conflict_on_arc(
         vehicle,
-        movement,
+        lane_key,
         s_front_arc,
         look_ahead,
         vehicle.id,
@@ -1264,17 +1299,7 @@ fn has_exit_space_after_intersection(
 }
 
 fn vehicle_obb_isometry_and_shape(vehicle: &Vehicle) -> (Isometry2<f32>, Cuboid) {
-    let (mut x_m, mut y_m) = geo_to_m_xy(vehicle.lat, vehicle.lng);
-    // Apply the same lane-center convention as frontend rendering:
-    // lane center offset = (lateral + 0.5) * lane_width.
-    const LANE_WIDTH_M: f64 = 3.2;
-    let dir_x = (vehicle.angle as f64).sin();
-    let dir_y = (vehicle.angle as f64).cos();
-    let right_x = dir_y;
-    let right_y = -dir_x;
-    let lat_shift_m = (vehicle.current_lateral_offset as f64 + 0.5) * LANE_WIDTH_M;
-    x_m += right_x * lat_shift_m;
-    y_m += right_y * lat_shift_m;
+    let (x_m, y_m) = geo_to_m_xy(vehicle.lat, vehicle.lng);
     // Convert our heading convention to standard angle from +X axis.
     let theta = std::f32::consts::FRAC_PI_2 - vehicle.angle;
     let iso = Isometry2::new(Vector2::new(x_m as f32, y_m as f32), theta);
@@ -1425,6 +1450,7 @@ fn apply_intersection_effect(
     let scan_dist = conflict_scan_distance_m(vehicle);
 
     if let Some((movement, conn)) = vehicle_next_movement(vehicle, map) {
+        let lane_key = lane_movement_key_for_vehicle(vehicle, movement);
         let dist_to_entry_center = ((conn.entry_progress - vehicle.edge_progress).max(0.0)
             * edge.length_m)
             .max(0.0);
@@ -1493,7 +1519,7 @@ fn apply_intersection_effect(
                 best = min_obstacle(best, threat);
             }
             if let Some((cp_id, pt, owner)) =
-                conflict_system.path_has_foreign_reservation(movement, vehicle.id, tgt_node_idx)
+                conflict_system.path_has_foreign_reservation(lane_key, vehicle.id, tgt_node_idx)
             {
                 if vehicle.speed < 0.5 && dist_to_stop_line <= 4.0 {
                     log::debug!(
@@ -1539,7 +1565,7 @@ fn apply_intersection_effect(
             }
             if let Some((block_dist, pt, owner)) = conflict_system.first_blocking_conflict_distance(
                 vehicle,
-                movement,
+                lane_key,
                 dist_to_entry,
                 scan_dist.max(CONFLICT_LOOKAHEAD_M),
                 vehicle.id,
@@ -2085,6 +2111,7 @@ fn apply_vehicle_physics(
             }
         }
         if let Some((movement, _)) = vehicle_next_movement(vehicle, map) {
+            let lane_key = lane_movement_key_for_vehicle(vehicle, movement);
             let pstate = conflict_system.check_priority(
                 vehicle,
                 movement.0,
@@ -2098,7 +2125,7 @@ fn apply_vehicle_physics(
             } else if !has_exit_space_after_intersection(vehicle, map, vehicles) {
                 can_enter_connector = false;
             } else if conflict_system
-                .try_reserve_all_for_vehicle(vehicle.id, movement, tgt_idx, now_game_s)
+                .try_reserve_all_for_vehicle(vehicle.id, lane_key, tgt_idx, now_game_s)
                 .is_err()
             {
                 can_enter_connector = false;
@@ -2165,17 +2192,30 @@ fn apply_vehicle_physics(
         vehicle.target_lane = compute_vehicle_target_lane(vehicle, map);
     }
 
-    // Linear position interpolation (straight road segments only).
+    // Lane-based linear position interpolation (straight road segments only):
+    // centerline point + right-normal * lane_center_offset.
     let src = &map.graph[src_idx];
     let tgt = &map.graph[tgt_idx];
     let t   = vehicle.edge_progress as f64;
-    vehicle.lat = src.lat + (tgt.lat - src.lat) * t;
-    vehicle.lng = src.lng + (tgt.lng - src.lng) * t;
-
-    // Heading
-    let dlng = tgt.lng - src.lng;
-    let dlat = tgt.lat - src.lat;
-    vehicle.angle = (dlng as f32).atan2(dlat as f32);
+    let (sx, sy) = geo_to_m_xy(src.lat, src.lng);
+    let (tx, ty) = geo_to_m_xy(tgt.lat, tgt.lng);
+    let bx = sx + (tx - sx) * t;
+    let by = sy + (ty - sy) * t;
+    let (dir_x, dir_y) = normalize_xy(tx - sx, ty - sy);
+    let right_x = dir_y;
+    let right_y = -dir_x;
+    let edge_w = map.graph.edge_weight(edge_idx);
+    let lane_shift_m = if let Some(w) = edge_w {
+        lane_center_offset_m(vehicle.current_lane, w.lanes.max(1), w.oneway)
+    } else {
+        0.0
+    };
+    let px = bx + right_x * lane_shift_m;
+    let py = by + right_y * lane_shift_m;
+    let (lat, lng) = m_xy_to_geo(px, py);
+    vehicle.lat = lat;
+    vehicle.lng = lng;
+    vehicle.angle = (dir_x as f32).atan2(dir_y as f32);
 }
 
 #[derive(Debug, Clone)]
@@ -2350,6 +2390,16 @@ fn vehicle_next_movement(vehicle: &Vehicle, map: &MapData) -> Option<((EdgeIndex
     Some(((in_edge, out_edge), conn))
 }
 
+#[inline]
+fn lane_movement_key_for_vehicle(vehicle: &Vehicle, movement: (EdgeIndex, EdgeIndex)) -> LaneMovementKey {
+    LaneMovementKey {
+        in_edge: movement.0,
+        out_edge: movement.1,
+        in_lane: vehicle.current_lane,
+        out_lane: vehicle.target_lane,
+    }
+}
+
 impl ConflictSystem {
     fn movements_conflict(
         &self,
@@ -2360,19 +2410,26 @@ impl ConflictSystem {
         let Some(node) = self.nodes.get(&node_idx) else {
             return false;
         };
-        let Some(path_a) = node.by_movement.get(&movement_a) else {
-            return false;
-        };
-        let Some(path_b) = node.by_movement.get(&movement_b) else {
-            return false;
-        };
-        if path_a.points.is_empty() || path_b.points.is_empty() {
-            return false;
-        }
-        for pa in &path_a.points {
-            for pb in &path_b.points {
-                if (pa.pos - pb.pos).length_squared() < 1.0 {
-                    return true;
+        for (ka, path_a) in &node.by_movement {
+            if ka.in_edge != movement_a.0 || ka.out_edge != movement_a.1 {
+                continue;
+            }
+            if path_a.points.is_empty() {
+                continue;
+            }
+            for (kb, path_b) in &node.by_movement {
+                if kb.in_edge != movement_b.0 || kb.out_edge != movement_b.1 {
+                    continue;
+                }
+                if path_b.points.is_empty() {
+                    continue;
+                }
+                for pa in &path_a.points {
+                    for pb in &path_b.points {
+                        if (pa.pos - pb.pos).length_squared() < 1.0 {
+                            return true;
+                        }
+                    }
                 }
             }
         }
@@ -2529,17 +2586,17 @@ impl ConflictSystem {
 
     fn path_has_foreign_reservation(
         &self,
-        movement: (EdgeIndex, EdgeIndex),
+        movement: LaneMovementKey,
         vehicle_id: u32,
         node_idx: NodeIndex,
     ) -> Option<(u64, [f64; 2], u32)> {
         let node = self.nodes.get(&node_idx)?;
         let path = node.by_movement.get(&movement)?;
-        path.points.iter().enumerate().find_map(|(i, p)| match p.reserved_by {
+        path.points.iter().find_map(|p| match p.reserved_by {
             Some(owner) if owner != vehicle_id => {
                 let lng = p.pos.x / GEO_LNG_M;
                 let lat = p.pos.y / GEO_LAT_M;
-                Some((i as u64 + 1, [lng, lat], owner))
+                Some((p.id, [lng, lat], owner))
             }
             _ => None,
         })
@@ -2548,7 +2605,7 @@ impl ConflictSystem {
     fn try_reserve_all_for_vehicle(
         &mut self,
         vehicle_id: u32,
-        movement: (EdgeIndex, EdgeIndex),
+        movement: LaneMovementKey,
         node_idx: NodeIndex,
         now_game_s: f32,
     ) -> Result<(), ([f64; 2], u32)> {
@@ -2697,7 +2754,7 @@ impl ConflictSystem {
     fn first_blocking_conflict_distance(
         &self,
         vehicle: &Vehicle,
-        movement: (EdgeIndex, EdgeIndex),
+        movement: LaneMovementKey,
         dist_to_entry: f32,
         look_ahead: f32,
         vehicle_id: u32,
@@ -2730,7 +2787,7 @@ impl ConflictSystem {
     fn first_blocking_conflict_on_arc(
         &self,
         vehicle: &Vehicle,
-        movement: (EdgeIndex, EdgeIndex),
+        movement: LaneMovementKey,
         s_front_arc_m: f32,
         look_ahead: f32,
         vehicle_id: u32,
@@ -2766,25 +2823,63 @@ impl ConflictSystem {
 
     fn debug_conflict_points_snapshot(&self) -> Vec<DebugConflictPointPayload> {
         let mut out = Vec::new();
-        let mut next_id: u64 = 1;
         for node in self.nodes.values() {
             for path in node.by_movement.values() {
                 for p in &path.points {
                     let lng = p.pos.x / GEO_LNG_M;
                     let lat = p.pos.y / GEO_LAT_M;
                     out.push(DebugConflictPointPayload {
-                        id: next_id,
+                        id: p.id,
                         lng,
                         lat,
                         radius_m: p.radius_m,
                         reserved_by: p.reserved_by,
                         colliding_with_obb: false,
                     });
-                    next_id += 1;
                 }
             }
         }
         out
+    }
+
+    fn debug_lane_paths_snapshot(&self) -> Vec<DebugLanePathPayload> {
+        let mut out = Vec::new();
+        for node in self.nodes.values() {
+            for (k, path) in &node.by_movement {
+                let (poly, _) = sample_connector_polyline(&path.bezier, 20);
+                let points: Vec<[f64; 2]> = poly
+                    .into_iter()
+                    .map(|p| [p.x / GEO_LNG_M, p.y / GEO_LAT_M])
+                    .collect();
+                let color_idx = ((k.in_lane as u16 * 3 + k.out_lane as u16) % 12) as u8;
+                out.push(DebugLanePathPayload {
+                    lane_path_id: format!(
+                        "{}:{}:{}:{}",
+                        k.in_edge.index(),
+                        k.out_edge.index(),
+                        k.in_lane,
+                        k.out_lane
+                    ),
+                    color_idx,
+                    points,
+                });
+            }
+        }
+        out
+    }
+
+    fn route_conflict_point_ids(
+        &self,
+        movement: LaneMovementKey,
+        node_idx: NodeIndex,
+    ) -> Vec<u64> {
+        let Some(node) = self.nodes.get(&node_idx) else {
+            return Vec::new();
+        };
+        let Some(path) = node.by_movement.get(&movement) else {
+            return Vec::new();
+        };
+        path.points.iter().map(|p| p.id).collect()
     }
 
     fn release_passed_for_vehicle(
@@ -2798,7 +2893,10 @@ impl ConflictSystem {
         let in_edge = EdgeIndex::new(from_edge);
         let out_edge = EdgeIndex::new(to_edge);
         for node in self.nodes.values_mut() {
-            if let Some(path) = node.by_movement.get_mut(&(in_edge, out_edge)) {
+            for (k, path) in node.by_movement.iter_mut() {
+                if k.in_edge != in_edge || k.out_edge != out_edge {
+                    continue;
+                }
                 for p in &mut path.points {
                     if p.reserved_by == Some(vehicle_id)
                         && current_dist_on_path
@@ -2840,7 +2938,10 @@ impl ConflictSystem {
         let in_edge = EdgeIndex::new(from_edge);
         let out_edge = EdgeIndex::new(to_edge);
         for node in self.nodes.values_mut() {
-            if let Some(path) = node.by_movement.get_mut(&(in_edge, out_edge)) {
+            for (k, path) in node.by_movement.iter_mut() {
+                if k.in_edge != in_edge || k.out_edge != out_edge {
+                    continue;
+                }
                 for p in &mut path.points {
                     if p.reserved_by != Some(vehicle_id) {
                         continue;
@@ -2892,21 +2993,43 @@ fn planned_turn_connector(vehicle: &Vehicle, map: &MapData) -> Option<PlannedTur
     if vehicle.route_pos + 1 >= vehicle.route.len() {
         return None;
     }
-    connector_for_movement(
+    connector_for_movement_lane(
         map,
         vehicle.route[vehicle.route_pos],
         vehicle.route[vehicle.route_pos + 1],
+        vehicle.current_lane,
+        vehicle.target_lane,
     )
 }
 
-fn connector_for_movement(map: &MapData, in_edge: EdgeIndex, out_edge: EdgeIndex) -> Option<PlannedTurnConnector> {
+fn lane_center_offset_m(lane: u8, lanes_total: u8, oneway: bool) -> f64 {
+    const LANE_WIDTH_M: f64 = 3.2;
+    if oneway {
+        // OSM axis is road center for oneway carriageways.
+        ((lane as f64 + 0.5) - (lanes_total as f64) * 0.5) * LANE_WIDTH_M
+    } else {
+        // For two-way represented as opposite directed edges on the same axis,
+        // the axis acts as the direction divider.
+        (lane as f64 + 0.5) * LANE_WIDTH_M
+    }
+}
+
+fn connector_for_movement_lane(
+    map: &MapData,
+    in_edge: EdgeIndex,
+    out_edge: EdgeIndex,
+    in_lane: u8,
+    out_lane: u8,
+) -> Option<PlannedTurnConnector> {
     let (src, junction) = map.graph.edge_endpoints(in_edge)?;
     let (next_src, next_tgt) = map.graph.edge_endpoints(out_edge)?;
     if junction != next_src {
         return None;
     }
-    let curr_len = map.graph.edge_weight(in_edge)?.length_m.max(1.0);
-    let next_len = map.graph.edge_weight(out_edge)?.length_m.max(1.0);
+    let in_w = map.graph.edge_weight(in_edge)?;
+    let out_w = map.graph.edge_weight(out_edge)?;
+    let curr_len = in_w.length_m.max(1.0);
+    let next_len = out_w.length_m.max(1.0);
     let src_n = &map.graph[src];
     let jn = &map.graph[junction];
     let tgt_n = &map.graph[next_tgt];
@@ -2929,8 +3052,21 @@ fn connector_for_movement(map: &MapData, in_edge: EdgeIndex, out_edge: EdgeIndex
     let p2_lng = jn.lng + (tgt_n.lng - jn.lng) * exit_progress as f64;
     let (in_fx, in_fy) = normalize_xy((jn.lng - src_n.lng) * GEO_LNG_M, (jn.lat - src_n.lat) * GEO_LAT_M);
     let (out_fx, out_fy) = normalize_xy((tgt_n.lng - jn.lng) * GEO_LNG_M, (tgt_n.lat - jn.lat) * GEO_LAT_M);
-    let (p1x, p1y) = geo_to_m_xy(p1_lat, p1_lng);
-    let (p2x, p2y) = geo_to_m_xy(p2_lat, p2_lng);
+    // Build per-lane physical entry/exit anchors once (lane-based geometry).
+    let right_in_x = in_fy;
+    let right_in_y = -in_fx;
+    let right_out_x = out_fy;
+    let right_out_y = -out_fx;
+    let (mut p1x, mut p1y) = geo_to_m_xy(p1_lat, p1_lng);
+    let (mut p2x, mut p2y) = geo_to_m_xy(p2_lat, p2_lng);
+    let in_shift = lane_center_offset_m(in_lane, in_w.lanes.max(1), in_w.oneway);
+    let out_shift = lane_center_offset_m(out_lane, out_w.lanes.max(1), out_w.oneway);
+    p1x += right_in_x * in_shift;
+    p1y += right_in_y * in_shift;
+    p2x += right_out_x * out_shift;
+    p2y += right_out_y * out_shift;
+    let (p1_lat, p1_lng) = m_xy_to_geo(p1x, p1y);
+    let (p2_lat, p2_lng) = m_xy_to_geo(p2x, p2y);
     let (ctrl_lat, ctrl_lng) = if let Some((cx, cy)) =
         line_intersection(p1x, p1y, in_fx, in_fy, p2x, p2y, -out_fx, -out_fy)
     {
@@ -2972,18 +3108,30 @@ fn build_conflict_system(map: &MapData) -> ConflictSystem {
             let bb = approach_angle_to_node(map, *b, node);
             bb.partial_cmp(&aa).unwrap_or(Ordering::Equal)
         });
-        let mut by_movement: HashMap<(EdgeIndex, EdgeIndex), ConflictPath> = HashMap::new();
+        let mut by_movement: HashMap<LaneMovementKey, ConflictPath> = HashMap::new();
+        let mut next_cp_id: u64 = 1;
         for &in_edge in &incoming {
             for &out_edge in &outgoing {
-                if let Some(c) = connector_for_movement(map, in_edge, out_edge) {
-                    by_movement.insert((in_edge, out_edge), ConflictPath {
-                        bezier: c,
-                        points: Vec::new(),
-                    });
+                let in_lanes = map.graph.edge_weight(in_edge).map(|e| e.lanes).unwrap_or(1);
+                let out_lanes = map.graph.edge_weight(out_edge).map(|e| e.lanes).unwrap_or(1);
+                for in_lane in 0..in_lanes {
+                    for out_lane in 0..out_lanes {
+                        if let Some(c) = connector_for_movement_lane(map, in_edge, out_edge, in_lane, out_lane) {
+                            by_movement.insert(LaneMovementKey {
+                                in_edge,
+                                out_edge,
+                                in_lane,
+                                out_lane,
+                            }, ConflictPath {
+                                bezier: c,
+                                points: Vec::new(),
+                            });
+                        }
+                    }
                 }
             }
         }
-        build_conflicts_for_node(&mut by_movement);
+        build_conflicts_for_node(&mut by_movement, &mut next_cp_id);
         let conflict_count: usize = by_movement.values().map(|p| p.points.len()).sum();
         let _ = conflict_count;
         nodes.insert(node, IntersectionConflictData {
@@ -3007,8 +3155,8 @@ fn approach_angle_to_node(map: &MapData, in_edge: EdgeIndex, node: NodeIndex) ->
     dy.atan2(dx)
 }
 
-fn build_conflicts_for_node(by_movement: &mut HashMap<(EdgeIndex, EdgeIndex), ConflictPath>) {
-    let keys: Vec<(EdgeIndex, EdgeIndex)> = by_movement.keys().copied().collect();
+fn build_conflicts_for_node(by_movement: &mut HashMap<LaneMovementKey, ConflictPath>, next_cp_id: &mut u64) {
+    let keys: Vec<LaneMovementKey> = by_movement.keys().copied().collect();
     for i in 0..keys.len() {
         for j in (i + 1)..keys.len() {
             let k1 = keys[i];
@@ -3023,6 +3171,7 @@ fn build_conflicts_for_node(by_movement: &mut HashMap<(EdgeIndex, EdgeIndex), Co
                     ) {
                         if let Some(path) = by_movement.get_mut(&k1) {
                             path.points.push(ConflictPoint {
+                                id: *next_cp_id,
                                 pos: p,
                                 distance_on_path: da,
                                 radius_m: 2.0,
@@ -3031,9 +3180,11 @@ fn build_conflicts_for_node(by_movement: &mut HashMap<(EdgeIndex, EdgeIndex), Co
                                 reserved_last_progress_m: None,
                                 reserved_last_motion_s: None,
                             });
+                            *next_cp_id += 1;
                         }
                         if let Some(path) = by_movement.get_mut(&k2) {
                             path.points.push(ConflictPoint {
+                                id: *next_cp_id,
                                 pos: p,
                                 distance_on_path: db,
                                 radius_m: 2.0,
@@ -3042,6 +3193,7 @@ fn build_conflicts_for_node(by_movement: &mut HashMap<(EdgeIndex, EdgeIndex), Co
                                 reserved_last_progress_m: None,
                                 reserved_last_motion_s: None,
                             });
+                            *next_cp_id += 1;
                         }
                     }
                 }
