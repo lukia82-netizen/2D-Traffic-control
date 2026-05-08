@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use petgraph::visit::EdgeRef;
 use tauri::ipc::Channel;
 use tauri::{command, AppHandle, State};
 
@@ -7,6 +8,7 @@ use crate::map::road_network::{
     build_single_intersection_network, InfraType, IntersectionType, LaneDirection, MapData,
     RestrictionKind,
 };
+use crate::map::world_editor::{EditorTool, GraphChange, MapOverrides};
 use crate::simulation::sim_loop::run_simulation;
 use crate::simulation::speed_config::SpeedConfig;
 use crate::state::{AppState, LightControlMode, SimCommand, SimControl};
@@ -107,8 +109,18 @@ pub struct MapDataResponse {
     pub buildings: Vec<BuildingData>,
     pub restrictions: Vec<TurnRestrictionData>,
     pub tram_stops: Vec<TramStopData>,
+    pub turn_connectors: Vec<TurnConnectorData>,
     pub lanes: Vec<LaneData>,
     pub conflict_areas: Vec<ConflictAreaData>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnConnectorData {
+    pub from_node_id: u64,
+    pub via_node_id: u64,
+    pub to_node_id: u64,
+    pub bezier_lut: Vec<[f64; 2]>,
 }
 
 // ── Commands ──────────────────────────────────────────────────────────────────
@@ -126,7 +138,7 @@ pub async fn load_map(bbox: BBox, state: State<'_, AppState>) -> Result<MapDataR
         bbox.north
     );
 
-    let (_city_map, map_data) =
+    let (_city_map, mut map_data) =
         build_city_map_from_bbox([bbox.west, bbox.south, bbox.east, bbox.north])
             .await
             .unwrap_or_else(|err| {
@@ -144,6 +156,9 @@ pub async fn load_map(bbox: BBox, state: State<'_, AppState>) -> Result<MapDataR
                     ]),
                 )
             });
+    apply_overrides_from_disk(&mut map_data)?;
+    map_data.rebuild_all_geometry();
+    crate::map::road_network::populate_lane_graph(&mut map_data);
 
     let response = build_map_response(&map_data);
     let mut guard = state.road_graph.write();
@@ -290,6 +305,208 @@ pub fn set_debug_visualization(
     send_sim_command(&state, SimCommand::SetDebugVisualization(enabled))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MoveNodePayload {
+    pub node_id: u64,
+    pub lat: f64,
+    pub lng: f64,
+    pub final_commit: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectPayload {
+    pub from_node_id: u64,
+    pub to_node_id: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtrudePayload {
+    pub from_node_id: u64,
+    pub new_node_id: u64,
+    pub lat: f64,
+    pub lng: f64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateEdgeTagsPayload {
+    pub from_node_id: u64,
+    pub to_node_id: u64,
+    pub lanes: u8,
+    pub oneway: bool,
+    pub lane_directions: Vec<String>,
+}
+
+#[command]
+pub fn set_editor_tool(tool: EditorTool, state: State<AppState>) -> Result<(), String> {
+    *state.editor_tool.write() = tool;
+    Ok(())
+}
+
+#[command]
+pub fn editor_move_node(payload: MoveNodePayload, state: State<AppState>) -> Result<MapDataResponse, String> {
+    let mut guard = state.road_graph.write();
+    let map = guard.as_mut().ok_or_else(|| "Map not loaded".to_string())?;
+    let Some(&idx) = map.node_index_map.get(&payload.node_id) else {
+        return Err("Unknown node id".to_string());
+    };
+    let before = (map.graph[idx].lat, map.graph[idx].lng);
+    map.update_node_position(payload.node_id, payload.lat, payload.lng)?;
+    if payload.final_commit {
+        let mut hist = state.editor_history.write();
+        hist.undo.push(GraphChange::NodePosition {
+            node_id: payload.node_id,
+            before_lat: before.0,
+            before_lng: before.1,
+            after_lat: payload.lat,
+            after_lng: payload.lng,
+        });
+        hist.redo.clear();
+    }
+    Ok(build_map_response(map))
+}
+
+#[command]
+pub fn editor_extrude(payload: ExtrudePayload, state: State<AppState>) -> Result<MapDataResponse, String> {
+    let mut guard = state.road_graph.write();
+    let map = guard.as_mut().ok_or_else(|| "Map not loaded".to_string())?;
+    if map.node_index_map.contains_key(&payload.new_node_id) {
+        return Err("new_node_id already exists".to_string());
+    }
+    let new_idx = map.graph.add_node(crate::map::road_network::RoadNode {
+        osm_id: payload.new_node_id,
+        lat: payload.lat,
+        lng: payload.lng,
+        intersection_type: crate::map::road_network::IntersectionType::Plain,
+    });
+    map.node_index_map.insert(payload.new_node_id, new_idx);
+    map.add_edge_default(payload.from_node_id, payload.new_node_id)?;
+    let mut hist = state.editor_history.write();
+    hist.undo.push(GraphChange::EdgeAdded {
+        from_node_id: payload.from_node_id,
+        to_node_id: payload.new_node_id,
+    });
+    hist.redo.clear();
+    Ok(build_map_response(map))
+}
+
+#[command]
+pub fn editor_connect(payload: ConnectPayload, state: State<AppState>) -> Result<MapDataResponse, String> {
+    let mut guard = state.road_graph.write();
+    let map = guard.as_mut().ok_or_else(|| "Map not loaded".to_string())?;
+    map.add_edge_default(payload.from_node_id, payload.to_node_id)?;
+    let mut hist = state.editor_history.write();
+    hist.undo.push(GraphChange::EdgeAdded {
+        from_node_id: payload.from_node_id,
+        to_node_id: payload.to_node_id,
+    });
+    hist.redo.clear();
+    Ok(build_map_response(map))
+}
+
+#[command]
+pub fn editor_delete_edge(payload: ConnectPayload, state: State<AppState>) -> Result<MapDataResponse, String> {
+    let mut guard = state.road_graph.write();
+    let map = guard.as_mut().ok_or_else(|| "Map not loaded".to_string())?;
+    let mut removed = false;
+    let edge_ids: Vec<_> = map
+        .graph
+        .edge_references()
+        .filter(|e| map.graph[e.source()].osm_id == payload.from_node_id && map.graph[e.target()].osm_id == payload.to_node_id)
+        .map(|e| e.id())
+        .collect();
+    for id in edge_ids {
+        map.graph.remove_edge(id);
+        removed = true;
+    }
+    if !removed {
+        return Err("Edge not found".to_string());
+    }
+    map.rebuild_geometry(payload.from_node_id);
+    map.rebuild_geometry(payload.to_node_id);
+    let mut hist = state.editor_history.write();
+    hist.undo.push(GraphChange::EdgeDeleted {
+        from_node_id: payload.from_node_id,
+        to_node_id: payload.to_node_id,
+    });
+    hist.redo.clear();
+    Ok(build_map_response(map))
+}
+
+#[command]
+pub fn editor_undo(state: State<AppState>) -> Result<MapDataResponse, String> {
+    let mut graph_guard = state.road_graph.write();
+    let map = graph_guard.as_mut().ok_or_else(|| "Map not loaded".to_string())?;
+    let mut hist = state.editor_history.write();
+    let Some(change) = hist.undo.pop() else {
+        return Ok(build_map_response(map));
+    };
+    apply_inverse_change(map, &change)?;
+    hist.redo.push(change);
+    Ok(build_map_response(map))
+}
+
+#[command]
+pub fn editor_redo(state: State<AppState>) -> Result<MapDataResponse, String> {
+    let mut graph_guard = state.road_graph.write();
+    let map = graph_guard.as_mut().ok_or_else(|| "Map not loaded".to_string())?;
+    let mut hist = state.editor_history.write();
+    let Some(change) = hist.redo.pop() else {
+        return Ok(build_map_response(map));
+    };
+    apply_change(map, &change)?;
+    hist.undo.push(change);
+    Ok(build_map_response(map))
+}
+
+#[command]
+pub fn save_map_overrides(state: State<AppState>) -> Result<(), String> {
+    let graph_guard = state.road_graph.read();
+    let map = graph_guard.as_ref().ok_or_else(|| "Map not loaded".to_string())?;
+    let overrides = build_overrides(map);
+    let body = serde_json::to_string_pretty(&overrides).map_err(|e| e.to_string())?;
+    std::fs::write("map_overrides.json", body).map_err(|e| e.to_string())
+}
+
+#[command]
+pub fn editor_update_edge_tags(
+    payload: UpdateEdgeTagsPayload,
+    state: State<AppState>,
+) -> Result<MapDataResponse, String> {
+    let mut graph_guard = state.road_graph.write();
+    let map = graph_guard.as_mut().ok_or_else(|| "Map not loaded".to_string())?;
+    let mut updated = false;
+    let lanes = payload.lanes.max(1);
+    let lane_directions = payload
+        .lane_directions
+        .iter()
+        .map(|d| parse_lane_direction(d))
+        .collect::<Vec<_>>();
+    let edge_ids: Vec<_> = map
+        .graph
+        .edge_references()
+        .filter(|e| map.graph[e.source()].osm_id == payload.from_node_id && map.graph[e.target()].osm_id == payload.to_node_id)
+        .map(|e| e.id())
+        .collect();
+    for edge_id in edge_ids {
+        if let Some(edge) = map.graph.edge_weight_mut(edge_id) {
+            edge.lanes = lanes;
+            edge.oneway = payload.oneway;
+            edge.lane_directions = lane_directions.clone();
+            updated = true;
+        }
+    }
+    if !updated {
+        return Err("Edge not found".to_string());
+    }
+    map.rebuild_geometry(payload.from_node_id);
+    map.rebuild_geometry(payload.to_node_id);
+    Ok(build_map_response(map))
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 fn send_sim_command(state: &State<AppState>, cmd: SimCommand) -> Result<(), String> {
@@ -307,8 +524,6 @@ fn send_sim_command(state: &State<AppState>, cmd: SimCommand) -> Result<(), Stri
 }
 
 fn build_map_response(map_data: &MapData) -> MapDataResponse {
-    use petgraph::visit::EdgeRef;
-
     let mut nodes = Vec::new();
     for node_idx in map_data.graph.node_indices() {
         let node = &map_data.graph[node_idx];
@@ -427,6 +642,17 @@ fn build_map_response(map_data: &MapData) -> MapDataResponse {
         })
         .collect();
 
+    let turn_connectors: Vec<TurnConnectorData> = map_data
+        .turn_connectors
+        .iter()
+        .map(|c| TurnConnectorData {
+            from_node_id: c.from_node_id,
+            via_node_id: c.via_node_id,
+            to_node_id: c.to_node_id,
+            bezier_lut: c.bezier_lut.clone(),
+        })
+        .collect();
+
     MapDataResponse {
         nodes,
         edges,
@@ -435,6 +661,7 @@ fn build_map_response(map_data: &MapData) -> MapDataResponse {
         buildings,
         restrictions,
         tram_stops,
+        turn_connectors,
         lanes: map_data
             .lanes
             .values()
@@ -459,4 +686,154 @@ fn build_map_response(map_data: &MapData) -> MapDataResponse {
             })
             .collect(),
     }
+}
+
+fn apply_change(map: &mut MapData, change: &GraphChange) -> Result<(), String> {
+    match *change {
+        GraphChange::NodePosition { node_id, after_lat, after_lng, .. } => {
+            map.update_node_position(node_id, after_lat, after_lng)
+        }
+        GraphChange::EdgeAdded { from_node_id, to_node_id } => map.add_edge_default(from_node_id, to_node_id),
+        GraphChange::EdgeDeleted { from_node_id, to_node_id } => {
+            let payload = ConnectPayload { from_node_id, to_node_id };
+            let edge_ids: Vec<_> = map
+                .graph
+                .edge_references()
+                .filter(|e| map.graph[e.source()].osm_id == payload.from_node_id && map.graph[e.target()].osm_id == payload.to_node_id)
+                .map(|e| e.id())
+                .collect();
+            for id in edge_ids {
+                map.graph.remove_edge(id);
+            }
+            map.rebuild_geometry(from_node_id);
+            map.rebuild_geometry(to_node_id);
+            Ok(())
+        }
+    }
+}
+
+fn apply_inverse_change(map: &mut MapData, change: &GraphChange) -> Result<(), String> {
+    match *change {
+        GraphChange::NodePosition { node_id, before_lat, before_lng, .. } => {
+            map.update_node_position(node_id, before_lat, before_lng)
+        }
+        GraphChange::EdgeAdded { from_node_id, to_node_id } => {
+            apply_change(map, &GraphChange::EdgeDeleted { from_node_id, to_node_id })
+        }
+        GraphChange::EdgeDeleted { from_node_id, to_node_id } => {
+            apply_change(map, &GraphChange::EdgeAdded { from_node_id, to_node_id })
+        }
+    }
+}
+
+fn apply_overrides_from_disk(map: &mut MapData) -> Result<(), String> {
+    let Ok(raw) = std::fs::read_to_string("map_overrides.json") else {
+        return Ok(());
+    };
+    let parsed: MapOverrides = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    for (id, [lat, lng]) in parsed.node_positions {
+        let _ = map.update_node_position(id, lat, lng);
+    }
+    for [from, to] in parsed.added_edges {
+        let _ = map.add_edge_default(from, to);
+    }
+    for [from, to] in parsed.deleted_edges {
+        let edge_ids: Vec<_> = map
+            .graph
+            .edge_references()
+            .filter(|e| map.graph[e.source()].osm_id == from && map.graph[e.target()].osm_id == to)
+            .map(|e| e.id())
+            .collect();
+        for id in edge_ids {
+            map.graph.remove_edge(id);
+        }
+    }
+    for (key, tags) in parsed.edge_tag_overrides {
+        let Some((from, to)) = decode_edge_key(&key) else {
+            continue;
+        };
+        let lane_directions = tags
+            .lane_directions
+            .iter()
+            .map(|d| parse_lane_direction(d))
+            .collect::<Vec<_>>();
+        let edge_ids: Vec<_> = map
+            .graph
+            .edge_references()
+            .filter(|e| map.graph[e.source()].osm_id == from && map.graph[e.target()].osm_id == to)
+            .map(|e| e.id())
+            .collect();
+        for edge_id in edge_ids {
+            if let Some(edge) = map.graph.edge_weight_mut(edge_id) {
+                edge.lanes = tags.lanes.max(1);
+                edge.oneway = tags.oneway;
+                edge.lane_directions = lane_directions.clone();
+            }
+        }
+    }
+    Ok(())
+}
+
+fn build_overrides(map: &MapData) -> MapOverrides {
+    let mut node_positions = std::collections::HashMap::new();
+    for idx in map.graph.node_indices() {
+        let n = &map.graph[idx];
+        node_positions.insert(n.osm_id, [n.lat, n.lng]);
+    }
+    MapOverrides {
+        node_positions,
+        added_edges: map
+            .graph
+            .edge_references()
+            .filter(|e| e.weight().osm_id == 0)
+            .map(|e| [map.graph[e.source()].osm_id, map.graph[e.target()].osm_id])
+            .collect(),
+        deleted_edges: Vec::new(),
+        edge_tag_overrides: map
+            .graph
+            .edge_references()
+            .map(|e| {
+                let from = map.graph[e.source()].osm_id;
+                let to = map.graph[e.target()].osm_id;
+                let lane_directions = e
+                    .weight()
+                    .lane_directions
+                    .iter()
+                    .map(|d| match d {
+                        LaneDirection::Left => "left",
+                        LaneDirection::Straight => "straight",
+                        LaneDirection::Right => "right",
+                        LaneDirection::UTurn => "uturn",
+                    }
+                    .to_string())
+                    .collect::<Vec<_>>();
+                (
+                    encode_edge_key(from, to),
+                    crate::map::world_editor::EdgeTagOverride {
+                        lanes: e.weight().lanes,
+                        oneway: e.weight().oneway,
+                        lane_directions,
+                    },
+                )
+            })
+            .collect(),
+    }
+}
+
+fn parse_lane_direction(value: &str) -> LaneDirection {
+    match value {
+        "left" => LaneDirection::Left,
+        "right" => LaneDirection::Right,
+        "uturn" => LaneDirection::UTurn,
+        _ => LaneDirection::Straight,
+    }
+}
+
+fn encode_edge_key(from: u64, to: u64) -> String {
+    format!("{}->{}", from, to)
+}
+
+fn decode_edge_key(key: &str) -> Option<(u64, u64)> {
+    let (a, b) = key.split_once("->")?;
+    Some((a.parse().ok()?, b.parse().ok()?))
 }

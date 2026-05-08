@@ -8,6 +8,15 @@ import {
   setTimeScale,
   setMaxVehicles,
   setDebugVehicle,
+  setEditorTool,
+  editorMoveNode,
+  editorConnect,
+  editorExtrude,
+  editorDeleteEdge,
+  editorUpdateEdgeTags,
+  editorUndo,
+  editorRedo,
+  saveMapOverrides,
   setDebugVisualization,
 } from './bridge/commands';
 import {
@@ -36,6 +45,7 @@ import { CongestionRenderer } from './rendering/CongestionRenderer';
 import { UIRenderer } from './rendering/UIRenderer';
 import { TrafficLightUI } from './traffic/TrafficLightUI';
 import { TrafficLightRenderer } from './rendering/TrafficLightRenderer';
+import { EditorOverlay } from './rendering/EditorOverlay';
 import { GameClockUI } from './time/GameClockUI';
 import { SandboxUI, CITY_PRESETS } from './ui/SandboxUI';
 import { MapScenarioEditorUI, type ScenarioData } from './ui/MapScenarioEditorUI';
@@ -111,6 +121,7 @@ function buildDemoMapData(): MapData {
     buildings: [],
     restrictions: [],
     tramStops: [],
+    turnConnectors: [],
     lanes: [],
     conflictAreas: [],
   };
@@ -160,6 +171,7 @@ export class Game {
   private trafficLightUI!: TrafficLightUI;
   private trafficLightRenderer!: TrafficLightRenderer;
   private gameClockUI!: GameClockUI;
+  private editorOverlay!: EditorOverlay;
 
   private mapData: MapData | null = null;
   private readonly vehicles: Map<number, VehicleState> = new Map();
@@ -211,6 +223,15 @@ export class Game {
   /** null = real OSM data; string = sandbox grid type ('mixed'|'one_lane'|'single_road'|…) */
   private currentGridMode: string | null = 'single_road';
   private bboxPicker: MapBboxPicker | null = null;
+  private editorMode = true;
+  private editorTool: 'select' | 'move_node' | 'add_road' | 'delete' = 'move_node';
+  private selectedEdgeIndex: number | null = null;
+  private dragNodeId: number | null = null;
+  private dragLastSentAt = 0;
+  private connectFromNodeId: number | null = null;
+  private nextCustomNodeId = 1_000_000;
+  private edgeEditorPanel: HTMLDivElement | null = null;
+  private toolSwitchPanel: HTMLDivElement | null = null;
 
   constructor(map: maplibregl.Map, overlay: PixiOverlay) {
     this.map = map;
@@ -238,6 +259,7 @@ export class Game {
     this.uiRenderer = new UIRenderer();
     this.trafficLightUI = new TrafficLightUI(this.map);
     this.trafficLightRenderer = new TrafficLightRenderer(this.overlay, this.map);
+    this.editorOverlay = new EditorOverlay(this.overlay, this.map);
     this.gameClockUI = new GameClockUI();
     this.debugRouteGfx = new PIXI.Graphics();
     this.turnConnectorGfx = new PIXI.Graphics();
@@ -289,6 +311,7 @@ export class Game {
     }
 
     if (this.tauriAvailable) {
+      await setEditorTool(this.editorTool);
       await this.loadMapData();
       await this.subscribeToEvents();
       await this.startRustSimulation();
@@ -314,6 +337,9 @@ export class Game {
       }
     });
     this.map.on('click', (e) => {
+      if (this.editorMode && this.mapData) {
+        if (this.handleEditorClick(e.point.x, e.point.y)) return;
+      }
       const consumed = this.trafficLightUI.handleMapClick(
         e.lngLat.lng,
         e.lngLat.lat,
@@ -324,6 +350,10 @@ export class Game {
       if (consumed) return;
       void this.selectVehicleAtScreenPoint(e.point.x, e.point.y);
     });
+    this.bindEditorPointerHandlers();
+    this.bindEditorKeyboardHandlers();
+    this.initEdgeEditorPanel();
+    this.initToolSwitchPanel();
 
     // Start the PixiJS ticker
     this.overlay.app.ticker.add((ticker) => this.gameLoop(ticker));
@@ -482,6 +512,8 @@ export class Game {
     this.trafficLightRenderer.init(this.mapData.nodes, this.mapData.edges);
     this.rebuildTurnConnectorPaths();
     this.redrawTurnConnectors();
+    this.editorOverlay.setEnabled(this.editorMode);
+    this.editorOverlay.redrawHandles(this.mapData);
     this.mapScenarioEditorUI?.setMapData(this.mapData);
   }
 
@@ -537,6 +569,9 @@ export class Game {
   }
 
   private applyCustomMapData(mapData: MapData): void {
+    if (!(mapData as Partial<MapData>).turnConnectors) {
+      (mapData as MapData).turnConnectors = [];
+    }
     this.mapData = mapData;
     this.vehicles.clear();
     this.gameOver = false;
@@ -553,6 +588,7 @@ export class Game {
     this.trafficLightRenderer.init(mapData.nodes, mapData.edges);
     this.rebuildTurnConnectorPaths();
     this.redrawTurnConnectors();
+    this.editorOverlay.redrawHandles(mapData);
   }
 
   private applyScenario(scenario: ScenarioData): void {
@@ -1100,6 +1136,16 @@ export class Game {
   private rebuildTurnConnectorPaths(): void {
     this.turnConnectorPaths = [];
     if (!this.mapData) return;
+    const backendTurnConnectors = this.mapData.turnConnectors ?? [];
+    if (backendTurnConnectors.length > 0) {
+      this.turnConnectorPaths = backendTurnConnectors.map((tc) => ({
+        points: tc.bezierLut,
+        p1: tc.bezierLut[0] ?? [0, 0],
+        ctrl: tc.bezierLut[Math.floor(tc.bezierLut.length / 2)] ?? [0, 0],
+        p2: tc.bezierLut[tc.bezierLut.length - 1] ?? [0, 0],
+      }));
+      return;
+    }
 
     const nodeById = new Map(this.mapData.nodes.map((n) => [n.id, n]));
     const incomingByNode = new Map<number, typeof this.mapData.edges>();
@@ -1309,6 +1355,239 @@ export class Game {
     gfx.circle(p.x, p.y, radiusPx);
     gfx.fill({ color, alpha: 0.95 });
     gfx.stroke({ color: 0x0b1020, alpha: 0.95, width: 2 });
+  }
+
+  private bindEditorPointerHandlers(): void {
+    const canvas = this.overlay.app.canvas as HTMLCanvasElement;
+    canvas.style.pointerEvents = 'auto';
+    canvas.addEventListener('pointerdown', (e) => {
+      if (!this.editorMode || !this.mapData) return;
+      const nodeId = this.findNearestNodeId(e.clientX, e.clientY, 12);
+      if (this.editorTool === 'move_node' && nodeId !== null) {
+        this.dragNodeId = nodeId;
+      } else if (this.editorTool === 'add_road' && nodeId !== null) {
+        this.connectFromNodeId = nodeId;
+      }
+    });
+    canvas.addEventListener('pointermove', (e) => {
+      if (!this.editorMode || !this.mapData || this.dragNodeId === null) return;
+      const lngLat = this.map.unproject([e.clientX, e.clientY]);
+      const node = this.mapData.nodes.find((n) => n.id === this.dragNodeId);
+      if (!node) return;
+      const guide = this.findAlignmentGuide(node.id, lngLat.lng, lngLat.lat);
+      const targetLng = guide.lng ?? lngLat.lng;
+      const targetLat = guide.lat ?? lngLat.lat;
+      const gpx = guide.lng !== null ? this.map.project([guide.lng, targetLat]).x : null;
+      const gpy = guide.lat !== null ? this.map.project([targetLng, guide.lat]).y : null;
+      this.editorOverlay.drawAlignmentGuide(gpx, gpy);
+      const now = performance.now();
+      if (now - this.dragLastSentAt > 24) {
+        this.dragLastSentAt = now;
+        editorMoveNode(this.dragNodeId, targetLat, targetLng, false)
+          .then((m) => this.applyCustomMapData(m))
+          .catch(console.error);
+      }
+    });
+    canvas.addEventListener('pointerup', (e) => {
+      if (!this.editorMode || !this.mapData) return;
+      if (this.dragNodeId !== null) {
+        const lngLat = this.map.unproject([e.clientX, e.clientY]);
+        const nodeId = this.dragNodeId;
+        this.dragNodeId = null;
+        this.editorOverlay.clearGuides();
+        editorMoveNode(nodeId, lngLat.lat, lngLat.lng, true)
+          .then((m) => this.applyCustomMapData(m))
+          .catch(console.error);
+        return;
+      }
+      if (this.editorTool === 'add_road' && this.connectFromNodeId !== null) {
+        const fromNodeId = this.connectFromNodeId;
+        this.connectFromNodeId = null;
+        const targetNode = this.findNearestNodeId(e.clientX, e.clientY, 12);
+        if (targetNode !== null && targetNode !== fromNodeId) {
+          editorConnect(fromNodeId, targetNode).then((m) => this.applyCustomMapData(m)).catch(console.error);
+        } else {
+          const ll = this.map.unproject([e.clientX, e.clientY]);
+          editorExtrude(fromNodeId, this.nextCustomNodeId++, ll.lat, ll.lng)
+            .then((m) => this.applyCustomMapData(m))
+            .catch(console.error);
+        }
+      }
+    });
+  }
+
+  private bindEditorKeyboardHandlers(): void {
+    window.addEventListener('keydown', (e) => {
+      if (!this.editorMode) return;
+      if ((e.key === 'Delete' || e.key === 'Backspace') && this.mapData && this.selectedEdgeIndex !== null) {
+        const edge = this.mapData.edges[this.selectedEdgeIndex];
+        if (!edge) return;
+        editorDeleteEdge(edge.from, edge.to).then((m) => this.applyCustomMapData(m)).catch(console.error);
+      } else if (e.key.toLowerCase() === 's') {
+        void saveMapOverrides();
+      } else if (e.ctrlKey && e.key.toLowerCase() === 'z') {
+        void editorUndo().then((m) => this.applyCustomMapData(m));
+      } else if (e.ctrlKey && e.key.toLowerCase() === 'y') {
+        void editorRedo().then((m) => this.applyCustomMapData(m));
+      }
+    });
+  }
+
+  private handleEditorClick(x: number, y: number): boolean {
+    if (!this.mapData) return false;
+    const idx = this.findNearestEdgeIndex(x, y, 8);
+    this.selectedEdgeIndex = idx;
+    this.editorOverlay.drawSelectedEdge(this.mapData, idx);
+    if (idx !== null) {
+      const edge = this.mapData.edges[idx];
+      this.updateEdgeEditorPanel(edge);
+      if (this.editorTool === 'delete') {
+        void editorDeleteEdge(edge.from, edge.to).then((m) => this.applyCustomMapData(m));
+        return true;
+      }
+      this.uiRenderer.showNotification(`Edge lanes=${edge.lanes} dir=${edge.oneway ? 'oneway' : 'both'}`, 'info');
+      return true;
+    }
+    this.updateEdgeEditorPanel(null);
+    return false;
+  }
+
+  private initEdgeEditorPanel(): void {
+    const panel = document.createElement('div');
+    panel.className = 'edge-editor-panel';
+    panel.innerHTML = `
+      <div class="edge-editor-title">Edge Selection</div>
+      <div class="edge-editor-content">No edge selected</div>
+      <div class="edge-editor-form hidden">
+        <label>Lanes <input id="edge-lanes" type="number" min="1" max="8" value="2" /></label>
+        <label>Direction
+          <select id="edge-direction">
+            <option value="both">both</option>
+            <option value="oneway">oneway</option>
+          </select>
+        </label>
+        <label>Lane directions (csv)
+          <input id="edge-lane-directions" type="text" value="left,straight" />
+        </label>
+        <button id="edge-apply-btn">Apply tags</button>
+      </div>
+    `;
+    document.body.appendChild(panel);
+    this.edgeEditorPanel = panel;
+    panel.querySelector('#edge-apply-btn')?.addEventListener('click', () => {
+      if (!this.mapData || this.selectedEdgeIndex === null) return;
+      const edge = this.mapData.edges[this.selectedEdgeIndex];
+      if (!edge) return;
+      const lanes = Number((panel.querySelector('#edge-lanes') as HTMLInputElement).value || '2');
+      const dir = (panel.querySelector('#edge-direction') as HTMLSelectElement).value;
+      const laneDirections = (panel.querySelector('#edge-lane-directions') as HTMLInputElement)
+        .value
+        .split(',')
+        .map((s) => s.trim().toLowerCase())
+        .filter(Boolean);
+      editorUpdateEdgeTags(edge.from, edge.to, lanes, dir === 'oneway', laneDirections)
+        .then((m) => this.applyCustomMapData(m))
+        .catch(console.error);
+    });
+  }
+
+  private updateEdgeEditorPanel(edge: MapData['edges'][number] | null): void {
+    if (!this.edgeEditorPanel) return;
+    const content = this.edgeEditorPanel.querySelector('.edge-editor-content');
+    if (!content) return;
+    if (!edge) {
+      content.innerHTML = 'No edge selected';
+      this.edgeEditorPanel.querySelector('.edge-editor-form')?.classList.add('hidden');
+      return;
+    }
+    this.edgeEditorPanel.querySelector('.edge-editor-form')?.classList.remove('hidden');
+    (this.edgeEditorPanel.querySelector('#edge-lanes') as HTMLInputElement).value = String(edge.lanes);
+    (this.edgeEditorPanel.querySelector('#edge-direction') as HTMLSelectElement).value = edge.oneway ? 'oneway' : 'both';
+    (this.edgeEditorPanel.querySelector('#edge-lane-directions') as HTMLInputElement).value = edge.laneDirections.join(',');
+    content.innerHTML = `
+      <div>Lanes: ${edge.lanes}</div>
+      <div>Direction: ${edge.oneway ? 'oneway' : 'both'}</div>
+      <div>Road type: ${edge.roadType}</div>
+      <div>Max speed: ${(edge.maxSpeed * 3.6).toFixed(0)} km/h</div>
+    `;
+  }
+
+  private initToolSwitchPanel(): void {
+    const panel = document.createElement('div');
+    panel.className = 'tool-switch-panel';
+    panel.innerHTML = `
+      <button data-tool="move_node">Move</button>
+      <button data-tool="add_road">Add</button>
+      <button data-tool="delete">Delete</button>
+      <button data-tool="select">Select</button>
+    `;
+    document.body.appendChild(panel);
+    this.toolSwitchPanel = panel;
+    const buttons = [...panel.querySelectorAll('button')];
+    const refresh = (): void => {
+      buttons.forEach((btn) => {
+        btn.classList.toggle('active', btn.getAttribute('data-tool') === this.editorTool);
+      });
+    };
+    buttons.forEach((btn) => {
+      btn.addEventListener('click', () => {
+        this.editorTool = btn.getAttribute('data-tool') as typeof this.editorTool;
+        void setEditorTool(this.editorTool);
+        refresh();
+      });
+    });
+    refresh();
+  }
+
+  private findNearestNodeId(x: number, y: number, maxDistPx: number): number | null {
+    if (!this.mapData) return null;
+    let best: number | null = null;
+    let bestDist = Number.POSITIVE_INFINITY;
+    for (const node of this.mapData.nodes) {
+      const p = this.map.project([node.lng, node.lat]);
+      const d = Math.hypot(p.x - x, p.y - y);
+      if (d < bestDist && d <= maxDistPx) {
+        bestDist = d;
+        best = node.id;
+      }
+    }
+    return best;
+  }
+
+  private findNearestEdgeIndex(x: number, y: number, maxDistPx: number): number | null {
+    if (!this.mapData) return null;
+    let best: number | null = null;
+    let bestDist = Number.POSITIVE_INFINITY;
+    this.mapData.edges.forEach((e, idx) => {
+      const a = this.mapData!.nodes.find((n) => n.id === e.from);
+      const b = this.mapData!.nodes.find((n) => n.id === e.to);
+      if (!a || !b) return;
+      const p1 = this.map.project([a.lng, a.lat]);
+      const p2 = this.map.project([b.lng, b.lat]);
+      const t = Math.max(0, Math.min(1, ((x - p1.x) * (p2.x - p1.x) + (y - p1.y) * (p2.y - p1.y)) / ((p2.x - p1.x) ** 2 + (p2.y - p1.y) ** 2 + 1e-9)));
+      const px = p1.x + (p2.x - p1.x) * t;
+      const py = p1.y + (p2.y - p1.y) * t;
+      const d = Math.hypot(px - x, py - y);
+      if (d < bestDist && d <= maxDistPx) {
+        bestDist = d;
+        best = idx;
+      }
+    });
+    return best;
+  }
+
+  private findAlignmentGuide(movingId: number, targetLng: number, targetLat: number): { lng: number | null; lat: number | null } {
+    if (!this.mapData) return { lng: null, lat: null };
+    let bestLng: number | null = null;
+    let bestLat: number | null = null;
+    for (const n of this.mapData.nodes) {
+      if (n.id === movingId) continue;
+      const pxA = this.map.project([n.lng, targetLat]);
+      const pxB = this.map.project([targetLng, n.lat]);
+      if (Math.abs(pxA.x - this.map.project([targetLng, targetLat]).x) < 8) bestLng = n.lng;
+      if (Math.abs(pxB.y - this.map.project([targetLng, targetLat]).y) < 8) bestLat = n.lat;
+    }
+    return { lng: bestLng, lat: bestLat };
   }
 
   // ─── Main game loop ────────────────────────────────────────────────────────

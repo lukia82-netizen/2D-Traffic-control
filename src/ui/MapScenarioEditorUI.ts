@@ -19,6 +19,7 @@ const EMPTY_MAP: MapData = {
   buildings: [],
   restrictions: [],
   tramStops: [],
+  turnConnectors: [],
   lanes: [],
   conflictAreas: [],
 };
@@ -148,6 +149,7 @@ export class MapScenarioEditorUI {
         buildings: parsed.buildings ?? [],
         restrictions: parsed.restrictions ?? [],
         tramStops: parsed.tramStops ?? [],
+        turnConnectors: parsed.turnConnectors ?? [],
         lanes: parsed.lanes ?? [],
         conflictAreas: parsed.conflictAreas ?? [],
       };

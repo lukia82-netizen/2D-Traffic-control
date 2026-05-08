@@ -1,11 +1,14 @@
 use std::sync::{Arc, Mutex};
 use parking_lot::RwLock;
 use crate::map::road_network::MapData;
+use crate::map::world_editor::{EditorHistory, EditorTool};
 use crate::simulation::speed_config::SpeedConfig;
 
 pub struct AppState {
     pub road_graph: Arc<RwLock<Option<MapData>>>,
     pub sim_control: Arc<Mutex<Option<SimControl>>>,
+    pub editor_tool: Arc<RwLock<EditorTool>>,
+    pub editor_history: Arc<RwLock<EditorHistory>>,
 }
 
 impl AppState {
@@ -13,6 +16,8 @@ impl AppState {
         Self {
             road_graph:  Arc::new(RwLock::new(None)),
             sim_control: Arc::new(Mutex::new(None)),
+            editor_tool: Arc::new(RwLock::new(EditorTool::None)),
+            editor_history: Arc::new(RwLock::new(EditorHistory::default())),
         }
     }
 }

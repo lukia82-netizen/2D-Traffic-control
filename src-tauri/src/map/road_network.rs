@@ -93,6 +93,15 @@ pub struct TurnRestriction {
     pub kind: RestrictionKind,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TurnConnector {
+    pub from_node_id: u64,
+    pub via_node_id: u64,
+    pub to_node_id: u64,
+    /// LUT samples of a quadratic Bezier in [lng, lat].
+    pub bezier_lut: Vec<[f64; 2]>,
+}
+
 pub type RoadGraph = DiGraph<RoadNode, RoadEdge>;
 
 pub type LaneId = u64;
@@ -145,6 +154,7 @@ pub struct MapData {
     pub is_sandbox: bool,
     /// Single-intersection sandbox (+ cross): 2-phase manual TL (N–S / E–W, no lefts) at init.
     pub sandbox_simple_cross_tl: bool,
+    pub turn_connectors: Vec<TurnConnector>,
     /// Full lane graph used by lane-based movement and conflict reservation.
     pub lanes: HashMap<LaneId, Lane>,
     pub conflict_areas: HashMap<ConflictAreaId, ConflictArea>,
@@ -307,6 +317,7 @@ pub fn build_demo_road_network(grid_type: &str, bbox: [f64; 4]) -> MapData {
         tram_data,
         is_sandbox: true,
         sandbox_simple_cross_tl: false,
+        turn_connectors: Vec::new(),
         lanes: HashMap::new(),
         conflict_areas: HashMap::new(),
     };
@@ -397,6 +408,7 @@ pub fn build_single_road_network(bbox: [f64; 4]) -> MapData {
         tram_data,
         is_sandbox: true,
         sandbox_simple_cross_tl: false,
+        turn_connectors: Vec::new(),
         lanes: HashMap::new(),
         conflict_areas: HashMap::new(),
     };
@@ -514,6 +526,7 @@ pub fn build_single_intersection_network(bbox: [f64; 4]) -> MapData {
         tram_data,
         is_sandbox: true,
         sandbox_simple_cross_tl: true,
+        turn_connectors: Vec::new(),
         lanes: HashMap::new(),
         conflict_areas: HashMap::new(),
     };
@@ -685,6 +698,7 @@ pub fn build_road_network(osm_data: OsmData) -> MapData {
         tram_data,
         is_sandbox: false,
         sandbox_simple_cross_tl: false,
+        turn_connectors: Vec::new(),
         lanes: HashMap::new(),
         conflict_areas: HashMap::new(),
     };
@@ -964,7 +978,7 @@ fn find_boundary_nodes(graph: &RoadGraph, bbox: &[f64; 4]) -> Vec<NodeIndex> {
     }
 }
 
-fn populate_lane_graph(map: &mut MapData) {
+pub fn populate_lane_graph(map: &mut MapData) {
     const LANE_WIDTH_M: f32 = 3.2;
     let mut lanes: HashMap<LaneId, Lane> = HashMap::new();
     let mut by_edge_lane: HashMap<(usize, u8), LaneId> = HashMap::new();
