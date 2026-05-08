@@ -6,12 +6,13 @@ use petgraph::graph::NodeIndex;
 
 use crate::map::road_network::MapData;
 use crate::simulation::od_model::{OdModel, TripKind};
-use crate::simulation::pathfinding::{find_path, random_destination, REF_SPEED_MS};
+use crate::simulation::pathfinding::{find_path, REF_SPEED_MS};
 use crate::simulation::speed_config::SpeedConfig;
 use crate::simulation::lane_change::compute_vehicle_target_lane;
 use crate::vehicles::vehicle::Vehicle;
 use crate::vehicles::types::VehicleType;
 use crate::vehicles::driver::DriverProfile;
+use crate::map::road_network::LaneId;
 
 /// Default hard cap on total non-tram vehicles in the simulation.
 /// A conservative start value; the frontend sends SetMaxVehicles to override.
@@ -153,6 +154,11 @@ impl SpawnSystem {
         vehicle.current_lane = initial_target;
         vehicle.current_lateral_offset = initial_target as f32;
         vehicle.target_lateral_offset  = initial_target as f32;
+        let lane_route = build_lane_route_from_edge_route(map, &vehicle.route, initial_target);
+        vehicle.current_lane_id = lane_route.first().copied();
+        vehicle.lane_route = lane_route;
+        vehicle.lane_route_pos = 0;
+        vehicle.lane_progress_m = 0.0;
 
         // Give new vehicles a tiny initial speed so they are not all stuck
         // at edge_progress=0.0 simultaneously.  This ensures a non-zero gap
@@ -247,6 +253,11 @@ impl SpawnSystem {
         vehicle.current_lane = initial_target;
         vehicle.current_lateral_offset = initial_target as f32;
         vehicle.target_lateral_offset  = initial_target as f32;
+        let lane_route = build_lane_route_from_edge_route(map, &vehicle.route, initial_target);
+        vehicle.current_lane_id = lane_route.first().copied();
+        vehicle.lane_route = lane_route;
+        vehicle.lane_route_pos = 0;
+        vehicle.lane_progress_m = 0.0;
         vehicle.speed = 2.0; // slow start — prevents all spawned cars sharing edge_progress=0
 
         Some(vehicle)
@@ -295,22 +306,27 @@ impl SpawnSystem {
                     .and_then(|b| b.access_node)
                     .unwrap_or(boundary_idx)
             } else {
-                let n = self.spawn_points.len();
+                let n = self.boundary_nodes.len();
                 if n == 0 { return None; }
-                self.spawn_points[self.rng.gen_range(0..n)]
+                self.boundary_nodes[self.rng.gen_range(0..n)]
             };
             Some((origin, boundary_idx, TripKind::ExternalOutbound))
         }
     }
 
     fn random_od(&mut self, map: &MapData) -> Option<(NodeIndex, NodeIndex, TripKind)> {
-        if self.spawn_points.is_empty() {
+        if self.boundary_nodes.len() < 2 {
             return None;
         }
-        let n = self.spawn_points.len();
-        let from = self.spawn_points[self.rng.gen_range(0..n)];
-        let to   = random_destination(&map.graph, from, &mut self.rng);
-        if from == to { return None; }
+        let n = self.boundary_nodes.len();
+        let fi = self.rng.gen_range(0..n);
+        let mut ti = self.rng.gen_range(0..n);
+        if ti == fi { ti = (ti + 1) % n; }
+        let from = self.boundary_nodes[fi];
+        let to = self.boundary_nodes[ti];
+        if map.graph.node_weight(from).is_none() || map.graph.node_weight(to).is_none() {
+            return None;
+        }
         Some((from, to, TripKind::LocalOD))
     }
 
@@ -334,6 +350,43 @@ impl SpawnSystem {
         else if roll < 0.95 { DriverProfile::Pirat    }
         else                { DriverProfile::Cautious }
     }
+}
+
+fn build_lane_route_from_edge_route(map: &MapData, route: &[petgraph::graph::EdgeIndex], lane_idx: u8) -> Vec<LaneId> {
+    let mut out = Vec::new();
+    for edge in route {
+        let mut candidates: Vec<&crate::map::road_network::Lane> = map
+            .lanes
+            .values()
+            .filter(|l| l.edge_id == edge.index() as u64 && l.lane_index == lane_idx)
+            .collect();
+        if candidates.is_empty() {
+            candidates = map
+                .lanes
+                .values()
+                .filter(|l| l.edge_id == edge.index() as u64)
+                .collect();
+        }
+        if let Some(chosen) = candidates.into_iter().min_by_key(|l| l.lane_index) {
+            if let Some(prev) = out.last().copied() {
+                // If a connector exists from previous lane to this lane, include it.
+                if let Some(conn) = map
+                    .lanes
+                    .get(&prev)
+                    .and_then(|l| l.connections.iter().copied().find(|c| {
+                        map.lanes
+                            .get(c)
+                            .map(|cl| cl.connections.contains(&chosen.id))
+                            .unwrap_or(false)
+                    }))
+                {
+                    out.push(conn);
+                }
+            }
+            out.push(chosen.id);
+        }
+    }
+    out
 }
 
 // ── Sampling helpers ─────────────────────────────────────────────────────────

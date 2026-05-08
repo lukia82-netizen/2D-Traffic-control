@@ -23,6 +23,11 @@ export class UIRenderer {
   private readonly idmDebugLine2: HTMLElement;
   private readonly idmDebugLine3: HTMLElement;
   private readonly idmDebugLine4: HTMLElement;
+  private readonly telemetrySpeed: HTMLElement;
+  private readonly telemetryDesired: HTMLElement;
+  private readonly telemetryAccel: HTMLElement;
+  private readonly telemetryDistance: HTMLElement;
+  private readonly telemetryHint: HTMLElement;
 
   // Game-over overlay elements
   private readonly gameOverOverlay: HTMLElement;
@@ -44,6 +49,12 @@ export class UIRenderer {
     this.idmDebugLine2 = this.require('idm-debug-line2');
     this.idmDebugLine3 = this.require('idm-debug-line3');
     this.idmDebugLine4 = this.require('idm-debug-line4');
+
+    this.telemetrySpeed = this.require('telemetry-speed');
+    this.telemetryDesired = this.require('telemetry-desired');
+    this.telemetryAccel = this.require('telemetry-accel');
+    this.telemetryDistance = this.require('telemetry-distance');
+    this.telemetryHint = this.require('vehicle-telemetry-hint');
 
     this.gameOverOverlay = this.require('game-over-overlay');
     this.gameOverReason = this.require('game-over-reason');
@@ -100,19 +111,54 @@ export class UIRenderer {
     speed: number;
     gap: number;
     deltaV: number;
+    desiredSpeed: number;
+    acceleration: number;
+    distanceToLeader: number;
+    leaderVehicleId: number | null;
+    conflictReserverId: number | null;
     distToStopLine: number;
     redBlocking: boolean;
     onCurve: boolean;
     turnT: number;
+    shapeLengthM: number;
+    shapeWidthM: number;
+    shapeRadiusM: number;
+    threatKind: string;
+    threatPoint: [number, number] | null;
+    threatLineStyle: string;
   }): void {
     this.idmDebugLine.textContent = `vehicle: ${data.vehicleId}`;
     this.idmDebugLine2.textContent =
-      `v: ${data.speed.toFixed(1)} m/s | gap: ${data.gap.toFixed(1)} m`;
+      `v: ${data.speed.toFixed(1)} m/s | gap: ${data.gap.toFixed(1)} m | v₀: ${data.desiredSpeed.toFixed(1)}`;
     this.idmDebugLine3.textContent =
-      `dv: ${data.deltaV.toFixed(1)} m/s | stop: ${data.distToStopLine.toFixed(1)} m`;
+      `accel: ${data.acceleration.toFixed(2)} m/s² | dv: ${data.deltaV.toFixed(1)} | stop: ${data.distToStopLine.toFixed(1)} m`;
+    const telem = `dist leader: ${data.distanceToLeader.toFixed(1)} m | style: ${data.threatLineStyle}`;
     this.idmDebugLine4.textContent =
-      `red: ${data.redBlocking ? 'YES' : 'NO'} | curve: ${data.onCurve ? 'YES' : 'NO'} | t: ${data.turnT.toFixed(3)}`;
+      `red: ${data.redBlocking ? 'YES' : 'NO'} | curve: ${data.onCurve ? 'YES' : 'NO'} | t: ${data.turnT.toFixed(3)} | L/W/R: ${data.shapeLengthM.toFixed(1)}/${data.shapeWidthM.toFixed(1)}/${data.shapeRadiusM.toFixed(1)} m | threat: ${data.threatKind}${data.leaderVehicleId != null ? ` | L#${data.leaderVehicleId}` : ''}${data.conflictReserverId != null ? ` | CP:${data.conflictReserverId}` : ''} | ${telem}`;
     this.idmDebugLine4.style.color = data.redBlocking ? '#ff6b6b' : (data.onCurve ? '#67e8f9' : '#7fffb0');
+  }
+
+  updateVehicleTelemetrySelected(data: {
+    vehicleId: number | null;
+    speed: number;
+    desiredSpeed: number;
+    acceleration: number;
+    distanceToLeader: number;
+  }): void {
+    if (data.vehicleId === null) {
+      this.telemetryHint.textContent = 'Klik pojazd — dane na żywo';
+      this.telemetrySpeed.textContent = 'Current Speed: -- m/s';
+      this.telemetryDesired.textContent = 'Desired Speed: -- m/s';
+      this.telemetryAccel.textContent = 'Acceleration: -- m/s²';
+      this.telemetryDistance.textContent = 'Distance to Leader: -- m';
+      return;
+    }
+    this.telemetryHint.textContent = `Pojazd #${data.vehicleId}`;
+    this.telemetrySpeed.textContent = `Current Speed: ${data.speed.toFixed(2)} m/s`;
+    this.telemetryDesired.textContent = `Desired Speed: ${data.desiredSpeed.toFixed(2)} m/s`;
+    this.telemetryAccel.textContent = `Acceleration: ${data.acceleration.toFixed(2)} m/s²`;
+    this.telemetryDistance.textContent =
+      `Distance to Leader: ${data.distanceToLeader.toFixed(2)} m (along path / IDM gap)`;
   }
 
   /**

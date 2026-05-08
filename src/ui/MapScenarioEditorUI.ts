@@ -19,6 +19,8 @@ const EMPTY_MAP: MapData = {
   buildings: [],
   restrictions: [],
   tramStops: [],
+  lanes: [],
+  conflictAreas: [],
 };
 
 const EDITOR_COLLAPSED_KEY = 'traffic-control-editor-collapsed';
@@ -134,11 +136,21 @@ export class MapScenarioEditorUI {
 
   private readMapFromTextarea(): MapData | null {
     try {
-      const parsed = JSON.parse(this.mapJson.value) as MapData;
+      const parsed = JSON.parse(this.mapJson.value) as Partial<MapData>;
       if (!Array.isArray(parsed.nodes) || !Array.isArray(parsed.edges) || !Array.isArray(parsed.spawnPoints)) {
         throw new Error('Map JSON requires nodes, edges, and spawnPoints arrays');
       }
-      return parsed;
+      return {
+        nodes: parsed.nodes,
+        edges: parsed.edges,
+        spawnPoints: parsed.spawnPoints,
+        bbox: parsed.bbox ?? EMPTY_MAP.bbox,
+        buildings: parsed.buildings ?? [],
+        restrictions: parsed.restrictions ?? [],
+        tramStops: parsed.tramStops ?? [],
+        lanes: parsed.lanes ?? [],
+        conflictAreas: parsed.conflictAreas ?? [],
+      };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       alert(`Niepoprawny JSON mapy: ${message}`);

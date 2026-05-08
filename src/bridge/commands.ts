@@ -73,6 +73,23 @@ export interface TramEdge {
   trackType: string;
 }
 
+export interface LaneData {
+  id: number;
+  width: number;
+  connections: number[];
+  conflictAreas: number[];
+  points: [number, number][];
+  lengthM: number;
+}
+
+export interface ConflictAreaData {
+  id: number;
+  centerLat: number;
+  centerLng: number;
+  radiusM: number;
+  laneIds: number[];
+}
+
 export interface MapData {
   nodes: NodeData[];
   edges: EdgeData[];
@@ -81,6 +98,8 @@ export interface MapData {
   buildings: BuildingData[];
   restrictions: TurnRestriction[];
   tramStops: TramStop[];
+  lanes: LaneData[];
+  conflictAreas: ConflictAreaData[];
 }
 
 // ─── Typed invoke wrappers ────────────────────────────────────────────────────
@@ -143,6 +162,11 @@ export async function setMaxVehicles(count: number): Promise<void> {
 /** Select a vehicle for backend debug tracking (`null` clears selection). */
 export async function setDebugVehicle(vehicleId: number | null): Promise<void> {
   return invoke<void>('set_debug_vehicle', { vehicleId });
+}
+
+/** Enable Cities-Skylines-style intersection debug (Rust emits `debug_visualization` events). */
+export async function setDebugVisualization(enabled: boolean): Promise<void> {
+  return invoke<void>('set_debug_visualization', { enabled });
 }
 
 /**
