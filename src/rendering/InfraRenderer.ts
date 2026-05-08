@@ -16,6 +16,20 @@ const BRIDGE_SHADOW_ALPHA = 0.35;
 const LANE_ARROW_MIN_ZOOM = 15;
 /** Fraction of edge length at which lane arrows are placed (near intersection end). */
 const LANE_ARROW_T = 0.75;
+const ROAD_SIGN_OFFSET_PX = 14;
+const ROAD_SIGN_MIN_ZOOM = 14;
+
+const STOP_SIGN_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+<polygon points="24,2 40,2 52,14 52,50 40,62 24,62 12,50 12,14" fill="#c42026" stroke="white" stroke-width="4"/>
+<text x="32" y="38" text-anchor="middle" font-family="Arial,sans-serif" font-size="16" font-weight="700" fill="white">STOP</text>
+</svg>`;
+
+const LIGHT_SIGN_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+<rect x="18" y="4" width="28" height="56" rx="8" fill="#111827" stroke="white" stroke-width="3"/>
+<circle cx="32" cy="17" r="7" fill="#ef4444"/>
+<circle cx="32" cy="32" r="7" fill="#facc15"/>
+<circle cx="32" cy="47" r="7" fill="#22c55e"/>
+</svg>`;
 
 // ─── InfraRenderer ───────────────────────────────────────────────────────────
 
@@ -43,6 +57,8 @@ export class InfraRenderer {
   private nodeMap: Map<number, NodeData> = new Map();
   /** Node intersection-type lookup for quick non-plain detection. */
   private intersectionNodeIds: Set<number> = new Set();
+  private stopSignTexture: PIXI.Texture | null = null;
+  private lightSignTexture: PIXI.Texture | null = null;
 
   constructor(overlay: PixiOverlay, map: maplibregl.Map, camera: CameraManager) {
     this.overlay = overlay;
@@ -66,6 +82,7 @@ export class InfraRenderer {
     this.rebuildTunnelOverlay(mapData);
     this.rebuildArrows(mapData);
     this.rebuildLaneArrows(mapData);
+    this.rebuildRoadSigns(mapData);
   }
 
   /** Must be called on map `render` so all markings follow camera pan / zoom. */
@@ -74,6 +91,7 @@ export class InfraRenderer {
     this.rebuildTunnelOverlay(mapData);
     this.rebuildArrows(mapData);
     this.rebuildLaneArrows(mapData);
+    this.rebuildRoadSigns(mapData);
   }
 
   /**
@@ -395,6 +413,50 @@ export class InfraRenderer {
     return gfx;
   }
 
+  // ─── SVG road signs ────────────────────────────────────────────────────────
+  private rebuildRoadSigns(mapData: MapData): void {
+    this.overlay.roadSigns.removeChildren();
+    if (this.map.getZoom() < ROAD_SIGN_MIN_ZOOM) return;
+    this.ensureSignTextures();
+
+    for (const edge of mapData.edges) {
+      const target = this.nodeMap.get(edge.to);
+      const from = this.nodeMap.get(edge.from);
+      if (!target || !from) continue;
+
+      let texture: PIXI.Texture | null = null;
+      if (target.intersectionType === 'stop') texture = this.stopSignTexture;
+      else if (target.intersectionType === 'traffic_light') texture = this.lightSignTexture;
+      if (!texture) continue;
+
+      const fromPx = projectPoint(this.map, from.lng, from.lat);
+      const toPx = projectPoint(this.map, target.lng, target.lat);
+      const dx = toPx.x - fromPx.x;
+      const dy = toPx.y - fromPx.y;
+      const len = Math.hypot(dx, dy);
+      if (len < 10) continue;
+
+      const perpX = -dy / len;
+      const perpY = dx / len;
+      const sx = toPx.x + perpX * ROAD_SIGN_OFFSET_PX;
+      const sy = toPx.y + perpY * ROAD_SIGN_OFFSET_PX;
+
+      const sprite = new PIXI.Sprite(texture);
+      sprite.anchor.set(0.5, 1);
+      sprite.x = sx;
+      sprite.y = sy;
+      sprite.width = 18;
+      sprite.height = 18;
+      this.overlay.roadSigns.addChild(sprite);
+    }
+  }
+
+  private ensureSignTextures(): void {
+    if (this.stopSignTexture && this.lightSignTexture) return;
+    this.stopSignTexture = PIXI.Texture.from(`data:image/svg+xml;utf8,${encodeURIComponent(STOP_SIGN_SVG)}`);
+    this.lightSignTexture = PIXI.Texture.from(`data:image/svg+xml;utf8,${encodeURIComponent(LIGHT_SIGN_SVG)}`);
+  }
+
   destroy(): void {
     this.staticSprite?.destroy();
     this.staticTexture?.destroy(true);
@@ -402,5 +464,9 @@ export class InfraRenderer {
     this.tunnelTexture?.destroy(true);
     this.nodeMap.clear();
     this.intersectionNodeIds.clear();
+    this.stopSignTexture?.destroy(true);
+    this.lightSignTexture?.destroy(true);
+    this.stopSignTexture = null;
+    this.lightSignTexture = null;
   }
 }
