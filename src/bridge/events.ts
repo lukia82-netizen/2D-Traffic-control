@@ -145,11 +145,46 @@ export interface IdmDebugPayload {
   speed: number;
   gap: number;
   deltaV: number;
+  desiredSpeed: number;
+  acceleration: number;
+  distanceToLeader: number;
+  leaderVehicleId: number | null;
+  conflictReserverId: number | null;
   distToStopLine: number;
   redBlocking: boolean;
   onCurve: boolean;
   turnT: number;
+  shapeLengthM: number;
+  shapeWidthM: number;
+  shapeRadiusM: number;
+  threatKind: string;
+  threatLineStyle: string;
+  threatPoint: [number, number] | null;
+  hoodLngLat: [number, number];
+  rearBumperLngLat: [number, number];
   routePoints: [number, number][];
+}
+
+export interface DebugConflictPoint {
+  lng: number;
+  lat: number;
+  reservedBy: number | null;
+}
+
+export interface DebugVehicleThreat {
+  vehicleId: number;
+  hoodLngLat: [number, number];
+  rearBumperLngLat: [number, number];
+  threatLngLat: [number, number] | null;
+  lineStyle: string;
+  threatKind: string;
+  leaderVehicleId: number | null;
+  conflictReserverId: number | null;
+}
+
+export interface DebugVisualizationPayload {
+  conflictPoints: DebugConflictPoint[];
+  vehicleThreats: DebugVehicleThreat[];
 }
 
 /**
@@ -173,6 +208,18 @@ export async function listenIdmDebug(
   cb: (data: IdmDebugPayload) => void,
 ): Promise<() => void> {
   const unlisten = await listen<IdmDebugPayload>('idm_debug', (event) => {
+    cb(event.payload);
+  });
+  return unlisten;
+}
+
+/**
+ * Full-map debug overlay (conflict points + per-vehicle threat rays). ~60 Hz when enabled in sim.
+ */
+export async function listenDebugVisualization(
+  cb: (data: DebugVisualizationPayload) => void,
+): Promise<() => void> {
+  const unlisten = await listen<DebugVisualizationPayload>('debug_visualization', (event) => {
     cb(event.payload);
   });
   return unlisten;

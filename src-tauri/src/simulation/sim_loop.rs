@@ -54,7 +54,9 @@ const TURN_CONNECTOR_TARGET_SPEED_MPS: f32 = 25.0 / 3.6; // 6.94 m/s = 25 km/h o
 const GEO_LAT_M: f64 = 111_320.0;
 const GEO_LNG_M: f64 = 71_700.0;
 const CONFLICT_LOOKAHEAD_M: f32 = 45.0;
+const CONFLICT_PRIORITY_ACTIVATION_M: f32 = 35.0;
 const CONFLICT_RELEASE_BUFFER_M: f32 = 3.0;
+const CONFLICT_SHAPE_BUFFER_M: f32 = 1.0;
 const RIGHT_HAND_CHECK_DIST_M: f32 = 15.0;
 const DEADLOCK_BREAK_S: f32 = 4.0;
 /// Physical lane half-width in metres used to offset Bezier P1/P2 from the
@@ -74,11 +76,53 @@ struct IdmDebugPayload {
     speed: f32,
     gap: f32,
     delta_v: f32,
+    desired_speed: f32,
+    acceleration: f32,
+    /// Arc / IDM braking gap to the dominant obstacle for this timestep.
+    distance_to_leader_m: f32,
+    leader_vehicle_id: Option<u32>,
+    conflict_reserver_id: Option<u32>,
     dist_to_stop_line: f32,
     red_blocking: bool,
     on_curve: bool,
     turn_t: f32,
+    shape_length_m: f32,
+    shape_width_m: f32,
+    shape_radius_m: f32,
+    threat_kind: String,
+    threat_line_style: String,
+    threat_point: Option<[f64; 2]>,
+    hood_lng_lat: [f64; 2],
+    rear_bumper_lng_lat: [f64; 2],
     route_points: Vec<[f64; 2]>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DebugConflictPointPayload {
+    lng: f64,
+    lat: f64,
+    reserved_by: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DebugVehicleThreatPayload {
+    vehicle_id: u32,
+    hood_lng_lat: [f64; 2],
+    rear_bumper_lng_lat: [f64; 2],
+    threat_lng_lat: Option<[f64; 2]>,
+    line_style: String,
+    threat_kind: String,
+    leader_vehicle_id: Option<u32>,
+    conflict_reserver_id: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DebugVisualizationPayload {
+    conflict_points: Vec<DebugConflictPointPayload>,
+    vehicle_threats: Vec<DebugVehicleThreatPayload>,
 }
 
 #[derive(Debug, Clone)]
@@ -107,6 +151,35 @@ enum PriorityState {
     Wait,
     Clear,
     FirstMove,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObstacleKind {
+    Vehicle,
+    ConflictPoint,
+    PriorityStopLine,
+    TrafficSignalStopLine,
+    StopSignStopLine,
+    YieldTarget,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ClosestObstacle {
+    kind: ObstacleKind,
+    gap_m: f32,
+    delta_v: f32,
+    point_lng_lat: Option<[f64; 2]>,
+    /// Same-lane leader (rear bumper coords in `point_lng_lat` when present).
+    leader_vehicle_id: Option<u32>,
+    /// Vehicle id that owns a reserved conflict patch ahead of ego.
+    conflict_reserver_id: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct IdmStepResult {
+    accel: f32,
+    desired_speed: f32,
+    obstacle: ClosestObstacle,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -156,8 +229,10 @@ pub fn run_simulation(
     let mut vehicles: Vec<Vehicle> = Vec::with_capacity(512);
     let mut congestion_timer = 0.0f32;
     let mut high_frustration_timer = 0.0f32;
-    let mut idm_debug_timer = 0.0f32;
+    let mut idm_env_log_timer = 0.0f32;
+    let mut idm_overlay_timer = 0.0f32;
     let mut selected_debug_vehicle: Option<u32> = None;
+    let mut debug_visualization_enabled = false;
 
     // ── Build subsystems from map ────────────────────────────────────────────
     let (mut intersections, mut spawn_system, mut od_model, mut tram_sim, mut conflict_system) = {
@@ -216,6 +291,7 @@ pub fn run_simulation(
                     &mut intersections,
                     &mut spawn_system,
                     &mut selected_debug_vehicle,
+                    &mut debug_visualization_enabled,
                 ),
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -273,7 +349,8 @@ pub fn run_simulation(
             let game_dt_s       = clock.tick(PHYSICS_DT);
             let game_hour       = clock.game_hour();
             let spawn_multiplier = DayCycle::spawn_multiplier(game_hour);
-            idm_debug_timer += PHYSICS_DT;
+            idm_env_log_timer += PHYSICS_DT;
+            idm_overlay_timer += PHYSICS_DT;
 
             // Traffic lights advance by fixed dt
             let light_updates = intersections.update(PHYSICS_DT);
@@ -378,104 +455,103 @@ pub fn run_simulation(
                 }
             }
 
-            // Parallel IDM acceleration computation (read-only, safe to parallelise)
+            // Parallel IDM / closest-obstacle computation (read-only parallel part)
             let tram_snapshot: Vec<(f64, f64, f32)> = tram_sim.trams.iter()
                 .map(|t| (t.lat, t.lng, t.speed))
                 .collect();
 
-            let accel_inputs: Vec<f32> = {
+            let idm_steps: Vec<IdmStepResult> = {
                 let guard = graph_lock.read();
                 if let Some(map) = guard.as_ref() {
                     vehicles
                         .par_iter()
                         .enumerate()
                         .map(|(i, v)| {
-                            // On turn connector: skip all leader/intersection effects.
-                            // The synthetic edge_progress on the connector does not
-                            // represent actual Bezier arc distance, so IDM gap
-                            // calculations would be wrong and cause speed oscillation
-                            // (visible as position flickering on the arc).
-                            if v.on_turn_connector {
-                                let desired = compute_desired_speed(v, map);
-                                let params  = v.driver_profile.params();
-                                let vtype   = v.vehicle_type.params();
-                                return idm_acceleration(
-                                    v.speed, desired, 1000.0, 0.0, &params, &vtype,
-                                );
-                            }
-                            let (gap, delta_v) =
-                                find_leader_arc(i, v, &vehicles, &edge_lane_vehicles, map);
-                            let (gap, delta_v) =
-                                apply_tram_leader_effect(v, gap, delta_v, &tram_snapshot);
-                            let (gap, delta_v) = apply_cross_traffic_leader_effect(
+                            compute_vehicle_idm_step(
                                 i,
                                 v,
                                 &vehicles,
+                                &edge_lane_vehicles,
                                 &vehicles_by_target_node,
+                                &tram_snapshot,
                                 map,
                                 &intersections,
-                                gap,
-                                delta_v,
-                            );
-                            let desired = compute_desired_speed(v, map);
-                            let (gap, delta_v) =
-                                apply_intersection_effect(
-                                    v,
-                                    gap,
-                                    delta_v,
-                                    &intersections,
-                                    &conflict_system,
-                                    &approach_tree,
-                                    &vehicles,
-                                    map,
-                                );
-                            let params = v.driver_profile.params();
-                            let vtype  = v.vehicle_type.params();
-                            idm_acceleration(v.speed, desired, gap, delta_v, &params, &vtype)
+                                &conflict_system,
+                                &approach_tree,
+                            )
                         })
                         .collect()
                 } else {
-                    vec![0.0; vehicles.len()]
+                    vec![]
                 }
             };
+            let accel_inputs: Vec<f32> = if idm_steps.len() == vehicles.len() {
+                idm_steps.iter().map(|s| s.accel).collect()
+            } else {
+                vec![0.0f32; vehicles.len()]
+            };
 
-            if idm_debug_timer >= debug_log_interval_s {
+            if debug_visualization_enabled
+                && !idm_steps.is_empty()
+                && idm_steps.len() == vehicles.len()
+            {
+                let conflict_points = conflict_system.debug_conflict_points_snapshot();
+                let vehicle_threats: Vec<DebugVehicleThreatPayload> = vehicles
+                    .iter()
+                    .zip(idm_steps.iter())
+                    .map(|(v, s)| DebugVehicleThreatPayload {
+                        vehicle_id: v.id,
+                        hood_lng_lat: hood_lng_lat_m(v),
+                        rear_bumper_lng_lat: rear_bumper_lng_lat_vehicle(v),
+                        threat_lng_lat: s.obstacle.point_lng_lat,
+                        line_style: threat_line_style_label(s.obstacle.kind).to_string(),
+                        threat_kind: obstacle_kind_label(s.obstacle.kind).to_string(),
+                        leader_vehicle_id: s.obstacle.leader_vehicle_id,
+                        conflict_reserver_id: s.obstacle.conflict_reserver_id,
+                    })
+                    .collect();
+                let _ = app_handle.emit(
+                    "debug_visualization",
+                    &DebugVisualizationPayload {
+                        conflict_points,
+                        vehicle_threats,
+                    },
+                );
+            }
+
+            if idm_env_log_timer >= debug_log_interval_s {
                 let guard = graph_lock.read();
-                if let Some(map) = guard.as_ref() {
+                if let (Some(_map), true) = (
+                    guard.as_ref(),
+                    idm_steps.len() == vehicles.len() && !vehicles.is_empty(),
+                ) {
                     if let Some((ego_idx, ego)) = vehicles
                         .iter()
                         .enumerate()
                         .find(|(_, v)| v.id == debug_vehicle_id && !v.despawned)
                     {
-                        let (base_gap, base_dv) =
-                            find_leader_arc(ego_idx, ego, &vehicles, &edge_lane_vehicles, map);
-                        let (gap, delta_v) =
-                            apply_tram_leader_effect(ego, base_gap, base_dv, &tram_snapshot);
-                        let desired = compute_desired_speed(ego, map);
-                        let (gap, delta_v) =
-                            apply_intersection_effect(
-                                ego,
-                                gap,
-                                delta_v,
-                                &intersections,
-                                &conflict_system,
-                                &approach_tree,
-                                &vehicles,
-                                map,
-                            );
+                        let desired = idm_steps[ego_idx].desired_speed;
+                        let obstacle = idm_steps[ego_idx].obstacle;
                         let params = ego.driver_profile.params();
                         let vtype = ego.vehicle_type.params();
                         let (s_clamped, s_star, accel_raw, accel_clamped) =
-                            idm_debug_snapshot(ego.speed, desired, gap, delta_v, &params, &vtype);
+                            idm_debug_snapshot(
+                                ego.speed,
+                                desired,
+                                obstacle.gap_m,
+                                obstacle.delta_v,
+                                &params,
+                                &vtype,
+                            );
                         let s_ratio = s_star / s_clamped;
-                        let leader_speed = (ego.speed - delta_v).max(0.0);
+                        let leader_speed = (ego.speed - obstacle.delta_v).max(0.0);
                         log::info!(
                             "IDM_DEBUG id={} v={:.2} v0={:.2} v_leader={:.2} dv={:.2} s={:.2} s*={:.2} s_ratio={:.2} accel_raw={:.2} accel={:.2}",
                             ego.id,
                             ego.speed,
                             desired,
                             leader_speed,
-                            delta_v,
+                            obstacle.delta_v,
                             s_clamped,
                             s_star,
                             s_ratio,
@@ -484,7 +560,7 @@ pub fn run_simulation(
                         );
                     }
                 }
-                idm_debug_timer = 0.0;
+                idm_env_log_timer = 0.0;
             }
 
             // Apply physics — always uses PHYSICS_DT (fixed step)
@@ -584,10 +660,9 @@ pub fn run_simulation(
                 }
             }
 
-            // IDM debug snapshot (~5 Hz): one representative vehicle.
-            idm_debug_timer += PHYSICS_DT;
-            if idm_debug_timer >= 0.2 {
-                idm_debug_timer = 0.0;
+            // IDM debug snapshot (~5 Hz): selected or first car — feed HUD + route overlay.
+            if idm_overlay_timer >= 0.2 {
+                idm_overlay_timer = 0.0;
                 let debug_target = if let Some(sel_id) = selected_debug_vehicle {
                     vehicles
                         .iter()
@@ -599,25 +674,43 @@ pub fn run_simulation(
                         .enumerate()
                         .find(|(_, v)| v.route_pos < v.route.len() && v.vehicle_type as u8 != 4)
                 };
-                if let Some((i, ego)) = debug_target
-                {
+                if let Some((i, ego)) = debug_target {
                     let guard = graph_lock.read();
                     if let Some(map) = guard.as_ref() {
-                        let (gap, delta_v) = find_leader_arc(i, ego, &vehicles, &edge_lane_vehicles, map);
-                        let (dist_to_stop_line, red_blocking) =
-                            stop_line_debug(ego, map, &intersections).unwrap_or((1000.0, false));
-                        let payload = IdmDebugPayload {
-                            vehicle_id: ego.id,
-                            speed: ego.speed,
-                            gap,
-                            delta_v,
-                            dist_to_stop_line,
-                            red_blocking,
-                            on_curve: ego.on_turn_connector,
-                            turn_t: (ego.turn_dist_m / ego.turn_length_m.max(0.001) as f64).clamp(0.0, 1.0) as f32,
-                            route_points: build_route_points(ego, map),
-                        };
-                        let _ = app_handle.emit("idm_debug", payload);
+                        if i < idm_steps.len() {
+                            let step = idm_steps[i];
+                            let obstacle = step.obstacle;
+                            let (dist_to_stop_line, red_blocking) =
+                                stop_line_debug(ego, map, &intersections).unwrap_or((1000.0, false));
+                            let vp = ego.vehicle_type.params();
+                            let accel_i = accel_inputs.get(i).copied().unwrap_or(0.0);
+                            let payload = IdmDebugPayload {
+                                vehicle_id: ego.id,
+                                speed: ego.speed,
+                                gap: obstacle.gap_m,
+                                delta_v: obstacle.delta_v,
+                                desired_speed: step.desired_speed,
+                                acceleration: accel_i,
+                                distance_to_leader_m: obstacle.gap_m,
+                                leader_vehicle_id: obstacle.leader_vehicle_id,
+                                conflict_reserver_id: obstacle.conflict_reserver_id,
+                                dist_to_stop_line,
+                                red_blocking,
+                                on_curve: ego.on_turn_connector,
+                                turn_t: (ego.turn_dist_m / ego.turn_length_m.max(0.001) as f64)
+                                    .clamp(0.0, 1.0) as f32,
+                                shape_length_m: vp.length_m,
+                                shape_width_m: vp.width_m,
+                                shape_radius_m: vehicle_path_radius_m(ego),
+                                threat_kind: obstacle_kind_label(obstacle.kind).to_string(),
+                                threat_line_style: threat_line_style_label(obstacle.kind).to_string(),
+                                threat_point: obstacle.point_lng_lat,
+                                hood_lng_lat: hood_lng_lat_m(ego),
+                                rear_bumper_lng_lat: rear_bumper_lng_lat_vehicle(ego),
+                                route_points: build_route_points(ego, map),
+                            };
+                            let _ = app_handle.emit("idm_debug", payload);
+                        }
                     }
                 }
             }
@@ -697,6 +790,7 @@ fn handle_command(
     intersections: &mut IntersectionManager,
     spawn_system: &mut SpawnSystem,
     selected_debug_vehicle: &mut Option<u32>,
+    debug_visualization_enabled: &mut bool,
 ) {
     match cmd {
         SimCommand::Pause                  => clock.pause(),
@@ -715,6 +809,9 @@ fn handle_command(
         }
         SimCommand::SetDebugVehicle(id) => {
             *selected_debug_vehicle = id;
+        }
+        SimCommand::SetDebugVisualization(on) => {
+            *debug_visualization_enabled = on;
         }
         SimCommand::Stop => {}
     }
@@ -753,79 +850,84 @@ fn build_route_points(vehicle: &Vehicle, map: &MapData) -> Vec<[f64; 2]> {
 
 // ── Physics helpers ────────────────────────────────────────────────────────────
 
-/// Find the leader vehicle using per-edge sorted buckets and arc-length gap.
+/// Find the dominant same-lane / look-ahead leader as an IDM obstacle.
 ///
-/// Returns `(gap_m, delta_v_ms)` — bumper-to-bumper gap in metres and speed
-/// difference (ego − leader) in m/s.  Uses 1000 m / 0.0 when no leader exists.
-///
-/// Gap is measured along the road (arc length), not Euclidean distance, which
-/// prevents phantom collisions on curved segments and at edge boundaries.
-fn find_leader_arc(
+/// Gap is bumper-to-bumper arc length (`MIN_IDM_GAP_M` clamped).
+/// Uses the leader's **rear bumper** as the visualised threat anchor.
+fn find_leader_obstacle_arc(
     ego_idx: usize,
     ego: &Vehicle,
     vehicles: &[Vehicle],
     edge_lane_vehicles: &HashMap<(EdgeIndex, u8), Vec<usize>>,
     map: &MapData,
-) -> (f32, f32) {
+) -> ClosestObstacle {
     if ego.route_pos >= ego.route.len() {
-        return (1000.0, 0.0);
+        return free_leader_obstacle();
     }
 
     let ego_edge = ego.route[ego.route_pos];
     let ego_lane = ego.current_lane;
     let ego_edge_len = map.graph.edge_weight(ego_edge).map(|e| e.length_m).unwrap_or(50.0);
 
-    // ── Same edge, same lane ──────────────────────────────────────────────────
     if let Some(bucket) = edge_lane_vehicles.get(&(ego_edge, ego_lane)) {
-        // Bucket is sorted by edge_progress ascending; find ego's position.
         if let Some(pos) = bucket.iter().position(|&idx| idx == ego_idx) {
             if let Some(&leader_idx) = bucket.get(pos + 1) {
                 let leader = &vehicles[leader_idx];
                 let center_dist_m = (leader.edge_progress - ego.edge_progress) * ego_edge_len;
-                let gap = bumper_gap(center_dist_m, ego, leader);
-                return (gap.max(MIN_IDM_GAP_M), ego.speed - leader.speed);
+                let gap = bumper_gap(center_dist_m, ego, leader).max(MIN_IDM_GAP_M);
+                let rear_ll = rear_bumper_lng_lat_vehicle(leader);
+                return ClosestObstacle {
+                    kind: ObstacleKind::Vehicle,
+                    gap_m: gap,
+                    delta_v: ego.speed - leader.speed,
+                    point_lng_lat: Some(rear_ll),
+                    leader_vehicle_id: Some(leader.id),
+                    conflict_reserver_id: None,
+                };
             }
         }
     }
 
-    // ── Look ahead to next edge when ego is past 60 % of current edge ────────
     if ego.edge_progress >= 0.60 && ego.route_pos + 1 < ego.route.len() {
         let next_edge = ego.route[ego.route_pos + 1];
         let next_edge_len = map.graph.edge_weight(next_edge).map(|e| e.length_m).unwrap_or(50.0);
         let dist_to_end = (1.0 - ego.edge_progress) * ego_edge_len;
 
-        // Check same lane on next edge, then adjacent lanes (merging / slight
-        // offset between directional lanes on a two-way road).
         let lanes_to_check: [u8; 3] = [
             ego_lane,
             ego_lane.saturating_sub(1),
             ego_lane.saturating_add(1),
         ];
-        let mut best_gap = f32::MAX;
-        let mut best_dv  = 0.0f32;
+        let mut best: Option<(f32, f32, u32, [f64; 2])> = None;
 
         for &lane in &lanes_to_check {
             if let Some(bucket) = edge_lane_vehicles.get(&(next_edge, lane)) {
-                // Lowest progress in bucket = vehicle closest to the edge start = closest to us
                 if let Some(&leader_idx) = bucket.first() {
                     let leader = &vehicles[leader_idx];
                     let leader_from_start = leader.edge_progress * next_edge_len;
                     let center_dist_m = dist_to_end + leader_from_start;
                     let gap = bumper_gap(center_dist_m, ego, leader).max(MIN_IDM_GAP_M);
-                    if gap < best_gap {
-                        best_gap = gap;
-                        best_dv  = ego.speed - leader.speed;
+                    if best.map_or(true, |(g, _, _, _)| gap < g) {
+                        let rear_ll = rear_bumper_lng_lat_vehicle(leader);
+                        best = Some((gap, ego.speed - leader.speed, leader.id, rear_ll));
                     }
                 }
             }
         }
 
-        if best_gap < 1000.0 {
-            return (best_gap, best_dv);
+        if let Some((gap, dv, lid, rear_ll)) = best {
+            return ClosestObstacle {
+                kind: ObstacleKind::Vehicle,
+                gap_m: gap,
+                delta_v: dv,
+                point_lng_lat: Some(rear_ll),
+                leader_vehicle_id: Some(lid),
+                conflict_reserver_id: None,
+            };
         }
     }
 
-    (1000.0, 0.0) // free road ahead
+    free_leader_obstacle()
 }
 
 #[inline]
@@ -833,6 +935,37 @@ fn bumper_gap(center_dist_m: f32, ego: &Vehicle, leader: &Vehicle) -> f32 {
     let ego_len = ego.vehicle_type.params().length_m;
     let leader_len = leader.vehicle_type.params().length_m;
     center_dist_m - 0.5 * (ego_len + leader_len)
+}
+
+#[inline]
+fn offset_vehicle_center_geo(v: &Vehicle, forward_m: f32) -> [f64; 2] {
+    let north = v.angle.cos() as f64 * forward_m as f64;
+    let east = v.angle.sin() as f64 * forward_m as f64;
+    [v.lng + east / GEO_LNG_M, v.lat + north / GEO_LAT_M]
+}
+
+#[inline]
+fn hood_lng_lat_m(v: &Vehicle) -> [f64; 2] {
+    let half = v.vehicle_type.params().length_m * 0.5;
+    offset_vehicle_center_geo(v, half)
+}
+
+#[inline]
+fn rear_bumper_lng_lat_vehicle(v: &Vehicle) -> [f64; 2] {
+    let half = v.vehicle_type.params().length_m * 0.5;
+    offset_vehicle_center_geo(v, -half)
+}
+
+#[inline]
+fn free_leader_obstacle() -> ClosestObstacle {
+    ClosestObstacle {
+        kind: ObstacleKind::Vehicle,
+        gap_m: 1000.0,
+        delta_v: 0.0,
+        point_lng_lat: None,
+        leader_vehicle_id: None,
+        conflict_reserver_id: None,
+    }
 }
 
 #[inline]
@@ -930,6 +1063,45 @@ fn compute_desired_speed(vehicle: &Vehicle, map: &MapData) -> f32 {
     desired
 }
 
+fn apply_connector_conflict_obstacle(
+    vehicle: &Vehicle,
+    base_obstacle: ClosestObstacle,
+    conflict_system: &ConflictSystem,
+    map: &MapData,
+) -> ClosestObstacle {
+    if !vehicle.on_turn_connector {
+        return base_obstacle;
+    }
+    let in_e = EdgeIndex::new(vehicle.turn_from_edge);
+    let out_e = EdgeIndex::new(vehicle.turn_to_edge);
+    let Some((_, node_idx)) = map.graph.edge_endpoints(in_e) else {
+        return base_obstacle;
+    };
+    let movement = (in_e, out_e);
+    let half_len = vehicle.vehicle_type.params().length_m * 0.5;
+    let s_front_arc = (vehicle.turn_dist_m as f32 + half_len).max(0.0);
+    let vr = vehicle_path_radius_m(vehicle);
+    let Some((block_dist, pt, owner)) = conflict_system.first_blocking_conflict_on_arc(
+        movement,
+        s_front_arc,
+        CONFLICT_LOOKAHEAD_M,
+        vehicle.id,
+        vr,
+        node_idx,
+    ) else {
+        return base_obstacle;
+    };
+    let threat = ClosestObstacle {
+        kind: ObstacleKind::ConflictPoint,
+        gap_m: block_dist,
+        delta_v: vehicle.speed,
+        point_lng_lat: Some(pt),
+        leader_vehicle_id: None,
+        conflict_reserver_id: Some(owner),
+    };
+    min_obstacle(base_obstacle, threat)
+}
+
 /// Apply traffic-light, stop-sign, and yield-sign braking effect.
 ///
 /// - **Traffic light (red/yellow):** treat the stop-line as a stationary obstacle.
@@ -937,21 +1109,20 @@ fn compute_desired_speed(vehicle: &Vehicle, map: &MapData) -> f32 {
 /// - **Yield sign:** cap approach speed to a low value within 20 m.
 fn apply_intersection_effect(
     vehicle: &Vehicle,
-    gap: f32,
-    delta_v: f32,
+    base_obstacle: ClosestObstacle,
     intersections: &IntersectionManager,
     conflict_system: &ConflictSystem,
     approach_tree: &RTree<ApproachIndexItem>,
     vehicles: &[Vehicle],
     map: &MapData,
-) -> (f32, f32) {
-    if vehicle.route_pos >= vehicle.route.len() { return (gap, delta_v); }
+) -> ClosestObstacle {
+    if vehicle.route_pos >= vehicle.route.len() { return base_obstacle; }
     // Vehicle already past the stop line — Bezier path owns its motion.
-    if vehicle.on_turn_connector { return (gap, delta_v); }
+    if vehicle.on_turn_connector { return base_obstacle; }
     let edge_idx = vehicle.route[vehicle.route_pos];
     let edge = match map.graph.edge_weight(edge_idx) {
         Some(e) => e,
-        None    => return (gap, delta_v),
+        None    => return base_obstacle,
     };
     let dist_to_end = edge.length_m * (1.0 - vehicle.edge_progress);
     // IDM must see free space from the FRONT BUMPER to the stop line.
@@ -959,9 +1130,10 @@ fn apply_intersection_effect(
 
     let (tgt_node_idx, tgt_osm_id) = match map.graph.edge_endpoints(edge_idx) {
         Some((_, tgt)) => (tgt, map.graph[tgt].osm_id),
-        None           => return (gap, delta_v),
+        None           => return base_obstacle,
     };
     let intersection_type = &map.graph[tgt_node_idx].intersection_type;
+    let mut best = base_obstacle;
 
     if let Some((movement, conn)) = vehicle_next_movement(vehicle, map) {
         let dist_to_entry_center = ((conn.entry_progress - vehicle.edge_progress).max(0.0)
@@ -969,29 +1141,59 @@ fn apply_intersection_effect(
             .max(0.0);
         let half_len = vehicle.vehicle_type.params().length_m * 0.5;
         let dist_to_entry = (dist_to_entry_center - half_len).max(MIN_IDM_GAP_M);
-        let pstate = conflict_system.check_priority(
-            vehicle,
-            movement.0,
-            tgt_node_idx,
-            map,
-            vehicles,
-            approach_tree,
-        );
-        if pstate == PriorityState::Wait {
-            let new_gap = dist_to_entry.min(gap).max(MIN_IDM_GAP_M);
-            let new_dv = if new_gap < gap { vehicle.speed } else { delta_v };
-            return (new_gap, new_dv);
-        }
-        if let Some(block_dist) = conflict_system.first_blocking_conflict_distance(
-            movement,
-            dist_to_entry,
-            CONFLICT_LOOKAHEAD_M,
-            vehicle.id,
-            tgt_node_idx,
-        ) {
-            let new_gap = block_dist.min(gap).max(MIN_IDM_GAP_M);
-            let new_dv = if new_gap < gap { vehicle.speed } else { delta_v };
-            return (new_gap, new_dv);
+        if dist_to_entry <= CONFLICT_PRIORITY_ACTIVATION_M {
+            let pstate = conflict_system.check_priority(
+                vehicle,
+                movement.0,
+                tgt_node_idx,
+                map,
+                vehicles,
+                approach_tree,
+            );
+            if pstate == PriorityState::Wait {
+                log::debug!(
+                    "CP_WAIT veh={} node={} in_edge={} dist_to_entry={:.1}m",
+                    vehicle.id,
+                    map.graph[tgt_node_idx].osm_id,
+                    edge_idx.index(),
+                    dist_to_entry
+                );
+                let threat = ClosestObstacle {
+                    kind: ObstacleKind::PriorityStopLine,
+                    gap_m: dist_to_entry.min(best.gap_m).max(MIN_IDM_GAP_M),
+                    delta_v: vehicle.speed,
+                    point_lng_lat: Some([conn.p1_lng, conn.p1_lat]),
+                    leader_vehicle_id: None,
+                    conflict_reserver_id: None,
+                };
+                best = min_obstacle(best, threat);
+            }
+            if let Some((block_dist, pt, owner)) = conflict_system.first_blocking_conflict_distance(
+                movement,
+                dist_to_entry,
+                CONFLICT_LOOKAHEAD_M,
+                vehicle.id,
+                vehicle_path_radius_m(vehicle),
+                tgt_node_idx,
+            ) {
+                log::debug!(
+                    "CP_BLOCKED veh={} node={} movement=({}->{}) block_dist={:.1}m",
+                    vehicle.id,
+                    map.graph[tgt_node_idx].osm_id,
+                    movement.0.index(),
+                    movement.1.index(),
+                    block_dist
+                );
+                let threat = ClosestObstacle {
+                    kind: ObstacleKind::ConflictPoint,
+                    gap_m: block_dist.min(best.gap_m).max(MIN_IDM_GAP_M),
+                    delta_v: vehicle.speed,
+                    point_lng_lat: Some(pt),
+                    leader_vehicle_id: None,
+                    conflict_reserver_id: Some(owner),
+                };
+                best = min_obstacle(best, threat);
+            }
         }
     }
 
@@ -1012,11 +1214,21 @@ fn apply_intersection_effect(
             )
         {
             // Virtual leader: standing at stop line.
-            let vgap = dist_to_stop_line.max(MIN_IDM_GAP_M);
-            let vdv  = vehicle.speed; // leader speed = 0
-            let new_gap = vgap.min(gap);
-            let new_dv  = if new_gap < gap { vdv } else { delta_v };
-            return (new_gap, new_dv);
+            let stop_t = (1.0 - STOP_LINE_OFFSET_M / edge.length_m.max(1.0)).clamp(0.0, 1.0) as f64;
+            let src = map.graph.edge_endpoints(edge_idx).map(|e| e.0).unwrap_or(tgt_node_idx);
+            let src_n = &map.graph[src];
+            let tgt_n = &map.graph[tgt_node_idx];
+            let stop_lat = src_n.lat + (tgt_n.lat - src_n.lat) * stop_t;
+            let stop_lng = src_n.lng + (tgt_n.lng - src_n.lng) * stop_t;
+            let threat = ClosestObstacle {
+                kind: ObstacleKind::TrafficSignalStopLine,
+                gap_m: dist_to_stop_line.max(MIN_IDM_GAP_M),
+                delta_v: vehicle.speed,
+                point_lng_lat: Some([stop_lng, stop_lat]),
+                leader_vehicle_id: None,
+                conflict_reserver_id: None,
+            };
+            best = min_obstacle(best, threat);
         }
     }
 
@@ -1026,10 +1238,21 @@ fn apply_intersection_effect(
     // vehicle reaches speed < 0.3 m/s.  After stopping, the vehicle may proceed.
     if matches!(intersection_type, IntersectionType::Stop) {
         if dist_to_end <= 15.0 && !vehicle.has_stopped_at_stop_sign {
-            let vgap = dist_to_stop_line.max(MIN_IDM_GAP_M);
-            let new_gap = vgap.min(gap);
-            let new_dv  = vehicle.speed;
-            return (new_gap, new_dv);
+            let stop_t = (1.0 - STOP_LINE_OFFSET_M / edge.length_m.max(1.0)).clamp(0.0, 1.0) as f64;
+            let src = map.graph.edge_endpoints(edge_idx).map(|e| e.0).unwrap_or(tgt_node_idx);
+            let src_n = &map.graph[src];
+            let tgt_n = &map.graph[tgt_node_idx];
+            let stop_lat = src_n.lat + (tgt_n.lat - src_n.lat) * stop_t;
+            let stop_lng = src_n.lng + (tgt_n.lng - src_n.lng) * stop_t;
+            let threat = ClosestObstacle {
+                kind: ObstacleKind::StopSignStopLine,
+                gap_m: dist_to_stop_line.max(MIN_IDM_GAP_M),
+                delta_v: vehicle.speed,
+                point_lng_lat: Some([stop_lng, stop_lat]),
+                leader_vehicle_id: None,
+                conflict_reserver_id: None,
+            };
+            best = min_obstacle(best, threat);
         }
     }
 
@@ -1039,15 +1262,20 @@ fn apply_intersection_effect(
         const YIELD_SPEED: f32 = 1.39; // 5 km/h
         if dist_to_end <= 20.0 && vehicle.speed > YIELD_SPEED {
             // Treat the junction entry as a slow virtual leader.
-            let virtual_gap = dist_to_stop_line.max(0.5);
-            let virtual_dv  = vehicle.speed - YIELD_SPEED;
-            let new_gap = virtual_gap.min(gap);
-            let new_dv  = if new_gap < gap { virtual_dv } else { delta_v };
-            return (new_gap, new_dv);
+            let jn = &map.graph[tgt_node_idx];
+            let threat = ClosestObstacle {
+                kind: ObstacleKind::YieldTarget,
+                gap_m: dist_to_stop_line.max(0.5),
+                delta_v: vehicle.speed - YIELD_SPEED,
+                point_lng_lat: Some([jn.lng, jn.lat]),
+                leader_vehicle_id: None,
+                conflict_reserver_id: None,
+            };
+            best = min_obstacle(best, threat);
         }
     }
 
-    (gap, delta_v)
+    best
 }
 
 #[inline]
@@ -1396,6 +1624,7 @@ fn apply_vehicle_physics(
             vehicle.turn_from_edge,
             vehicle.turn_to_edge,
             vehicle.turn_dist_m as f32,
+            vehicle_path_radius_m(vehicle),
         );
         // Build arc-length-parameterised path in local Cartesian metres.
         let path = bezier_path_from_geo(
@@ -1485,11 +1714,22 @@ fn apply_vehicle_physics(
                     movement,
                     0.0,
                     CONFLICT_LOOKAHEAD_M,
+                    vehicle_path_radius_m(vehicle),
                     tgt_idx,
                 );
             }
         }
         if vehicle.edge_progress >= conn.entry_progress {
+            let p = vehicle.vehicle_type.params();
+            let shape_radius = vehicle_path_radius_m(vehicle);
+            log::debug!(
+                "CP_SHAPE veh={} type={:?} L={:.2}m W={:.2}m radius={:.2}m",
+                vehicle.id,
+                vehicle.vehicle_type,
+                p.length_m,
+                p.width_m,
+                shape_radius
+            );
             vehicle.on_turn_connector = true;
             vehicle.turn_dist_m = 0.0;
             vehicle.turn_from_edge = edge_idx.index();
@@ -1584,6 +1824,120 @@ fn right_incoming_edge(incoming_cw: &[EdgeIndex], ego_in: EdgeIndex) -> Option<E
 }
 
 #[inline]
+fn vehicle_path_radius_m(vehicle: &Vehicle) -> f32 {
+    let p = vehicle.vehicle_type.params();
+    0.5 * (p.length_m * p.length_m + p.width_m * p.width_m).sqrt()
+}
+
+#[inline]
+fn obstacle_kind_label(kind: ObstacleKind) -> &'static str {
+    match kind {
+        ObstacleKind::Vehicle => "vehicle",
+        ObstacleKind::ConflictPoint => "conflict_point",
+        ObstacleKind::PriorityStopLine => "priority_stop_line",
+        ObstacleKind::TrafficSignalStopLine => "traffic_signal_stop_line",
+        ObstacleKind::StopSignStopLine => "stop_sign_stop_line",
+        ObstacleKind::YieldTarget => "yield_target",
+    }
+}
+
+/// UI line style from hood toward IDM braking target (`solid`|`dashed`|`thick`).
+#[inline]
+fn threat_line_style_label(kind: ObstacleKind) -> &'static str {
+    match kind {
+        ObstacleKind::Vehicle => "solid",
+        ObstacleKind::ConflictPoint => "dashed",
+        ObstacleKind::PriorityStopLine
+        | ObstacleKind::TrafficSignalStopLine
+        | ObstacleKind::StopSignStopLine
+        | ObstacleKind::YieldTarget => "thick",
+    }
+}
+
+#[inline]
+fn min_obstacle(a: ClosestObstacle, b: ClosestObstacle) -> ClosestObstacle {
+    if b.gap_m < a.gap_m { b } else { a }
+}
+
+#[inline]
+fn compute_idm_accel_with_obstacle(vehicle: &Vehicle, desired: f32, obs: ClosestObstacle) -> f32 {
+    let params = vehicle.driver_profile.params();
+    let vtype  = vehicle.vehicle_type.params();
+    idm_acceleration(vehicle.speed, desired, obs.gap_m, obs.delta_v, &params, &vtype)
+}
+
+fn compute_vehicle_idm_step(
+    ego_idx: usize,
+    ego: &Vehicle,
+    vehicles: &[Vehicle],
+    edge_lane_vehicles: &HashMap<(EdgeIndex, u8), Vec<usize>>,
+    vehicles_by_target_node: &HashMap<NodeIndex, Vec<usize>>,
+    tram_snapshot: &[(f64, f64, f32)],
+    map: &MapData,
+    intersections: &IntersectionManager,
+    conflict_system: &ConflictSystem,
+    approach_tree: &RTree<ApproachIndexItem>,
+) -> IdmStepResult {
+    let desired = compute_desired_speed(ego, map);
+
+    if ego.on_turn_connector {
+        let mut base = free_leader_obstacle();
+        let (gap, dv) =
+            apply_tram_leader_effect(ego, base.gap_m, base.delta_v, tram_snapshot);
+        base.gap_m = gap;
+        base.delta_v = dv;
+        let obstacle =
+            apply_connector_conflict_obstacle(ego, base, conflict_system, map);
+        let accel = compute_idm_accel_with_obstacle(ego, desired, obstacle);
+        return IdmStepResult {
+            accel,
+            desired_speed: desired,
+            obstacle,
+        };
+    }
+
+    let mut base_obstacle =
+        find_leader_obstacle_arc(ego_idx, ego, vehicles, edge_lane_vehicles, map);
+    let (gap, dv) = apply_tram_leader_effect(
+        ego,
+        base_obstacle.gap_m,
+        base_obstacle.delta_v,
+        tram_snapshot,
+    );
+    base_obstacle.gap_m = gap;
+    base_obstacle.delta_v = dv;
+    let (gap, dv) = apply_cross_traffic_leader_effect(
+        ego_idx,
+        ego,
+        vehicles,
+        vehicles_by_target_node,
+        map,
+        intersections,
+        base_obstacle.gap_m,
+        base_obstacle.delta_v,
+    );
+    base_obstacle.gap_m = gap;
+    base_obstacle.delta_v = dv;
+
+    let obstacle = apply_intersection_effect(
+        ego,
+        base_obstacle,
+        intersections,
+        conflict_system,
+        approach_tree,
+        vehicles,
+        map,
+    );
+    let accel = compute_idm_accel_with_obstacle(ego, desired, obstacle);
+
+    IdmStepResult {
+        accel,
+        desired_speed: desired,
+        obstacle,
+    }
+}
+
+#[inline]
 fn vehicle_next_movement(vehicle: &Vehicle, map: &MapData) -> Option<((EdgeIndex, EdgeIndex), PlannedTurnConnector)> {
     if vehicle.route_pos + 1 >= vehicle.route.len() {
         return None;
@@ -1629,7 +1983,17 @@ impl ConflictSystem {
             if waiting.len() >= 4 {
                 data.deadlock_timer_s += dt_s;
                 if data.deadlock_timer_s >= DEADLOCK_BREAK_S {
-                    data.deadlock_first_move = waiting.iter().copied().min();
+                    let next = waiting.iter().copied().min();
+                    if data.deadlock_first_move != next {
+                        log::info!(
+                            "CP_DEADLOCK_BREAK node={} waited={:.1}s first_move={:?} waiting_count={}",
+                            map.graph[*node_idx].osm_id,
+                            data.deadlock_timer_s,
+                            next,
+                            waiting.len()
+                        );
+                    }
+                    data.deadlock_first_move = next;
                 }
             } else {
                 data.deadlock_timer_s = 0.0;
@@ -1701,21 +2065,78 @@ impl ConflictSystem {
         dist_to_entry: f32,
         look_ahead: f32,
         vehicle_id: u32,
+        vehicle_radius_m: f32,
         node_idx: NodeIndex,
-    ) -> Option<f32> {
+    ) -> Option<(f32, [f64; 2], u32)> {
         let node = self.nodes.get(&node_idx)?;
         let path = node.by_movement.get(&movement)?;
         path.points
             .iter()
             .filter_map(|p| {
-                let d = dist_to_entry + p.distance_on_path;
+                let owner = match p.reserved_by {
+                    Some(o) if o != vehicle_id => o,
+                    _ => return None,
+                };
+                let d_raw = dist_to_entry + p.distance_on_path;
+                let d = (d_raw - vehicle_radius_m - CONFLICT_SHAPE_BUFFER_M).max(MIN_IDM_GAP_M);
                 if d > look_ahead { return None; }
-                match p.reserved_by {
-                    Some(owner) if owner != vehicle_id => Some(d),
-                    _ => None,
-                }
+                let lng = p.pos.x / GEO_LNG_M;
+                let lat = p.pos.y / GEO_LAT_M;
+                Some((d, [lng, lat], owner))
             })
-            .min_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal))
+            .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal))
+    }
+
+    /// Bezier-turn connector: ego front-bumper arc length from Bezier start (p1).
+    fn first_blocking_conflict_on_arc(
+        &self,
+        movement: (EdgeIndex, EdgeIndex),
+        s_front_arc_m: f32,
+        look_ahead: f32,
+        vehicle_id: u32,
+        vehicle_radius_m: f32,
+        node_idx: NodeIndex,
+    ) -> Option<(f32, [f64; 2], u32)> {
+        let node = self.nodes.get(&node_idx)?;
+        let path = node.by_movement.get(&movement)?;
+        path.points
+            .iter()
+            .filter_map(|p| {
+                let owner = match p.reserved_by {
+                    Some(o) if o != vehicle_id => o,
+                    _ => return None,
+                };
+                let d_raw = p.distance_on_path - s_front_arc_m;
+                if d_raw < 0.0 {
+                    return None;
+                }
+                let d = (d_raw - vehicle_radius_m - CONFLICT_SHAPE_BUFFER_M).max(MIN_IDM_GAP_M);
+                if d > look_ahead {
+                    return None;
+                }
+                let lng = p.pos.x / GEO_LNG_M;
+                let lat = p.pos.y / GEO_LAT_M;
+                Some((d, [lng, lat], owner))
+            })
+            .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal))
+    }
+
+    fn debug_conflict_points_snapshot(&self) -> Vec<DebugConflictPointPayload> {
+        let mut out = Vec::new();
+        for node in self.nodes.values() {
+            for path in node.by_movement.values() {
+                for p in &path.points {
+                    let lng = p.pos.x / GEO_LNG_M;
+                    let lat = p.pos.y / GEO_LAT_M;
+                    out.push(DebugConflictPointPayload {
+                        lng,
+                        lat,
+                        reserved_by: p.reserved_by,
+                    });
+                }
+            }
+        }
+        out
     }
 
     fn reserve_for_vehicle(
@@ -1724,18 +2145,31 @@ impl ConflictSystem {
         movement: (EdgeIndex, EdgeIndex),
         current_dist_on_path: f32,
         look_ahead: f32,
+        vehicle_radius_m: f32,
         node_idx: NodeIndex,
     ) {
         let Some(node) = self.nodes.get_mut(&node_idx) else { return; };
         let Some(path) = node.by_movement.get_mut(&movement) else { return; };
+        let reserve_from = (current_dist_on_path - vehicle_radius_m - CONFLICT_SHAPE_BUFFER_M).max(0.0);
+        let reserve_to = current_dist_on_path + look_ahead + vehicle_radius_m + CONFLICT_SHAPE_BUFFER_M;
         for p in &mut path.points {
-            if p.distance_on_path < current_dist_on_path {
+            if p.distance_on_path < reserve_from {
                 continue;
             }
-            if p.distance_on_path > current_dist_on_path + look_ahead {
+            if p.distance_on_path > reserve_to {
                 break;
             }
             if p.reserved_by.is_none() || p.reserved_by == Some(vehicle_id) {
+                if p.reserved_by != Some(vehicle_id) {
+                    log::debug!(
+                        "CP_RESERVE veh={} node={} movement=({}->{}) at={:.1}m",
+                        vehicle_id,
+                        node_idx.index(),
+                        movement.0.index(),
+                        movement.1.index(),
+                        p.distance_on_path
+                    );
+                }
                 p.reserved_by = Some(vehicle_id);
             }
         }
@@ -1747,6 +2181,7 @@ impl ConflictSystem {
         from_edge: usize,
         to_edge: usize,
         current_dist_on_path: f32,
+        vehicle_radius_m: f32,
     ) {
         let in_edge = EdgeIndex::new(from_edge);
         let out_edge = EdgeIndex::new(to_edge);
@@ -1754,8 +2189,17 @@ impl ConflictSystem {
             if let Some(path) = node.by_movement.get_mut(&(in_edge, out_edge)) {
                 for p in &mut path.points {
                     if p.reserved_by == Some(vehicle_id)
-                        && current_dist_on_path > p.distance_on_path + CONFLICT_RELEASE_BUFFER_M
+                        && (current_dist_on_path - vehicle_radius_m)
+                            > p.distance_on_path + CONFLICT_RELEASE_BUFFER_M
                     {
+                        log::debug!(
+                            "CP_RELEASE veh={} movement=({}->{}) passed={:.1}m point={:.1}m",
+                            vehicle_id,
+                            from_edge,
+                            to_edge,
+                            current_dist_on_path,
+                            p.distance_on_path
+                        );
                         p.reserved_by = None;
                     }
                 }
@@ -1872,6 +2316,15 @@ fn build_conflict_system(map: &MapData) -> ConflictSystem {
             }
         }
         build_conflicts_for_node(&mut by_movement);
+        let conflict_count: usize = by_movement.values().map(|p| p.points.len()).sum();
+        if !by_movement.is_empty() {
+            log::info!(
+                "CP_INIT node={} movements={} conflict_points={}",
+                map.graph[node].osm_id,
+                by_movement.len(),
+                conflict_count
+            );
+        }
         nodes.insert(node, IntersectionConflictData {
             by_movement,
             incoming_cw,
@@ -1931,20 +2384,18 @@ fn sample_connector_polyline(conn: &PlannedTurnConnector, samples: usize) -> (Ve
     let n = samples.max(8);
     let mut pts = Vec::with_capacity(n + 1);
     let mut dists = Vec::with_capacity(n + 1);
-    let mut acc = 0.0f32;
-    let mut prev = DVec2::ZERO;
+    let path = bezier_path_from_geo(
+        conn.p1_lat, conn.p1_lng,
+        conn.ctrl_lat, conn.ctrl_lng,
+        conn.p2_lat, conn.p2_lng,
+    );
+    let total = path.total_length.max(0.1) as f32;
     for i in 0..=n {
-        let t = i as f32 / n as f32;
-        let (lat, lng) = bezier_point_lat_lng(
-            conn.p1_lat, conn.p1_lng, conn.ctrl_lat, conn.ctrl_lng, conn.p2_lat, conn.p2_lng, t,
-        );
-        let p = DVec2::new(lng * GEO_LNG_M, lat * GEO_LAT_M);
-        if i > 0 {
-            acc += (p - prev).length() as f32;
-        }
+        let d = total * (i as f32 / n as f32);
+        let state = path.get_state(d as f64);
+        let p = DVec2::new(state.position.x, state.position.y);
         pts.push(p);
-        dists.push(acc);
-        prev = p;
+        dists.push(d);
     }
     (pts, dists)
 }

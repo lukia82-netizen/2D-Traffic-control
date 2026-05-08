@@ -28,6 +28,7 @@ export type BuildingToggleCb = (visible: boolean) => void;
 export type MapBgToggleCb    = (visible: boolean) => void;
 export type TurnConnectorsToggleCb = (visible: boolean) => void;
 export type TurnConnectorsActiveOnlyToggleCb = (activeOnly: boolean) => void;
+export type DebugVisualizationToggleCb = (enabled: boolean) => void;
 /** center = [lng, lat], sizeM = metres per side */
 export type ReloadMapCb        = (center: [number, number], sizeM: number) => void;
 export type MaxVehiclesCb      = (count: number) => void;
@@ -105,6 +106,7 @@ export class SandboxUI {
   onMapBgToggle:       MapBgToggleCb    = () => undefined;
   onTurnConnectorsToggle: TurnConnectorsToggleCb = () => undefined;
   onTurnConnectorsActiveOnlyToggle: TurnConnectorsActiveOnlyToggleCb = () => undefined;
+  onDebugVisualizationToggle: DebugVisualizationToggleCb = () => undefined;
   onReloadMap:         ReloadMapCb      = () => undefined;
   onMaxVehiclesChange: MaxVehiclesCb    = () => undefined;
   onBboxPickRequest:   BboxPickCb       = () => undefined;
@@ -401,6 +403,10 @@ export class SandboxUI {
     sec.appendChild(this.buildCheckRow(
       'turn-connectors-active-only', 'Tylko aktywne łuki', '#f59e0b', false,
       (checked) => this.onTurnConnectorsActiveOnlyToggle(checked),
+    ));
+    sec.appendChild(this.buildCheckRow(
+      'debug-visualization', 'Tryb debug skrzyżowań (klawisz D)', '#f43f5e', false,
+      (checked) => this.onDebugVisualizationToggle(checked),
     ));
 
     return sec;

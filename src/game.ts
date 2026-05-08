@@ -8,6 +8,7 @@ import {
   setTimeScale,
   setMaxVehicles,
   setDebugVehicle,
+  setDebugVisualization,
 } from './bridge/commands';
 import {
   parseVehicleFrame,
@@ -15,8 +16,16 @@ import {
   listenLightStateChanges,
   listenGameOver,
   listenIdmDebug,
+  listenDebugVisualization,
 } from './bridge/events';
-import type { VehicleState, CongestionData, LightStateUpdate, GameOverPayload, IdmDebugPayload } from './bridge/events';
+import type {
+  VehicleState,
+  CongestionData,
+  LightStateUpdate,
+  GameOverPayload,
+  IdmDebugPayload,
+  DebugVisualizationPayload,
+} from './bridge/events';
 import { PixiOverlay } from './rendering/PixiOverlay';
 import { CameraManager } from './rendering/CameraManager';
 import { RoadRenderer } from './rendering/RoadRenderer';
@@ -154,9 +163,19 @@ export class Game {
   private unlistenLights: (() => void) | null = null;
   private unlistenGameOver: (() => void) | null = null;
   private unlistenIdmDebug: (() => void) | null = null;
+  private unlistenDebugVisualization: (() => void) | null = null;
   private selectedVehicleId: number | null = null;
   private selectedRoutePoints: [number, number][] = [];
+  private selectedThreatPoint: [number, number] | null = null;
+  private selectedThreatShapeLengthM = 0;
+  /** From latest idm_debug: hood [lng,lat] for HUD threat line matching Rust. */
+  private selectedHudHoodLngLat: [number, number] | null = null;
   private debugRouteGfx: PIXI.Graphics | null = null;
+  private debugVizGfx: PIXI.Graphics | null = null;
+  private debugConflictLabels: PIXI.Container | null = null;
+  /** Full-map CP + threat overlay (Rust `debug_visualization`). */
+  private debugVisualizationEnabled = false;
+  private latestDebugVisualization: DebugVisualizationPayload | null = null;
   private turnConnectorGfx: PIXI.Graphics | null = null;
   private turnConnectorPaths: TurnConnectorPath[] = [];
   private showTurnConnectors = false;
@@ -207,10 +226,24 @@ export class Game {
     this.gameClockUI = new GameClockUI();
     this.debugRouteGfx = new PIXI.Graphics();
     this.turnConnectorGfx = new PIXI.Graphics();
+    this.debugVizGfx = new PIXI.Graphics();
+    this.debugConflictLabels = new PIXI.Container();
     this.overlay.congestionLayer.addChild(this.debugRouteGfx);
     this.overlay.congestionLayer.addChild(this.turnConnectorGfx);
+    this.overlay.congestionLayer.addChild(this.debugVizGfx);
+    this.overlay.congestionLayer.addChild(this.debugConflictLabels);
 
-    // Init vehicle textures
+    window.addEventListener('keydown', (ev) => {
+      if (!this.tauriAvailable) return;
+      const t = ev.target as HTMLElement | null;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+      if (ev.key === 'd' || ev.key === 'D') {
+        ev.preventDefault();
+        const next = !this.debugVisualizationEnabled;
+        void this.setDebugVisualizationMode(next);
+        this.sandboxUI?.setChecked('debug-visualization', next);
+      }
+    });
     await this.vehicleRenderer.init();
 
     // Init HUD controls
@@ -250,6 +283,9 @@ export class Game {
         this.trafficLightRenderer.rebuildOnCameraChange();
         this.redrawSelectedRoute();
         this.redrawTurnConnectors();
+        if (this.debugVisualizationEnabled && this.latestDebugVisualization) {
+          this.redrawFullDebugVisualization();
+        }
       }
     });
     this.map.on('click', (e) => {
@@ -364,8 +400,12 @@ export class Game {
       localStorage.setItem(TURN_DEBUG_ACTIVE_ONLY_STORAGE_KEY, activeOnly ? '1' : '0');
       this.redrawTurnConnectors();
     };
+    ui.onDebugVisualizationToggle = (enabled) => {
+      void this.setDebugVisualizationMode(enabled);
+    };
     ui.setChecked('turn-connectors', this.showTurnConnectors);
     ui.setChecked('turn-connectors-active-only', this.showTurnConnectorsActiveOnly);
+    ui.setChecked('debug-visualization', false);
   }
 
   private wireMapScenarioEditorUI(): void {
@@ -541,6 +581,9 @@ export class Game {
     this.unlistenIdmDebug = await listenIdmDebug((data) =>
       this.onIdmDebug(data),
     );
+    this.unlistenDebugVisualization = await listenDebugVisualization((data) =>
+      this.onDebugVisualization(data),
+    );
   }
 
   // ─── Simulation start ──────────────────────────────────────────────────────
@@ -604,10 +647,132 @@ export class Game {
 
   private onIdmDebug(data: IdmDebugPayload): void {
     this.uiRenderer.updateIdmDebug(data);
+    if (this.selectedVehicleId !== null && data.vehicleId === this.selectedVehicleId) {
+      this.uiRenderer.updateVehicleTelemetrySelected({
+        vehicleId: data.vehicleId,
+        speed: data.speed,
+        desiredSpeed: data.desiredSpeed,
+        acceleration: data.acceleration,
+        distanceToLeader: data.distanceToLeader,
+      });
+    }
     if (this.selectedVehicleId === null || data.vehicleId === this.selectedVehicleId) {
       this.selectedVehicleId = data.vehicleId;
       this.selectedRoutePoints = data.routePoints ?? [];
+      this.selectedThreatPoint = data.threatPoint ?? null;
+      this.selectedThreatShapeLengthM = data.shapeLengthM ?? 0;
+      this.selectedHudHoodLngLat = data.hoodLngLat ?? null;
       this.redrawSelectedRoute();
+    }
+  }
+
+  private onDebugVisualization(data: DebugVisualizationPayload): void {
+    this.latestDebugVisualization = data;
+  }
+
+  /** Toggle CP / IDM map overlay — syncs Sandbox checkbox + key D. */
+  private async setDebugVisualizationMode(enabled: boolean): Promise<void> {
+    this.debugVisualizationEnabled = enabled;
+    if (this.debugVizGfx) {
+      this.debugVizGfx.visible = enabled;
+    }
+    if (this.debugConflictLabels) {
+      this.debugConflictLabels.visible = enabled;
+    }
+    if (!enabled) {
+      this.latestDebugVisualization = null;
+      this.debugVizGfx?.clear();
+      this.debugConflictLabels?.removeChildren();
+    }
+    if (this.tauriAvailable) {
+      await setDebugVisualization(enabled).catch(console.error);
+    }
+  }
+
+  private redrawFullDebugVisualization(): void {
+    if (!this.debugVisualizationEnabled || !this.latestDebugVisualization) return;
+    const gfx = this.debugVizGfx;
+    const lbl = this.debugConflictLabels;
+    if (!gfx || !lbl) return;
+
+    gfx.clear();
+    lbl.removeChildren();
+
+    const DATA = this.latestDebugVisualization;
+
+    for (const cp of DATA.conflictPoints) {
+      const p = this.map.project([cp.lng, cp.lat]);
+      const reserved = cp.reservedBy !== null && cp.reservedBy !== undefined;
+      gfx.circle(p.x, p.y, reserved ? 5 : 3.5);
+      gfx.fill({ color: reserved ? 0xdc2626 : 0x22c55e, alpha: 0.92 });
+      gfx.stroke({ color: 0x0f172a, alpha: 0.85, width: 1.5 });
+
+      if (reserved) {
+        const t = new PIXI.Text({
+          text: `Reserved by Car ID: ${cp.reservedBy}`,
+          style: { fontFamily: 'Inter, Segoe UI, sans-serif', fontSize: 9, fill: 0xfff1f2 },
+        });
+        t.x = p.x + 8;
+        t.y = p.y - 14;
+        t.alpha = 0.95;
+        lbl.addChild(t);
+      }
+    }
+
+    const drawDashed = (x0: number, y0: number, x1: number, y1: number, w: number, col: number) => {
+      const dx = x1 - x0;
+      const dy = y1 - y0;
+      const len = Math.hypot(dx, dy);
+      if (len < 4) return;
+      const ux = dx / len;
+      const uy = dy / len;
+      const dash = 5;
+      const gap = 4;
+      let t = 0;
+      let on = true;
+      let cx = x0;
+      let cy = y0;
+      while (t < len) {
+        const step = on ? dash : gap;
+        const nt = Math.min(len, t + step);
+        const nx = x0 + ux * nt;
+        const ny = y0 + uy * nt;
+        if (on) {
+          gfx.moveTo(cx, cy);
+          gfx.lineTo(nx, ny);
+        }
+        cx = nx;
+        cy = ny;
+        t = nt;
+        on = !on;
+      }
+      gfx.stroke({ color: col, alpha: 0.95, width: w });
+    };
+
+    for (const th of DATA.vehicleThreats) {
+      const [lngH, latH] = th.hoodLngLat;
+      const p0 = this.map.project([lngH, latH]);
+      const [lngR, latR] = th.rearBumperLngLat;
+      const pb = this.map.project([lngR, latR]);
+      gfx.moveTo(pb.x - 4, pb.y - 4);
+      gfx.lineTo(pb.x + 4, pb.y + 4);
+      gfx.moveTo(pb.x + 4, pb.y - 4);
+      gfx.lineTo(pb.x - 4, pb.y + 4);
+      gfx.stroke({ color: 0x3b82f6, alpha: 0.98, width: 2 });
+
+      if (!th.threatLngLat) continue;
+      const p1 = this.map.project(th.threatLngLat);
+      const thick = th.lineStyle === 'thick';
+      const dashed = th.lineStyle === 'dashed';
+      const lw = thick ? 5 : dashed ? 2 : 2.5;
+      const col = 0xef4444;
+      if (dashed) {
+        drawDashed(p0.x, p0.y, p1.x, p1.y, lw, col);
+      } else {
+        gfx.moveTo(p0.x, p0.y);
+        gfx.lineTo(p1.x, p1.y);
+        gfx.stroke({ color: col, alpha: 0.95, width: lw });
+      }
     }
   }
 
@@ -635,7 +800,17 @@ export class Game {
     } else {
       this.selectedVehicleId = null;
       this.selectedRoutePoints = [];
+      this.selectedThreatPoint = null;
+      this.selectedThreatShapeLengthM = 0;
+      this.selectedHudHoodLngLat = null;
       this.redrawSelectedRoute();
+      this.uiRenderer.updateVehicleTelemetrySelected({
+        vehicleId: null,
+        speed: 0,
+        desiredSpeed: 0,
+        acceleration: 0,
+        distanceToLeader: 0,
+      });
       await setDebugVehicle(null).catch(console.error);
     }
   }
@@ -650,6 +825,31 @@ export class Game {
       this.debugRouteGfx.lineTo(pts[i].x, pts[i].y);
     }
     this.debugRouteGfx.stroke({ color: 0x22d3ee, alpha: 0.95, width: 3 });
+
+    // Red line: current IDM braking target (virtual leader / conflict point / stop line).
+    if (this.selectedThreatPoint && this.selectedVehicleId !== null) {
+      const v = this.vehicles.get(this.selectedVehicleId);
+      if (v) {
+        const hood = this.selectedHudHoodLngLat
+          ?? this.computeVehicleHoodLngLat(v, this.selectedThreatShapeLengthM);
+        const p0 = this.map.project(hood);
+        const p1 = this.map.project(this.selectedThreatPoint);
+        this.debugRouteGfx.moveTo(p0.x, p0.y);
+        this.debugRouteGfx.lineTo(p1.x, p1.y);
+        this.debugRouteGfx.stroke({ color: 0xef4444, alpha: 1.0, width: 3 });
+      }
+    }
+  }
+
+  private computeVehicleHoodLngLat(v: VehicleState, lengthM: number): [number, number] {
+    const half = Math.max(1.0, lengthM * 0.5);
+    // Rust heading convention: angle = atan2(d_lng, d_lat)
+    // => north component = cos(angle), east component = sin(angle).
+    const northM = Math.cos(v.angle) * half;
+    const eastM = Math.sin(v.angle) * half;
+    const lat = v.lat + northM / 111_320.0;
+    const lng = v.lng + eastM / 71_700.0;
+    return [lng, lat];
   }
 
   private rebuildTurnConnectorPaths(): void {
@@ -871,6 +1071,10 @@ export class Game {
     // Animate oneway arrows regardless of pause state
     this.infraRenderer.update(ticker.deltaMS);
 
+    if (this.debugVisualizationEnabled && this.latestDebugVisualization) {
+      this.redrawFullDebugVisualization();
+    }
+
     if (this.gameClockUI.paused || this.gameOver) return;
 
     // Advance game clock
@@ -938,8 +1142,11 @@ export class Game {
     this.unlistenGameOver?.();
     this.bboxPicker?.destroy();
     this.unlistenIdmDebug?.();
+    this.unlistenDebugVisualization?.();
     this.sandboxUI?.destroy();
     this.debugRouteGfx?.destroy();
+    this.debugVizGfx?.destroy();
+    this.debugConflictLabels?.destroy();
     this.turnConnectorGfx?.destroy();
     this.mapScenarioEditorUI?.destroy();
     this.buildingRenderer.destroy();

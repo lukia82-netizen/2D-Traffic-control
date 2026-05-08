@@ -6,7 +6,7 @@ use petgraph::graph::NodeIndex;
 
 use crate::map::road_network::MapData;
 use crate::simulation::od_model::{OdModel, TripKind};
-use crate::simulation::pathfinding::{find_path, random_destination, REF_SPEED_MS};
+use crate::simulation::pathfinding::{find_path, REF_SPEED_MS};
 use crate::simulation::speed_config::SpeedConfig;
 use crate::simulation::lane_change::compute_vehicle_target_lane;
 use crate::vehicles::vehicle::Vehicle;
@@ -295,22 +295,27 @@ impl SpawnSystem {
                     .and_then(|b| b.access_node)
                     .unwrap_or(boundary_idx)
             } else {
-                let n = self.spawn_points.len();
+                let n = self.boundary_nodes.len();
                 if n == 0 { return None; }
-                self.spawn_points[self.rng.gen_range(0..n)]
+                self.boundary_nodes[self.rng.gen_range(0..n)]
             };
             Some((origin, boundary_idx, TripKind::ExternalOutbound))
         }
     }
 
     fn random_od(&mut self, map: &MapData) -> Option<(NodeIndex, NodeIndex, TripKind)> {
-        if self.spawn_points.is_empty() {
+        if self.boundary_nodes.len() < 2 {
             return None;
         }
-        let n = self.spawn_points.len();
-        let from = self.spawn_points[self.rng.gen_range(0..n)];
-        let to   = random_destination(&map.graph, from, &mut self.rng);
-        if from == to { return None; }
+        let n = self.boundary_nodes.len();
+        let fi = self.rng.gen_range(0..n);
+        let mut ti = self.rng.gen_range(0..n);
+        if ti == fi { ti = (ti + 1) % n; }
+        let from = self.boundary_nodes[fi];
+        let to = self.boundary_nodes[ti];
+        if map.graph.node_weight(from).is_none() || map.graph.node_weight(to).is_none() {
+            return None;
+        }
         Some((from, to, TripKind::LocalOD))
     }
 

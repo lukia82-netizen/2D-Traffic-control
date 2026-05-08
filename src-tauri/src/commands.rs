@@ -232,6 +232,15 @@ pub fn set_debug_vehicle(
     send_sim_command(&state, SimCommand::SetDebugVehicle(vehicle_id))
 }
 
+/// Enable/disable full-map debug overlay (conflict points, threats, bumper markers).
+#[command]
+pub fn set_debug_visualization(
+    enabled: bool,
+    state: State<AppState>,
+) -> Result<(), String> {
+    send_sim_command(&state, SimCommand::SetDebugVisualization(enabled))
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 fn send_sim_command(state: &State<AppState>, cmd: SimCommand) -> Result<(), String> {
