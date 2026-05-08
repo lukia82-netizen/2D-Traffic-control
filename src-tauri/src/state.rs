@@ -48,6 +48,8 @@ pub enum SimCommand {
         red_s: f32,
     },
     SetDebugVehicle(Option<u32>),
+    /// Toggle Cities-Skylines-style conflict / IDM visualization (sent to frontend each tick).
+    SetDebugVisualization(bool),
     Stop,
 }
 

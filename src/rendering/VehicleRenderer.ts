@@ -249,10 +249,9 @@ export class VehicleRenderer {
       const color  = frustrationDotColor(v.frustration, DOT_COLORS[typeId] ?? 0x4488ff);
       const px     = this.map.project([s.lng, s.lat]);
 
-      // Right-hand lane offset applied in screen space.
-      const offsetPx = this.camera.getLaneOffset() * (2 * v.lateralOffset + 1);
-      const cx = px.x + Math.cos(s.angle) * offsetPx;
-      const cy = px.y + Math.sin(s.angle) * offsetPx;
+      // Backend now provides lane-centered geometry directly.
+      const cx = px.x;
+      const cy = px.y;
 
       gfx.circle(cx, cy, radius).fill({ color, alpha: 0.9 });
     }
@@ -347,15 +346,9 @@ export class VehicleRenderer {
 
       const px = this.map.project([s.lng, s.lat]);
 
-      // Right-hand lane offset — applied in screen space perpendicular to heading.
-      // On a turn connector the Bezier axis is at road centre; we still apply the
-      // lane offset so the vehicle stays in its lane visually throughout the turn.
-      const laneOffset = this.camera.getLaneOffset() * (2 * v.lateralOffset + 1);
-      const offsetX    = Math.cos(s.angle) * laneOffset;
-      const offsetY    = Math.sin(s.angle) * laneOffset;
-
-      rect.x        = px.x + offsetX;
-      rect.y        = px.y + offsetY;
+      // Backend now sends true lane-path position; no dynamic screen offset.
+      rect.x        = px.x;
+      rect.y        = px.y;
       rect.rotation = s.angle;
 
       const targetWidth  = Math.max(4, laneWidthPx * widthFill);

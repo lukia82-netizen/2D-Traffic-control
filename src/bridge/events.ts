@@ -20,6 +20,8 @@ export interface VehicleState {
   lateralOffset: number;
   /** Driver frustration 0 (calm) … 100 (rage). */
   frustration: number;
+  /** Full lane graph identifier for current path (`null` when unknown). */
+  currentLaneId: number | null;
 }
 
 export interface CongestionData {
@@ -53,7 +55,7 @@ export interface LightStateUpdate {
 /**
  * Decode a base64-encoded binary vehicle frame.
  *
- * Packet layout (40 bytes):
+ * Packet layout (v3, 48 bytes):
  *   [0..3]   id:            u32  LE
  *   [4..11]  lat:           f64  LE  ← double precision, eliminates f32 quantisation jitter
  *   [12..19] lng:           f64  LE  ← double precision
@@ -65,6 +67,10 @@ export interface LightStateUpdate {
  *   [31]     laneFlags:     u8   (bits 0..6: currentLane, bit7: onTurnConnector)
  *   [32..35] frustration:   f32  LE  (0=calm, 100=rage)
  *   [36..39] lateralOffset: f32  LE  (smooth: 0.0=lane-0 centre, 1.0=lane-1 …)
+ *   [40..47] currentLaneId: u64  LE  (u64::MAX => null)
+ *
+ * Backward compatibility:
+ * - v2 packets (40 bytes) are still accepted; `currentLaneId` is set to `null`.
  */
 export function parseVehicleFrame(base64Data: string): VehicleState[] {
   const binaryStr = atob(base64Data);
@@ -74,14 +80,24 @@ export function parseVehicleFrame(base64Data: string): VehicleState[] {
     bytes[i] = binaryStr.charCodeAt(i);
   }
 
-  const PACKET_SIZE = 40;
-  const count = Math.floor(bytes.byteLength / PACKET_SIZE);
+  const PACKET_V3 = 48;
+  const PACKET_V2 = 40;
+  const packetSize =
+    bytes.byteLength % PACKET_V3 === 0 ? PACKET_V3
+    : bytes.byteLength % PACKET_V2 === 0 ? PACKET_V2
+    : PACKET_V3;
+  const count = Math.floor(bytes.byteLength / packetSize);
   const view = new DataView(bytes.buffer);
   const vehicles: VehicleState[] = new Array(count);
+  const U64_NONE = BigInt('18446744073709551615');
 
   for (let i = 0; i < count; i++) {
-    const base = i * PACKET_SIZE;
+    const base = i * packetSize;
     const laneFlags = view.getUint8(base + 31);
+    const laneId =
+      packetSize >= PACKET_V3
+        ? view.getBigUint64(base + 40, true)
+        : U64_NONE;
     vehicles[i] = {
       id:              view.getUint32 (base,      true),
       lat:             view.getFloat64(base + 4,  true),
@@ -95,6 +111,7 @@ export function parseVehicleFrame(base64Data: string): VehicleState[] {
       onTurnConnector: (laneFlags & 0x80) !== 0,
       frustration:     view.getFloat32(base + 32, true),
       lateralOffset:   view.getFloat32(base + 36, true),
+      currentLaneId:   laneId === U64_NONE ? null : Number(laneId),
     };
   }
 
@@ -145,11 +162,72 @@ export interface IdmDebugPayload {
   speed: number;
   gap: number;
   deltaV: number;
+  desiredSpeed: number;
+  acceleration: number;
+  distanceToLeader: number;
+  leaderVehicleId: number | null;
+  conflictReserverId: number | null;
   distToStopLine: number;
   redBlocking: boolean;
   onCurve: boolean;
   turnT: number;
+  shapeLengthM: number;
+  shapeWidthM: number;
+  shapeRadiusM: number;
+  threatKind: string;
+  threatLineStyle: string;
+  threatPoint: [number, number] | null;
+  stopLinePoint: [number, number] | null;
+  turnEntryPoint: [number, number] | null;
+  hoodLngLat: [number, number];
+  rearBumperLngLat: [number, number];
   routePoints: [number, number][];
+}
+
+export interface DebugConflictPoint {
+  id: number;
+  lng: number;
+  lat: number;
+  radiusM: number;
+  reservedBy: number | null;
+  collidingWithObb: boolean;
+}
+
+export interface DebugVehicleThreat {
+  vehicleId: number;
+  centerLngLat: [number, number];
+  hoodLngLat: [number, number];
+  rearBumperLngLat: [number, number];
+  threatLngLat: [number, number] | null;
+  rightArrowLngLat: [number, number];
+  rightArrowActive: boolean;
+  hasSignalPriority: boolean;
+  yieldToVehicleLngLat: [number, number] | null;
+  yieldToVehicleId: number | null;
+  reservationPath: [number, number][] | null;
+  routeConflictPointIds: number[];
+  comfortBrakeEndLngLat: [number, number];
+  emergencyBrakeEndLngLat: [number, number];
+  emergencyBrakingActive: boolean;
+  obbCorners: [number, number][];
+  collidingConflictPointIds: number[];
+  lineStyle: string;
+  threatKind: string;
+  leaderVehicleId: number | null;
+  conflictReserverId: number | null;
+  debugState: string | null;
+}
+
+export interface DebugLanePath {
+  lanePathId: string;
+  colorIdx: number;
+  points: [number, number][];
+}
+
+export interface DebugVisualizationPayload {
+  lanePaths: DebugLanePath[];
+  conflictPoints: DebugConflictPoint[];
+  vehicleThreats: DebugVehicleThreat[];
 }
 
 /**
@@ -173,6 +251,18 @@ export async function listenIdmDebug(
   cb: (data: IdmDebugPayload) => void,
 ): Promise<() => void> {
   const unlisten = await listen<IdmDebugPayload>('idm_debug', (event) => {
+    cb(event.payload);
+  });
+  return unlisten;
+}
+
+/**
+ * Full-map debug overlay (conflict points + per-vehicle threat rays). ~60 Hz when enabled in sim.
+ */
+export async function listenDebugVisualization(
+  cb: (data: DebugVisualizationPayload) => void,
+): Promise<() => void> {
+  const unlisten = await listen<DebugVisualizationPayload>('debug_visualization', (event) => {
     cb(event.payload);
   });
   return unlisten;

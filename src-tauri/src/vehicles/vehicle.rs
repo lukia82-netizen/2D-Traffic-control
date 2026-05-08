@@ -1,6 +1,7 @@
 use petgraph::graph::EdgeIndex;
 use super::types::VehicleType;
 use super::driver::DriverProfile;
+use crate::map::road_network::LaneId;
 
 #[derive(Debug, Clone)]
 pub struct Vehicle {
@@ -13,6 +14,10 @@ pub struct Vehicle {
     pub speed: f32,
     /// Current acceleration m/s²
     pub accel: f32,
+    /// OBB half length in metres for collision checks.
+    pub obb_half_length_m: f32,
+    /// OBB half width in metres for collision checks.
+    pub obb_half_width_m: f32,
     pub vehicle_type: VehicleType,
     pub driver_profile: DriverProfile,
 
@@ -52,6 +57,13 @@ pub struct Vehicle {
     /// Progress along the current edge: 0.0 = start, 1.0 = end.
     pub edge_progress: f32,
 
+    /// Lane-centric route (full cutover target). When populated, simulation
+    /// should prefer this over edge-based fields.
+    pub lane_route: Vec<LaneId>,
+    pub lane_route_pos: usize,
+    pub lane_progress_m: f32,
+    pub current_lane_id: Option<LaneId>,
+
     // ── Lane management ──────────────────────────────────────────────────────
 
     pub current_lane: u8,
@@ -78,8 +90,8 @@ pub struct Vehicle {
     // ── Junction turn connector (Bezier) ────────────────────────────────────
     /// True while the vehicle follows an invisible connector curve through a turn.
     pub on_turn_connector: bool,
-    /// Normalized progress on the connector curve [0..1].
-    pub turn_t: f32,
+    /// Arc-length distance travelled along the connector curve (metres).
+    pub turn_dist_m: f64,
     /// Entry progress on the current edge where the connector starts.
     pub turn_entry_progress: f32,
     /// Exit progress on the next edge where the connector ends.
@@ -95,6 +107,10 @@ pub struct Vehicle {
     /// Quadratic Bezier end point (lat/lng).
     pub turn_p2_lat: f64,
     pub turn_p2_lng: f64,
+    /// Edge index of incoming approach that started current connector traversal.
+    pub turn_from_edge: usize,
+    /// Edge index of outgoing edge targeted by current connector traversal.
+    pub turn_to_edge: usize,
 }
 
 impl Vehicle {
@@ -117,6 +133,8 @@ impl Vehicle {
             angle: 0.0,
             speed: 0.0,
             accel: 0.0,
+            obb_half_length_m: vehicle_type.params().length_m * 0.5,
+            obb_half_width_m: vehicle_type.params().width_m * 0.5,
             vehicle_type,
             driver_profile,
             personal_compliance,
@@ -130,6 +148,10 @@ impl Vehicle {
             route,
             route_pos: 0,
             edge_progress: 0.0,
+            lane_route: Vec::new(),
+            lane_route_pos: 0,
+            lane_progress_m: 0.0,
+            current_lane_id: None,
             current_lane: 0,
             target_lane: 0,
             lane_change_cooldown: 0.0,
@@ -138,7 +160,7 @@ impl Vehicle {
             has_stopped_at_stop_sign: false,
             despawned: false,
             on_turn_connector: false,
-            turn_t: 0.0,
+            turn_dist_m: 0.0,
             turn_entry_progress: 0.0,
             turn_exit_progress: 0.0,
             turn_length_m: 1.0,
@@ -148,6 +170,8 @@ impl Vehicle {
             turn_ctrl_lng: lng,
             turn_p2_lat: lat,
             turn_p2_lng: lng,
+            turn_from_edge: 0,
+            turn_to_edge: 0,
         }
     }
 

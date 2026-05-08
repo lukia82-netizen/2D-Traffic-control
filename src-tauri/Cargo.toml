@@ -15,6 +15,10 @@ tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 osmpbf = "0.3"
+osm2streets = { git = "https://github.com/a-b-street/osm2streets" }
+streets_reader = { git = "https://github.com/a-b-street/osm2streets", package = "streets_reader" }
+abstutil = { git = "https://github.com/a-b-street/abstreet" }
+geom = { git = "https://github.com/a-b-street/geom" }
 petgraph = { version = "0.6", features = ["serde-1"] }
 rayon = "1"
 reqwest = { version = "0.12", features = ["json", "blocking"] }
@@ -22,6 +26,7 @@ tokio = { version = "1", features = ["full"] }
 rand = "0.8"
 rand_distr = "0.4"
 rstar = "0.12"
+parry2d = "0.23"
 log = "0.4"
 env_logger = "0.11"
 base64 = "0.22"

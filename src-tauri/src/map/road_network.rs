@@ -1,6 +1,10 @@
 use std::collections::HashMap;
 use petgraph::graph::{DiGraph, NodeIndex};
+use petgraph::visit::EdgeRef;
 use serde::{Deserialize, Serialize};
+use parry2d::na::Point2;
+use parry2d::query::intersection_test;
+use parry2d::shape::Segment;
 
 use crate::map::osm_loader::{OsmData, OsmRelation};
 use crate::map::building_loader::OdBuilding;
@@ -100,6 +104,38 @@ pub struct TurnConnector {
 
 pub type RoadGraph = DiGraph<RoadNode, RoadEdge>;
 
+pub type LaneId = u64;
+pub type ConflictAreaId = u64;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BezierPath {
+    pub points: Vec<[f64; 2]>,
+    pub length_m: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConflictArea {
+    pub id: ConflictAreaId,
+    pub center_lat: f64,
+    pub center_lng: f64,
+    pub radius_m: f32,
+    pub lane_ids: Vec<LaneId>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Lane {
+    pub id: LaneId,
+    pub path: BezierPath,
+    pub width: f32,
+    pub connections: Vec<LaneId>,
+    pub conflict_areas: Vec<ConflictAreaId>,
+    /// Compatibility metadata for edge-oriented systems during migration.
+    pub from_node_osm_id: u64,
+    pub to_node_osm_id: u64,
+    pub edge_id: u64,
+    pub lane_index: u8,
+}
+
 pub struct MapData {
     pub graph: RoadGraph,
     pub node_index_map: HashMap<u64, NodeIndex>,
@@ -119,6 +155,9 @@ pub struct MapData {
     /// Single-intersection sandbox (+ cross): 2-phase manual TL (N–S / E–W, no lefts) at init.
     pub sandbox_simple_cross_tl: bool,
     pub turn_connectors: Vec<TurnConnector>,
+    /// Full lane graph used by lane-based movement and conflict reservation.
+    pub lanes: HashMap<LaneId, Lane>,
+    pub conflict_areas: HashMap<ConflictAreaId, ConflictArea>,
 }
 
 // ── Demo network ─────────────────────────────────────────────────────────────
@@ -267,7 +306,7 @@ pub fn build_demo_road_network(grid_type: &str, bbox: [f64; 4]) -> MapData {
         lines: Vec::new(),
     };
 
-    MapData {
+    let mut map = MapData {
         graph,
         node_index_map,
         bbox,
@@ -279,7 +318,11 @@ pub fn build_demo_road_network(grid_type: &str, bbox: [f64; 4]) -> MapData {
         is_sandbox: true,
         sandbox_simple_cross_tl: false,
         turn_connectors: Vec::new(),
-    }
+        lanes: HashMap::new(),
+        conflict_areas: HashMap::new(),
+    };
+    populate_lane_graph(&mut map);
+    map
 }
 
 /// Build the **single-road** test map: one straight 600 m one-way road.
@@ -354,7 +397,7 @@ pub fn build_single_road_network(bbox: [f64; 4]) -> MapData {
         lines: Vec::new(),
     };
 
-    MapData {
+    let mut map = MapData {
         graph,
         node_index_map,
         bbox,
@@ -366,7 +409,11 @@ pub fn build_single_road_network(bbox: [f64; 4]) -> MapData {
         is_sandbox: true,
         sandbox_simple_cross_tl: false,
         turn_connectors: Vec::new(),
-    }
+        lanes: HashMap::new(),
+        conflict_areas: HashMap::new(),
+    };
+    populate_lane_graph(&mut map);
+    map
 }
 
 /// Build the default **single-intersection** sandbox map:
@@ -468,7 +515,7 @@ pub fn build_single_intersection_network(bbox: [f64; 4]) -> MapData {
         lines: Vec::new(),
     };
 
-    MapData {
+    let mut map = MapData {
         graph,
         node_index_map,
         bbox,
@@ -480,7 +527,11 @@ pub fn build_single_intersection_network(bbox: [f64; 4]) -> MapData {
         is_sandbox: true,
         sandbox_simple_cross_tl: true,
         turn_connectors: Vec::new(),
-    }
+        lanes: HashMap::new(),
+        conflict_areas: HashMap::new(),
+    };
+    populate_lane_graph(&mut map);
+    map
 }
 
 // ── Real OSM network ─────────────────────────────────────────────────────────
@@ -636,7 +687,7 @@ pub fn build_road_network(osm_data: OsmData) -> MapData {
         tram_data.graph.node_count()
     );
 
-    MapData {
+    let mut map = MapData {
         graph,
         node_index_map,
         bbox,
@@ -648,7 +699,11 @@ pub fn build_road_network(osm_data: OsmData) -> MapData {
         is_sandbox: false,
         sandbox_simple_cross_tl: false,
         turn_connectors: Vec::new(),
-    }
+        lanes: HashMap::new(),
+        conflict_areas: HashMap::new(),
+    };
+    populate_lane_graph(&mut map);
+    map
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
@@ -921,4 +976,270 @@ fn find_boundary_nodes(graph: &RoadGraph, bbox: &[f64; 4]) -> Vec<NodeIndex> {
     } else {
         boundary
     }
+}
+
+pub fn populate_lane_graph(map: &mut MapData) {
+    const LANE_WIDTH_M: f32 = 3.2;
+    let mut lanes: HashMap<LaneId, Lane> = HashMap::new();
+    let mut by_edge_lane: HashMap<(usize, u8), LaneId> = HashMap::new();
+    let mut next_lane_id: LaneId = 1;
+
+    for edge_ref in map.graph.edge_references() {
+        let edge_id = edge_ref.id();
+        let edge = edge_ref.weight();
+        let from = &map.graph[edge_ref.source()];
+        let to = &map.graph[edge_ref.target()];
+        let (sx, sy) = geo_to_m_xy(from.lat, from.lng);
+        let (tx, ty) = geo_to_m_xy(to.lat, to.lng);
+        let dx = tx - sx;
+        let dy = ty - sy;
+        let len = (dx * dx + dy * dy).sqrt().max(1.0);
+        let ux = dx / len;
+        let uy = dy / len;
+        let nx = uy;
+        let ny = -ux;
+
+        for lane_idx in 0..edge.lanes.max(1) {
+            let offset_m = lane_center_offset_m(lane_idx, edge.lanes.max(1), edge.oneway);
+            let psx = sx + nx * offset_m;
+            let psy = sy + ny * offset_m;
+            let ptx = tx + nx * offset_m;
+            let pty = ty + ny * offset_m;
+            let (plat, plng) = m_xy_to_geo(psx, psy);
+            let (qlat, qlng) = m_xy_to_geo(ptx, pty);
+
+            let lane_id = next_lane_id;
+            next_lane_id += 1;
+            by_edge_lane.insert((edge_id.index(), lane_idx), lane_id);
+            lanes.insert(lane_id, Lane {
+                id: lane_id,
+                path: BezierPath {
+                    points: vec![[plat, plng], [qlat, qlng]],
+                    length_m: edge.length_m,
+                },
+                width: LANE_WIDTH_M,
+                connections: Vec::new(),
+                conflict_areas: Vec::new(),
+                from_node_osm_id: from.osm_id,
+                to_node_osm_id: to.osm_id,
+                edge_id: edge_id.index() as u64,
+                lane_index: lane_idx,
+            });
+        }
+    }
+
+    // Build lane connections at each node using lane-index pairing and
+    // create physical Bezier connector lanes.
+    for node in map.graph.node_indices() {
+        let incoming: Vec<_> = map.graph
+            .edges_directed(node, petgraph::Direction::Incoming)
+            .map(|e| (e.id(), e.weight().lanes.max(1)))
+            .collect();
+        let outgoing: Vec<_> = map.graph
+            .edges_directed(node, petgraph::Direction::Outgoing)
+            .map(|e| (e.id(), e.weight().lanes.max(1)))
+            .collect();
+        if incoming.is_empty() || outgoing.is_empty() {
+            continue;
+        }
+        for (in_edge, in_lanes) in &incoming {
+            for in_lane in 0..*in_lanes {
+                let Some(&in_lane_id) = by_edge_lane.get(&(in_edge.index(), in_lane)) else { continue; };
+                let mut conns = Vec::new();
+                for (out_edge, out_lanes) in &outgoing {
+                    if in_edge == out_edge {
+                        continue;
+                    }
+                    let out_lane = in_lane.min(out_lanes.saturating_sub(1));
+                    if let Some(&out_lane_id) = by_edge_lane.get(&(out_edge.index(), out_lane)) {
+                        let Some(connector) = build_lane_connector(&lanes, in_lane_id, out_lane_id, next_lane_id) else {
+                            conns.push(out_lane_id);
+                            continue;
+                        };
+                        next_lane_id += 1;
+                        let connector_id = connector.id;
+                        conns.push(connector_id);
+                        lanes.insert(connector_id, connector);
+                        if let Some(out) = lanes.get_mut(&connector_id) {
+                            out.connections.push(out_lane_id);
+                        }
+                    }
+                }
+                if let Some(l) = lanes.get_mut(&in_lane_id) {
+                    l.connections = conns;
+                }
+            }
+        }
+    }
+
+    // Build physical conflict areas from lane path intersections.
+    let lane_items: Vec<(LaneId, Vec<[f64; 2]>)> = lanes
+        .iter()
+        .map(|(id, lane)| (*id, lane.path.points.clone()))
+        .collect();
+    let mut areas: HashMap<ConflictAreaId, ConflictArea> = HashMap::new();
+    let mut next_conflict_id: ConflictAreaId = 1;
+    for i in 0..lane_items.len() {
+        for j in (i + 1)..lane_items.len() {
+            let (a_id, a_pts) = &lane_items[i];
+            let (b_id, b_pts) = &lane_items[j];
+            if a_pts.len() < 2 || b_pts.len() < 2 {
+                continue;
+            }
+            for wa in a_pts.windows(2) {
+                for wb in b_pts.windows(2) {
+                    let (a0x, a0y) = geo_to_m_xy(wa[0][0], wa[0][1]);
+                    let (a1x, a1y) = geo_to_m_xy(wa[1][0], wa[1][1]);
+                    let (b0x, b0y) = geo_to_m_xy(wb[0][0], wb[0][1]);
+                    let (b1x, b1y) = geo_to_m_xy(wb[1][0], wb[1][1]);
+                    let sa = Segment::new(Point2::new(a0x as f32, a0y as f32), Point2::new(a1x as f32, a1y as f32));
+                    let sb = Segment::new(Point2::new(b0x as f32, b0y as f32), Point2::new(b1x as f32, b1y as f32));
+                    let hits = intersection_test(
+                        &parry2d::na::Isometry2::identity(),
+                        &sa,
+                        &parry2d::na::Isometry2::identity(),
+                        &sb,
+                    ).unwrap_or(false);
+                    if !hits {
+                        continue;
+                    }
+                    let cx = (a0x + a1x + b0x + b1x) * 0.25;
+                    let cy = (a0y + a1y + b0y + b1y) * 0.25;
+                    let (clat, clng) = m_xy_to_geo(cx, cy);
+                    let cid = next_conflict_id;
+                    next_conflict_id += 1;
+                    areas.insert(cid, ConflictArea {
+                        id: cid,
+                        center_lat: clat,
+                        center_lng: clng,
+                        radius_m: 2.0,
+                        lane_ids: vec![*a_id, *b_id],
+                    });
+                    if let Some(la) = lanes.get_mut(a_id) {
+                        la.conflict_areas.push(cid);
+                    }
+                    if let Some(lb) = lanes.get_mut(b_id) {
+                        lb.conflict_areas.push(cid);
+                    }
+                }
+            }
+        }
+    }
+
+    map.lanes = lanes;
+    map.conflict_areas = areas;
+}
+
+#[inline]
+fn lane_center_offset_m(lane: u8, lanes_total: u8, oneway: bool) -> f64 {
+    const LANE_WIDTH_M: f64 = 3.2;
+    if oneway {
+        ((lane as f64 + 0.5) - (lanes_total as f64) * 0.5) * LANE_WIDTH_M
+    } else {
+        (lane as f64 + 0.5) * LANE_WIDTH_M
+    }
+}
+
+#[inline]
+fn geo_to_m_xy(lat: f64, lng: f64) -> (f64, f64) {
+    (lng * 71_700.0, lat * 111_320.0)
+}
+
+#[inline]
+fn m_xy_to_geo(x: f64, y: f64) -> (f64, f64) {
+    (y / 111_320.0, x / 71_700.0)
+}
+
+fn build_lane_connector(
+    lanes: &HashMap<LaneId, Lane>,
+    from_lane_id: LaneId,
+    to_lane_id: LaneId,
+    lane_id: LaneId,
+) -> Option<Lane> {
+    let from = lanes.get(&from_lane_id)?;
+    let to = lanes.get(&to_lane_id)?;
+    let p1 = *from.path.points.last()?;
+    let p2 = *to.path.points.first()?;
+    if p1 == p2 {
+        return None;
+    }
+    let prev = if from.path.points.len() >= 2 {
+        from.path.points[from.path.points.len() - 2]
+    } else {
+        p1
+    };
+    let next = if to.path.points.len() >= 2 {
+        to.path.points[1]
+    } else {
+        p2
+    };
+    let (p1x, p1y) = geo_to_m_xy(p1[0], p1[1]);
+    let (p2x, p2y) = geo_to_m_xy(p2[0], p2[1]);
+    let (prx, pry) = geo_to_m_xy(prev[0], prev[1]);
+    let (nx, ny) = geo_to_m_xy(next[0], next[1]);
+    let in_dir = normalize_xy(p1x - prx, p1y - pry);
+    let out_dir = normalize_xy(nx - p2x, ny - p2y);
+    let span = ((p2x - p1x).powi(2) + (p2y - p1y).powi(2)).sqrt().max(1.0);
+    let h = (span * 0.5).min(18.0);
+    let c1 = (p1x + in_dir.0 * h, p1y + in_dir.1 * h);
+    let c2 = (p2x - out_dir.0 * h, p2y - out_dir.1 * h);
+    let samples = cubic_bezier_samples((p1x, p1y), c1, c2, (p2x, p2y), 12);
+    let mut points = Vec::with_capacity(samples.len());
+    let mut length_m = 0.0f32;
+    let mut prev_xy: Option<(f64, f64)> = None;
+    for (x, y) in samples {
+        let (lat, lng) = m_xy_to_geo(x, y);
+        points.push([lat, lng]);
+        if let Some((px, py)) = prev_xy {
+            let seg = ((x - px).powi(2) + (y - py).powi(2)).sqrt() as f32;
+            length_m += seg;
+        }
+        prev_xy = Some((x, y));
+    }
+    Some(Lane {
+        id: lane_id,
+        path: BezierPath { points, length_m: length_m.max(0.5) },
+        width: from.width.min(to.width),
+        connections: Vec::new(),
+        conflict_areas: Vec::new(),
+        from_node_osm_id: from.from_node_osm_id,
+        to_node_osm_id: to.to_node_osm_id,
+        edge_id: u64::MAX,
+        lane_index: 0,
+    })
+}
+
+#[inline]
+fn normalize_xy(x: f64, y: f64) -> (f64, f64) {
+    let len = (x * x + y * y).sqrt();
+    if len <= 1e-9 {
+        (0.0, 0.0)
+    } else {
+        (x / len, y / len)
+    }
+}
+
+fn cubic_bezier_samples(
+    p0: (f64, f64),
+    p1: (f64, f64),
+    p2: (f64, f64),
+    p3: (f64, f64),
+    segments: usize,
+) -> Vec<(f64, f64)> {
+    let n = segments.max(4);
+    let mut out = Vec::with_capacity(n + 1);
+    for i in 0..=n {
+        let t = i as f64 / n as f64;
+        let u = 1.0 - t;
+        let x = u * u * u * p0.0
+            + 3.0 * u * u * t * p1.0
+            + 3.0 * u * t * t * p2.0
+            + t * t * t * p3.0;
+        let y = u * u * u * p0.1
+            + 3.0 * u * u * t * p1.1
+            + 3.0 * u * t * t * p2.1
+            + t * t * t * p3.1;
+        out.push((x, y));
+    }
+    out
 }

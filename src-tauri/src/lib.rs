@@ -13,6 +13,7 @@ use commands::{
     set_light_durations, set_max_vehicles, set_debug_vehicle, set_editor_tool,
     editor_move_node, editor_extrude, editor_connect, editor_delete_edge, editor_undo, editor_redo,
     save_map_overrides, editor_update_edge_tags,
+    set_debug_visualization,
 };
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -42,6 +43,7 @@ pub fn run() {
             editor_redo,
             save_map_overrides,
             editor_update_edge_tags,
+            set_debug_visualization,
         ])
         .setup(|app| {
             log::info!("Traffic Control app started");
