@@ -1,11 +1,10 @@
 use std::collections::HashMap;
-use kurbo::{BezPath, PathEl, Point, Vec2};
+use kurbo::{
+    flatten, BezPath, CubicBez, ParamCurve, ParamCurveArclen, PathEl, Point, Shape, Vec2,
+};
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef;
 use serde::{Deserialize, Serialize};
-use parry2d::na::Point2;
-use parry2d::query::intersection_test;
-use parry2d::shape::Segment;
 
 use crate::map::osm_loader::{OsmData, OsmRelation};
 use crate::map::building_loader::OdBuilding;
@@ -127,6 +126,9 @@ pub struct ConflictArea {
 pub struct Lane {
     pub id: LaneId,
     pub path: BezierPath,
+    /// Cubic connector control points in local metres (x = east, y = north). `None` for road lanes.
+    #[serde(default)]
+    pub connector_cubic_m: Option<[[f64; 2]; 4]>,
     pub width: f32,
     pub connections: Vec<LaneId>,
     pub conflict_areas: Vec<ConflictAreaId>,
@@ -141,9 +143,9 @@ pub struct MapData {
     pub graph: RoadGraph,
     pub node_index_map: HashMap<u64, NodeIndex>,
     pub bbox: [f64; 4],
-    /// All spawn points (boundary + junctions) – used as transit boundary nodes.
+    /// Nodes in an outer band of the map bbox (map “edge”) — for UI and catalog; not interior junctions.
     pub spawn_points: Vec<NodeIndex>,
-    /// Nodes strictly on the bbox boundary (subset of spawn_points) – for transit spawning.
+    /// Narrower edge band than `spawn_points` — used by `SpawnSystem` for transit / random O-D endpoints.
     pub boundary_nodes: Vec<NodeIndex>,
     /// OD buildings with type, centroid, access_node.
     pub od_buildings: Vec<OdBuilding>,
@@ -948,42 +950,16 @@ fn compute_bbox(graph: &RoadGraph) -> [f64; 4] {
     }
 }
 
-fn find_spawn_points(graph: &RoadGraph, bbox: &[f64; 4]) -> Vec<NodeIndex> {
+/// Nodes whose coordinates fall in an outer band of fraction `margin` (0..1) along the bbox edges.
+pub(crate) fn node_indices_in_bbox_margin(
+    graph: &RoadGraph,
+    bbox: &[f64; 4],
+    margin: f64,
+) -> Vec<NodeIndex> {
     let [min_lat, min_lng, max_lat, max_lng] = *bbox;
-    let lat_range = max_lat - min_lat;
-    let lng_range = max_lng - min_lng;
-    let margin = 0.05;
-
-    let mut spawn_points = Vec::new();
-    for idx in graph.node_indices() {
-        let n = &graph[idx];
-        let near_boundary = n.lat < min_lat + lat_range * margin
-            || n.lat > max_lat - lat_range * margin
-            || n.lng < min_lng + lng_range * margin
-            || n.lng > max_lng - lng_range * margin;
-
-        let degree = graph.edges(idx).count()
-            + graph.edges_directed(idx, petgraph::Direction::Incoming).count();
-        let is_junction = degree >= 3;
-
-        if near_boundary || is_junction {
-            spawn_points.push(idx);
-        }
-    }
-    if spawn_points.len() < 4 {
-        spawn_points = graph.node_indices().collect();
-    }
-    spawn_points
-}
-
-/// Nodes within the outermost 3 % of the bounding box – used for transit spawning.
-fn find_boundary_nodes(graph: &RoadGraph, bbox: &[f64; 4]) -> Vec<NodeIndex> {
-    let [min_lat, min_lng, max_lat, max_lng] = *bbox;
-    let lat_range = max_lat - min_lat;
-    let lng_range = max_lng - min_lng;
-    let margin = 0.03;
-
-    let boundary: Vec<NodeIndex> = graph
+    let lat_range = (max_lat - min_lat).max(1e-12);
+    let lng_range = (max_lng - min_lng).max(1e-12);
+    graph
         .node_indices()
         .filter(|&idx| {
             let n = &graph[idx];
@@ -992,13 +968,54 @@ fn find_boundary_nodes(graph: &RoadGraph, bbox: &[f64; 4]) -> Vec<NodeIndex> {
                 || n.lng < min_lng + lng_range * margin
                 || n.lng > max_lng - lng_range * margin
         })
-        .collect();
+        .collect()
+}
 
-    if boundary.is_empty() {
-        graph.node_indices().take(4).collect()
-    } else {
-        boundary
+fn road_graph_node_degree(graph: &RoadGraph, idx: NodeIndex) -> usize {
+    graph.edges(idx).count()
+        + graph
+            .edges_directed(idx, petgraph::Direction::Incoming)
+            .count()
+}
+
+/// Spawn / catalog points: **only** the geographic edge of the map, never interior junctions.
+pub(crate) fn find_spawn_points(graph: &RoadGraph, bbox: &[f64; 4]) -> Vec<NodeIndex> {
+    for margin in [0.05_f64, 0.08, 0.12, 0.18, 0.26] {
+        let pts = node_indices_in_bbox_margin(graph, bbox, margin);
+        if pts.len() >= 4 {
+            return pts;
+        }
     }
+    let mut pts = node_indices_in_bbox_margin(graph, bbox, 0.35);
+    if pts.len() < 4 {
+        let leaves: Vec<NodeIndex> = graph
+            .node_indices()
+            .filter(|&idx| road_graph_node_degree(graph, idx) == 1)
+            .collect();
+        if leaves.len() >= 4 {
+            return leaves;
+        }
+        pts = graph.node_indices().collect();
+    }
+    pts
+}
+
+/// Transit / fallback random O-D: edge band (tighter than spawn), then degree-1 stubs, then any nodes.
+pub(crate) fn find_boundary_nodes(graph: &RoadGraph, bbox: &[f64; 4]) -> Vec<NodeIndex> {
+    for margin in [0.03_f64, 0.06, 0.10, 0.15, 0.22] {
+        let v = node_indices_in_bbox_margin(graph, bbox, margin);
+        if v.len() >= 2 {
+            return v;
+        }
+    }
+    let leaves: Vec<NodeIndex> = graph
+        .node_indices()
+        .filter(|&idx| road_graph_node_degree(graph, idx) == 1)
+        .collect();
+    if leaves.len() >= 2 {
+        return leaves;
+    }
+    graph.node_indices().take(4).collect()
 }
 
 /// Turn class used for lane-connectivity rules.
@@ -1094,6 +1111,7 @@ pub fn populate_lane_graph(map: &mut MapData) {
                     points,
                     length_m: length_m.max(0.5),
                 },
+                connector_cubic_m: None,
                 width: lane_width_m,
                 connections: Vec::new(),
                 conflict_areas: Vec::new(),
@@ -1159,55 +1177,60 @@ pub fn populate_lane_graph(map: &mut MapData) {
         }
     }
 
-    // Build physical conflict areas from lane path intersections.
-    let lane_items: Vec<(LaneId, Vec<[f64; 2]>)> = lanes
-        .iter()
-        .map(|(id, lane)| (*id, lane.path.points.clone()))
-        .collect();
+    // Conflict areas: only intersections between two connector cubics (kurbo-flattened polylines).
+    for lane in lanes.values_mut() {
+        lane.conflict_areas.clear();
+    }
     let mut areas: HashMap<ConflictAreaId, ConflictArea> = HashMap::new();
     let mut next_conflict_id: ConflictAreaId = 1;
-    for i in 0..lane_items.len() {
-        for j in (i + 1)..lane_items.len() {
-            let (a_id, a_pts) = &lane_items[i];
-            let (b_id, b_pts) = &lane_items[j];
-            if a_pts.len() < 2 || b_pts.len() < 2 {
-                continue;
+    const FLATTEN_TOL: f64 = 0.22;
+    let connector_ids: Vec<LaneId> = lanes
+        .iter()
+        .filter(|(_, l)| l.edge_id == u64::MAX && l.connector_cubic_m.is_some())
+        .map(|(id, _)| *id)
+        .collect();
+    let mut polylines: HashMap<LaneId, Vec<(Point, Point)>> = HashMap::new();
+    for id in &connector_ids {
+        if let Some(l) = lanes.get(id) {
+            if let Some(c) = lane_connector_cubic(l) {
+                polylines.insert(*id, cubic_to_flat_segments(&c, FLATTEN_TOL));
             }
-            for wa in a_pts.windows(2) {
-                for wb in b_pts.windows(2) {
-                    let (a0x, a0y) = geo_to_m_xy(wa[0][0], wa[0][1]);
-                    let (a1x, a1y) = geo_to_m_xy(wa[1][0], wa[1][1]);
-                    let (b0x, b0y) = geo_to_m_xy(wb[0][0], wb[0][1]);
-                    let (b1x, b1y) = geo_to_m_xy(wb[1][0], wb[1][1]);
-                    let sa = Segment::new(Point2::new(a0x as f32, a0y as f32), Point2::new(a1x as f32, a1y as f32));
-                    let sb = Segment::new(Point2::new(b0x as f32, b0y as f32), Point2::new(b1x as f32, b1y as f32));
-                    let hits = intersection_test(
-                        &parry2d::na::Isometry2::identity(),
-                        &sa,
-                        &parry2d::na::Isometry2::identity(),
-                        &sb,
-                    ).unwrap_or(false);
-                    if !hits {
-                        continue;
+        }
+    }
+    for i in 0..connector_ids.len() {
+        for j in (i + 1)..connector_ids.len() {
+            let a_id = connector_ids[i];
+            let b_id = connector_ids[j];
+            let Some(sega) = polylines.get(&a_id) else { continue; };
+            let Some(segb) = polylines.get(&b_id) else { continue; };
+            let mut hits: Vec<(f64, f64)> = Vec::new();
+            for &(p0, p1) in sega {
+                for &(q0, q1) in segb {
+                    if let Some((x, y)) = segment_intersection_xy(
+                        (p0.x, p0.y, p1.x, p1.y),
+                        (q0.x, q0.y, q1.x, q1.y),
+                    ) {
+                        hits.push((x, y));
                     }
-                    let cx = (a0x + a1x + b0x + b1x) * 0.25;
-                    let cy = (a0y + a1y + b0y + b1y) * 0.25;
-                    let (clat, clng) = m_xy_to_geo(cx, cy);
-                    let cid = next_conflict_id;
-                    next_conflict_id += 1;
-                    areas.insert(cid, ConflictArea {
-                        id: cid,
-                        center_lat: clat,
-                        center_lng: clng,
-                        radius_m: 2.0,
-                        lane_ids: vec![*a_id, *b_id],
-                    });
-                    if let Some(la) = lanes.get_mut(a_id) {
-                        la.conflict_areas.push(cid);
-                    }
-                    if let Some(lb) = lanes.get_mut(b_id) {
-                        lb.conflict_areas.push(cid);
-                    }
+                }
+            }
+            merge_close_points(&mut hits, 2.5);
+            for (x, y) in hits {
+                let (clat, clng) = m_xy_to_geo(x, y);
+                let cid = next_conflict_id;
+                next_conflict_id += 1;
+                areas.insert(cid, ConflictArea {
+                    id: cid,
+                    center_lat: clat,
+                    center_lng: clng,
+                    radius_m: 2.0,
+                    lane_ids: vec![a_id, b_id],
+                });
+                if let Some(la) = lanes.get_mut(&a_id) {
+                    la.conflict_areas.push(cid);
+                }
+                if let Some(lb) = lanes.get_mut(&b_id) {
+                    lb.conflict_areas.push(cid);
                 }
             }
         }
@@ -1341,6 +1364,92 @@ fn m_xy_to_geo(x: f64, y: f64) -> (f64, f64) {
     (y / 111_320.0, x / 71_700.0)
 }
 
+/// Handle length (m) along incoming / outgoing tangents for connector cubics (matches sim / spec).
+pub const CONNECTOR_CUBIC_HANDLE_M: f64 = 5.0;
+/// Arc-length quadrature accuracy for connector cubics (sim + length_m).
+pub const CONNECTOR_ARCLEN_ACC: f64 = 0.08;
+/// Pull connector endpoints away from the junction node along each arm (metres).
+pub const CONNECTOR_ENDPOINT_INSET_M: f64 = 7.0;
+
+#[inline]
+pub fn lane_connector_cubic(lane: &Lane) -> Option<CubicBez> {
+    let c = lane.connector_cubic_m.as_ref()?;
+    Some(CubicBez::new(
+        Point::new(c[0][0], c[0][1]),
+        Point::new(c[1][0], c[1][1]),
+        Point::new(c[2][0], c[2][1]),
+        Point::new(c[3][0], c[3][1]),
+    ))
+}
+
+fn cubic_to_flat_segments(c: &CubicBez, tol: f64) -> Vec<(Point, Point)> {
+    let mut bez = BezPath::new();
+    bez.move_to(c.p0);
+    bez.curve_to(c.p1, c.p2, c.p3);
+    let mut out = Vec::new();
+    let mut cur: Option<Point> = None;
+    flatten(bez.path_elements(tol), tol, |el| match el {
+        PathEl::MoveTo(p) => {
+            cur = Some(p);
+        }
+        PathEl::LineTo(p) => {
+            if let Some(c0) = cur {
+                out.push((c0, p));
+                cur = Some(p);
+            }
+        }
+        PathEl::ClosePath | PathEl::QuadTo(_, _) | PathEl::CurveTo(_, _, _) => {}
+    });
+    out
+}
+
+/// Line–line intersection in metre space; `t`/`u` must lie in \[0,1\].
+fn segment_intersection_xy(
+    a: (f64, f64, f64, f64),
+    b: (f64, f64, f64, f64),
+) -> Option<(f64, f64)> {
+    let (x1, y1, x2, y2) = a;
+    let (x3, y3, x4, y4) = b;
+    let rx = x2 - x1;
+    let ry = y2 - y1;
+    let sx = x4 - x3;
+    let sy = y4 - y3;
+    let den = rx * sy - ry * sx;
+    if den.abs() < 1e-12 {
+        return None;
+    }
+    let t = ((x3 - x1) * sy - (y3 - y1) * sx) / den;
+    let u = ((x3 - x1) * ry - (y3 - y1) * rx) / den;
+    if t < -1e-5 || t > 1.0 + 1e-5 || u < -1e-5 || u > 1.0 + 1e-5 {
+        return None;
+    }
+    Some((x1 + t * rx, y1 + t * ry))
+}
+
+fn merge_close_points(pts: &mut Vec<(f64, f64)>, min_dist: f64) {
+    if pts.is_empty() {
+        return;
+    }
+    let mut out: Vec<(f64, f64)> = Vec::new();
+    for &(x, y) in pts.iter() {
+        let mut merged = false;
+        for m in out.iter_mut() {
+            let dx = m.0 - x;
+            let dy = m.1 - y;
+            if (dx * dx + dy * dy).sqrt() < min_dist {
+                m.0 = (m.0 + x) * 0.5;
+                m.1 = (m.1 + y) * 0.5;
+                merged = true;
+                break;
+            }
+        }
+        if !merged {
+            out.push((x, y));
+        }
+    }
+    *pts = out;
+}
+
 fn build_lane_connector(
     lanes: &HashMap<LaneId, Lane>,
     from_lane_id: LaneId,
@@ -1349,47 +1458,65 @@ fn build_lane_connector(
 ) -> Option<Lane> {
     let from = lanes.get(&from_lane_id)?;
     let to = lanes.get(&to_lane_id)?;
-    let p1 = *from.path.points.last()?;
-    let p2 = *to.path.points.first()?;
-    if p1 == p2 {
+    let p0_geo = *from.path.points.last()?;
+    let p3_geo = *to.path.points.first()?;
+    if p0_geo == p3_geo {
         return None;
     }
     let prev = if from.path.points.len() >= 2 {
         from.path.points[from.path.points.len() - 2]
     } else {
-        p1
+        p0_geo
     };
     let next = if to.path.points.len() >= 2 {
         to.path.points[1]
     } else {
-        p2
+        p3_geo
     };
-    let (p1x, p1y) = geo_to_m_xy(p1[0], p1[1]);
-    let (p2x, p2y) = geo_to_m_xy(p2[0], p2[1]);
+    let (mut p0x, mut p0y) = geo_to_m_xy(p0_geo[0], p0_geo[1]);
+    let (mut p3x, mut p3y) = geo_to_m_xy(p3_geo[0], p3_geo[1]);
     let (prx, pry) = geo_to_m_xy(prev[0], prev[1]);
     let (nx, ny) = geo_to_m_xy(next[0], next[1]);
-    let in_dir = normalize_xy(p1x - prx, p1y - pry);
-    let out_dir = normalize_xy(nx - p2x, ny - p2y);
-    let span = ((p2x - p1x).powi(2) + (p2y - p1y).powi(2)).sqrt().max(1.0);
-    let h = (span * 0.5).min(18.0);
-    let c1 = (p1x + in_dir.0 * h, p1y + in_dir.1 * h);
-    let c2 = (p2x - out_dir.0 * h, p2y - out_dir.1 * h);
-    let samples = cubic_bezier_samples((p1x, p1y), c1, c2, (p2x, p2y), 12);
-    let mut points = Vec::with_capacity(samples.len());
-    let mut length_m = 0.0f32;
-    let mut prev_xy: Option<(f64, f64)> = None;
-    for (x, y) in samples {
-        let (lat, lng) = m_xy_to_geo(x, y);
+    let in_dir = normalize_xy(p0x - prx, p0y - pry);
+    let out_dir = normalize_xy(nx - p3x, ny - p3y);
+    // Move endpoints off the junction: back along the incoming arm, forward on the outgoing arm.
+    let back_len = ((p0x - prx).powi(2) + (p0y - pry).powi(2)).sqrt();
+    let fwd_len = ((nx - p3x).powi(2) + (ny - p3y).powi(2)).sqrt();
+    let inset_back = CONNECTOR_ENDPOINT_INSET_M.min(back_len * 0.88).max(0.0);
+    let inset_fwd = CONNECTOR_ENDPOINT_INSET_M.min(fwd_len * 0.88).max(0.0);
+    p0x -= in_dir.0 * inset_back;
+    p0y -= in_dir.1 * inset_back;
+    p3x += out_dir.0 * inset_fwd;
+    p3y += out_dir.1 * inset_fwd;
+    let h = CONNECTOR_CUBIC_HANDLE_M;
+    let p0 = Point::new(p0x, p0y);
+    let p1 = Point::new(p0x + in_dir.0 * h, p0y + in_dir.1 * h);
+    let p2 = Point::new(p3x - out_dir.0 * h, p3y - out_dir.1 * h);
+    let p3 = Point::new(p3x, p3y);
+    let cubic = CubicBez::new(p0, p1, p2, p3);
+    let length_m = cubic.arclen(CONNECTOR_ARCLEN_ACC) as f32;
+
+    const SAMPLES: usize = 40;
+    let mut points = Vec::with_capacity(SAMPLES + 1);
+    for i in 0..=SAMPLES {
+        let t = i as f64 / SAMPLES as f64;
+        let p = cubic.eval(t);
+        let (lat, lng) = m_xy_to_geo(p.x, p.y);
         points.push([lat, lng]);
-        if let Some((px, py)) = prev_xy {
-            let seg = ((x - px).powi(2) + (y - py).powi(2)).sqrt() as f32;
-            length_m += seg;
-        }
-        prev_xy = Some((x, y));
     }
+    let connector_cubic_m = Some([
+        [p0.x, p0.y],
+        [p1.x, p1.y],
+        [p2.x, p2.y],
+        [p3.x, p3.y],
+    ]);
     Some(Lane {
         id: lane_id,
-        path: BezierPath { points, length_m: length_m.max(0.5) },
+        path: BezierPath {
+            points,
+            length_m: length_m.max(0.5),
+        },
+        connector_cubic_m,
         width: from.width.min(to.width),
         connections: Vec::new(),
         conflict_areas: Vec::new(),
@@ -1410,27 +1537,3 @@ fn normalize_xy(x: f64, y: f64) -> (f64, f64) {
     }
 }
 
-fn cubic_bezier_samples(
-    p0: (f64, f64),
-    p1: (f64, f64),
-    p2: (f64, f64),
-    p3: (f64, f64),
-    segments: usize,
-) -> Vec<(f64, f64)> {
-    let n = segments.max(4);
-    let mut out = Vec::with_capacity(n + 1);
-    for i in 0..=n {
-        let t = i as f64 / n as f64;
-        let u = 1.0 - t;
-        let x = u * u * u * p0.0
-            + 3.0 * u * u * t * p1.0
-            + 3.0 * u * t * t * p2.0
-            + t * t * t * p3.0;
-        let y = u * u * u * p0.1
-            + 3.0 * u * u * t * p1.1
-            + 3.0 * u * t * t * p2.1
-            + t * t * t * p3.1;
-        out.push((x, y));
-    }
-    out
-}

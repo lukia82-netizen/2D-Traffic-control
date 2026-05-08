@@ -12,7 +12,10 @@ use serde::Serialize;
 use petgraph::graph::{EdgeIndex, NodeIndex};
 use petgraph::visit::EdgeRef;
 
-use crate::map::road_network::{Lane, LaneId, MapData, IntersectionType};
+use kurbo::{ParamCurve, ParamCurveArclen, ParamCurveDeriv};
+use crate::map::road_network::{
+    lane_connector_cubic, Lane, LaneId, MapData, IntersectionType, CONNECTOR_ARCLEN_ACC,
+};
 use crate::state::SimCommand;
 use crate::time::game_clock::GameClock;
 use crate::time::day_cycle::DayCycle;
@@ -27,7 +30,6 @@ use crate::simulation::speed_config::SpeedConfig;
 use crate::simulation::tram_sim::TramSim;
 use crate::simulation::bezier_smooth::BezierPath;
 use glam::DVec2;
-use rstar::{AABB, PointDistance, RTree, RTreeObject};
 use parry2d::shape::{Segment, Cuboid, Ball};
 use parry2d::query::intersection_test;
 use parry2d::na::{Isometry2, Vector2};
@@ -60,7 +62,6 @@ const CONFLICT_SCAN_SAFETY_MARGIN_M: f32 = 12.0;
 const CONFLICT_TTL_STALLED_S: f32 = 10.0;
 const CONFLICT_RELEASE_CENTER_PAST_M: f32 = 1.0;
 const CONFLICT_OWNER_GHOST_DIST_M: f32 = 180.0;
-const RIGHT_HAND_CHECK_DIST_M: f32 = 15.0;
 const DEADLOCK_BREAK_S: f32 = 3.0;
 /// Physical lane half-width in metres used to offset Bezier P1/P2 from the
 
@@ -185,16 +186,8 @@ struct ConflictPath {
 #[derive(Debug, Clone)]
 struct IntersectionConflictData {
     by_movement: HashMap<LaneMovementKey, ConflictPath>,
-    incoming_cw: Vec<EdgeIndex>,
     deadlock_timer_s: f32,
     deadlock_first_move: Option<u32>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PriorityState {
-    Wait,
-    Clear,
-    FirstMove,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -230,28 +223,6 @@ struct IdmStepResult {
 #[derive(Debug, Clone, Default)]
 struct ConflictSystem {
     nodes: HashMap<NodeIndex, IntersectionConflictData>,
-}
-
-#[derive(Clone, Copy)]
-struct ApproachIndexItem {
-    pos: [f64; 2],
-    vehicle_idx: usize,
-}
-
-impl RTreeObject for ApproachIndexItem {
-    type Envelope = AABB<[f64; 2]>;
-
-    fn envelope(&self) -> Self::Envelope {
-        AABB::from_point(self.pos)
-    }
-}
-
-impl PointDistance for ApproachIndexItem {
-    fn distance_2(&self, point: &[f64; 2]) -> f64 {
-        let dx = self.pos[0] - point[0];
-        let dy = self.pos[1] - point[1];
-        dx * dx + dy * dy
-    }
 }
 
 pub fn run_simulation(
@@ -465,16 +436,6 @@ pub fn run_simulation(
                     None => HashMap::new(),
                 }
             };
-            let approach_items: Vec<ApproachIndexItem> = vehicles
-                .iter()
-                .enumerate()
-                .filter(|(_, v)| !v.on_turn_connector && v.route_pos < v.route.len())
-                .map(|(i, v)| {
-                    let (x, y) = geo_to_m_xy(v.lat, v.lng);
-                    ApproachIndexItem { pos: [x, y], vehicle_idx: i }
-                })
-                .collect();
-            let approach_tree = RTree::bulk_load(approach_items);
             {
                 let guard = graph_lock.read();
                 if let Some(map) = guard.as_ref() {
@@ -482,7 +443,7 @@ pub fn run_simulation(
                         map,
                         &vehicles,
                         &vehicles_by_target_node,
-                        &approach_tree,
+                        &intersections,
                         PHYSICS_DT,
                     );
                 }
@@ -510,7 +471,6 @@ pub fn run_simulation(
                                 map,
                                 &intersections,
                                 &conflict_system,
-                                &approach_tree,
                             )
                         })
                         .collect()
@@ -688,7 +648,6 @@ pub fn run_simulation(
                             &intersections,
                             &mut conflict_system,
                             &vehicles_by_target_node,
-                            &approach_tree,
                             &vehicles_snapshot,
                             &spawn_system.speed_config,
                             clock.game_time_s as f32,
@@ -1151,6 +1110,23 @@ fn sample_lane_path_at(lane: &Lane, dist_m: f32) -> Option<(f64, f64, f32)> {
     Some((last[0], last[1], (dx as f32).atan2(dy as f32)))
 }
 
+/// Connector motion along the stored kurbo [`CubicBez`] (arc-length parameterisation).
+fn sample_connector_kurbo_at(lane: &Lane, dist_m: f32) -> Option<(f64, f64, f32)> {
+    let cubic = lane_connector_cubic(lane)?;
+    let acc = CONNECTOR_ARCLEN_ACC;
+    let total = cubic.arclen(acc);
+    if total <= 1e-9 {
+        return None;
+    }
+    let s = (dist_m as f64).clamp(0.0, total);
+    let t = cubic.inv_arclen(s, acc);
+    let p = cubic.eval(t);
+    let d = cubic.deriv().eval(t);
+    let angle = (d.x as f32).atan2(d.y as f32);
+    let (lat, lng) = m_xy_to_geo(p.x, p.y);
+    Some((lat, lng, angle))
+}
+
 /// Build a `BezierPath` from three geographic control points (lat/lng).
 /// The curve is constructed in local Cartesian metres (x = east, y = north).
 #[inline]
@@ -1459,7 +1435,6 @@ fn apply_intersection_effect(
     base_obstacle: ClosestObstacle,
     intersections: &IntersectionManager,
     conflict_system: &ConflictSystem,
-    approach_tree: &RTree<ApproachIndexItem>,
     vehicles: &[Vehicle],
     map: &MapData,
 ) -> ClosestObstacle {
@@ -1491,63 +1466,26 @@ fn apply_intersection_effect(
         let half_len = vehicle.vehicle_type.params().length_m * 0.5;
         let dist_to_entry = (dist_to_entry_center - half_len).max(MIN_IDM_GAP_M);
         if dist_to_entry <= scan_dist {
-            let my_intent = movement_turn_intent(map, movement, tgt_node_idx);
-            let control = intersection_control_from_type(intersection_type);
-            let signal_state = signal_priority_state(vehicle, map, intersections);
-            // Cities-style hierarchy:
-            // Lights: on green ignore perpendicular approaches, keep only opposite-straight check for left turn.
-            // Uncontrolled: full right-hand scan.
-            let yield_target = match control {
-                IntersectionControl::Lights => {
-                    if signal_state == Some(true) && my_intent == TurnIntent::Left {
-                        conflict_system.is_yielding_to_opposite_straight(
-                            vehicle,
-                            vehicles,
-                            map,
-                            tgt_node_idx,
-                            movement,
-                            scan_dist.max(CONFLICT_LOOKAHEAD_M),
-                        )
-                    } else {
-                        None
-                    }
-                }
-                IntersectionControl::Uncontrolled => conflict_system.is_yielding_to_right(
-                    vehicle,
-                    vehicles,
-                    map,
-                    tgt_node_idx,
-                    movement,
-                    scan_dist.max(CONFLICT_LOOKAHEAD_M),
-                ),
-                IntersectionControl::Signs => None,
-            };
-            if let Some((yield_id, yield_pos)) = yield_target {
+            let deadlock_first = conflict_system
+                .nodes
+                .get(&tgt_node_idx)
+                .and_then(|d| d.deadlock_first_move);
+            if let Some((yield_id, yield_pos)) = conflict_system.cross_traffic_yield_target(
+                vehicle,
+                map,
+                vehicles,
+                intersections,
+                tgt_node_idx,
+                movement,
+                scan_dist,
+                deadlock_first,
+            ) {
                 let threat = ClosestObstacle {
                     kind: ObstacleKind::PriorityStopLine,
                     gap_m: dist_to_stop_line.max(MIN_IDM_GAP_M),
                     delta_v: vehicle.speed,
                     point_lng_lat: Some(yield_pos),
                     leader_vehicle_id: Some(yield_id),
-                    conflict_reserver_id: None,
-                };
-                best = min_obstacle(best, threat);
-            }
-            let pstate = conflict_system.check_priority(
-                vehicle,
-                movement.0,
-                tgt_node_idx,
-                map,
-                vehicles,
-                approach_tree,
-            );
-            if pstate == PriorityState::Wait {
-                let threat = ClosestObstacle {
-                    kind: ObstacleKind::PriorityStopLine,
-                    gap_m: dist_to_entry.min(best.gap_m).max(MIN_IDM_GAP_M),
-                    delta_v: vehicle.speed,
-                    point_lng_lat: Some([conn.p1_lng, conn.p1_lat]),
-                    leader_vehicle_id: None,
                     conflict_reserver_id: None,
                 };
                 best = min_obstacle(best, threat);
@@ -1921,7 +1859,6 @@ fn apply_vehicle_physics(
     intersections: &IntersectionManager,
     conflict_system: &mut ConflictSystem,
     _by_target_node: &HashMap<NodeIndex, Vec<usize>>,
-    approach_tree: &RTree<ApproachIndexItem>,
     vehicles: &[Vehicle],
     speed_cfg: &SpeedConfig,
     now_game_s: f32,
@@ -2046,9 +1983,13 @@ fn apply_vehicle_physics(
         // so the vehicle tracks the same path shown by the visual lane lines.
         let (total_len, new_pos) = if let Some(cid) = vehicle.connector_lane_id {
             if let Some(clane) = map.lanes.get(&cid) {
-                let total = clane.path.length_m as f64;
+                let total = lane_connector_cubic(clane)
+                    .map(|c| c.arclen(CONNECTOR_ARCLEN_ACC))
+                    .unwrap_or(clane.path.length_m as f64);
                 let dist  = (vehicle.turn_dist_m + vehicle.speed as f64 * real_dt_s as f64).min(total);
-                if let Some((lat, lng, angle)) = sample_lane_path_at(clane, dist as f32) {
+                let pos = sample_connector_kurbo_at(clane, dist as f32)
+                    .or_else(|| sample_lane_path_at(clane, dist as f32));
+                if let Some((lat, lng, angle)) = pos {
                     vehicle.lat   = lat;
                     vehicle.lng   = lng;
                     vehicle.angle = angle;
@@ -2170,15 +2111,19 @@ fn apply_vehicle_physics(
         }
         if let Some((movement, _)) = vehicle_next_movement(vehicle, map) {
             let lane_key = lane_movement_key_for_vehicle(vehicle, movement);
-            let pstate = conflict_system.check_priority(
+            let deadlock_first = conflict_system
+                .nodes
+                .get(&tgt_idx)
+                .and_then(|d| d.deadlock_first_move);
+            if conflict_system.waiting_on_cross_traffic_yield(
                 vehicle,
-                movement.0,
-                tgt_idx,
                 map,
                 vehicles,
-                approach_tree,
-            );
-            if pstate == PriorityState::Wait {
+                intersections,
+                tgt_idx,
+                movement,
+                deadlock_first,
+            ) {
                 can_enter_connector = false;
             } else if !has_exit_space_after_intersection(vehicle, map, vehicles) {
                 can_enter_connector = false;
@@ -2232,7 +2177,7 @@ fn apply_vehicle_physics(
             // Use the polyline when we have a precomputed connector lane, else fall back to bezier.
             let placed = if let Some(cid) = vehicle.connector_lane_id {
                 map.lanes.get(&cid)
-                    .and_then(|cl| sample_lane_path_at(cl, 0.0))
+                    .and_then(|cl| sample_connector_kurbo_at(cl, 0.0).or_else(|| sample_lane_path_at(cl, 0.0)))
                     .map(|(lat0, lng0, angle0)| {
                         vehicle.lat   = lat0;
                         vehicle.lng   = lng0;
@@ -2316,21 +2261,6 @@ struct PlannedTurnConnector {
 }
 
 #[inline]
-fn is_major_road(road_type: &str) -> bool {
-    matches!(road_type, "motorway" | "trunk" | "primary" | "secondary")
-}
-
-#[inline]
-fn right_incoming_edge(incoming_cw: &[EdgeIndex], ego_in: EdgeIndex) -> Option<EdgeIndex> {
-    let idx = incoming_cw.iter().position(|&e| e == ego_in)?;
-    if incoming_cw.is_empty() {
-        return None;
-    }
-    let right_idx = if idx == 0 { incoming_cw.len() - 1 } else { idx - 1 };
-    incoming_cw.get(right_idx).copied()
-}
-
-#[inline]
 fn vehicle_path_radius_m(vehicle: &Vehicle) -> f32 {
     let p = vehicle.vehicle_type.params();
     0.5 * (p.length_m * p.length_m + p.width_m * p.width_m).sqrt()
@@ -2402,7 +2332,6 @@ fn compute_vehicle_idm_step(
     map: &MapData,
     intersections: &IntersectionManager,
     conflict_system: &ConflictSystem,
-    approach_tree: &RTree<ApproachIndexItem>,
 ) -> IdmStepResult {
     let desired = compute_desired_speed(ego, map);
 
@@ -2450,7 +2379,6 @@ fn compute_vehicle_idm_step(
         base_obstacle,
         intersections,
         conflict_system,
-        approach_tree,
         vehicles,
         map,
     );
@@ -2668,6 +2596,88 @@ impl ConflictSystem {
         best.map(|(_, id, pos)| (id, pos))
     }
 
+    /// Single rule for “give way to cross traffic” at a node:
+    /// - **Uncontrolled:** yield to traffic from the right (`is_yielding_to_right`).
+    /// - **Lights (green):** left turn yields to opposite straight only.
+    /// - **Stop / yield signs:** no extra cross-traffic scan here (handled by stop/yield IDM).
+    ///
+    /// `deadlock_first_mover`: when set to this vehicle’s id, skip yield (deadlock breaker).
+    fn cross_traffic_yield_target(
+        &self,
+        vehicle: &Vehicle,
+        map: &MapData,
+        vehicles: &[Vehicle],
+        intersections: &IntersectionManager,
+        node_idx: NodeIndex,
+        movement: (EdgeIndex, EdgeIndex),
+        scan_dist_m: f32,
+        deadlock_first_mover: Option<u32>,
+    ) -> Option<(u32, [f64; 2])> {
+        if deadlock_first_mover == Some(vehicle.id) {
+            return None;
+        }
+        let intersection_type = &map.graph[node_idx].intersection_type;
+        let control = intersection_control_from_type(intersection_type);
+        let look = scan_dist_m.max(CONFLICT_LOOKAHEAD_M);
+        match control {
+            IntersectionControl::Uncontrolled => self.is_yielding_to_right(
+                vehicle,
+                vehicles,
+                map,
+                node_idx,
+                movement,
+                look,
+            ),
+            IntersectionControl::Lights => {
+                if movement_turn_intent(map, movement, node_idx) != TurnIntent::Left {
+                    return None;
+                }
+                let tgt_osm_id = map.graph[node_idx].osm_id;
+                if !intersections.can_vehicle_proceed(
+                    tgt_osm_id,
+                    vehicle.has_stopped_at_stop_sign,
+                    vehicle,
+                    map,
+                ) {
+                    return None;
+                }
+                self.is_yielding_to_opposite_straight(
+                    vehicle,
+                    vehicles,
+                    map,
+                    node_idx,
+                    movement,
+                    look,
+                )
+            }
+            IntersectionControl::Signs => None,
+        }
+    }
+
+    #[inline]
+    fn waiting_on_cross_traffic_yield(
+        &self,
+        vehicle: &Vehicle,
+        map: &MapData,
+        vehicles: &[Vehicle],
+        intersections: &IntersectionManager,
+        node_idx: NodeIndex,
+        movement: (EdgeIndex, EdgeIndex),
+        deadlock_first_mover: Option<u32>,
+    ) -> bool {
+        self.cross_traffic_yield_target(
+            vehicle,
+            map,
+            vehicles,
+            intersections,
+            node_idx,
+            movement,
+            conflict_scan_distance_m(vehicle),
+            deadlock_first_mover,
+        )
+        .is_some()
+    }
+
     fn path_has_foreign_reservation(
         &self,
         movement: LaneMovementKey,
@@ -2722,13 +2732,17 @@ impl ConflictSystem {
         map: &MapData,
         vehicles: &[Vehicle],
         by_target_node: &HashMap<NodeIndex, Vec<usize>>,
-        approach_tree: &RTree<ApproachIndexItem>,
+        intersections: &IntersectionManager,
         dt_s: f32,
     ) {
-        for (node_idx, data) in self.nodes.iter_mut() {
-            let Some(candidates) = by_target_node.get(node_idx) else {
-                data.deadlock_timer_s = 0.0;
-                data.deadlock_first_move = None;
+        let node_indices: Vec<NodeIndex> = self.nodes.keys().copied().collect();
+        for node_idx in node_indices {
+            let forced_first = self.nodes.get(&node_idx).and_then(|d| d.deadlock_first_move);
+            let Some(candidates) = by_target_node.get(&node_idx) else {
+                if let Some(data) = self.nodes.get_mut(&node_idx) {
+                    data.deadlock_timer_s = 0.0;
+                    data.deadlock_first_move = None;
+                }
                 continue;
             };
             let waiting: Vec<u32> = candidates
@@ -2738,101 +2752,47 @@ impl ConflictSystem {
                     if v.route_pos + 1 >= v.route.len() || v.on_turn_connector {
                         return None;
                     }
-                        let in_edge = v.route[v.route_pos];
-                        let edge = map.graph.edge_weight(in_edge)?;
-                        let dist_to_end = edge.length_m * (1.0 - v.edge_progress);
-                        let dist_to_stop_line =
-                            distance_to_stop_line_from_front_bumper(v, dist_to_end);
-                        let waiting_on_stop_line = v.speed < 0.35 && dist_to_stop_line <= 2.0;
-                        let waits_priority = Self::check_priority_for_node(
-                            data,
-                            v,
-                            in_edge,
-                            *node_idx,
-                            map,
-                            vehicles,
-                            approach_tree,
-                        ) == PriorityState::Wait;
-                        if waiting_on_stop_line && waits_priority {
-                            Some(v.id)
-                        } else {
-                            None
-                        }
+                    let movement = (v.route[v.route_pos], v.route[v.route_pos + 1]);
+                    let in_edge = movement.0;
+                    let edge = map.graph.edge_weight(in_edge)?;
+                    let dist_to_end = edge.length_m * (1.0 - v.edge_progress);
+                    let dist_to_stop_line =
+                        distance_to_stop_line_from_front_bumper(v, dist_to_end);
+                    let waiting_on_stop_line = v.speed < 0.35 && dist_to_stop_line <= 2.0;
+                    let waits_yield = self.waiting_on_cross_traffic_yield(
+                        v,
+                        map,
+                        vehicles,
+                        intersections,
+                        node_idx,
+                        movement,
+                        forced_first,
+                    );
+                    if waiting_on_stop_line && waits_yield {
+                        Some(v.id)
+                    } else {
+                        None
+                    }
                 })
                 .collect();
-            if waiting.len() >= 2 {
-                data.deadlock_timer_s += dt_s;
-                if data.deadlock_timer_s >= DEADLOCK_BREAK_S {
-                    let next = waiting.iter().copied().min();
-                    if data.deadlock_first_move != next {
-                        if let Some(force_id) = next {
-                            log::info!("DEADLOCK DETECTED - Forcing Car {} to move", force_id);
+            if let Some(data) = self.nodes.get_mut(&node_idx) {
+                if waiting.len() >= 2 {
+                    data.deadlock_timer_s += dt_s;
+                    if data.deadlock_timer_s >= DEADLOCK_BREAK_S {
+                        let next = waiting.iter().copied().min();
+                        if data.deadlock_first_move != next {
+                            if let Some(force_id) = next {
+                                log::info!("DEADLOCK DETECTED - Forcing Car {} to move", force_id);
+                            }
                         }
+                        data.deadlock_first_move = next;
                     }
-                    data.deadlock_first_move = next;
+                } else {
+                    data.deadlock_timer_s = 0.0;
+                    data.deadlock_first_move = None;
                 }
-            } else {
-                data.deadlock_timer_s = 0.0;
-                data.deadlock_first_move = None;
             }
         }
-    }
-
-    fn check_priority(
-        &self,
-        vehicle: &Vehicle,
-        in_edge: EdgeIndex,
-        node_idx: NodeIndex,
-        map: &MapData,
-        vehicles: &[Vehicle],
-        approach_tree: &RTree<ApproachIndexItem>,
-    ) -> PriorityState {
-        let Some(node_data) = self.nodes.get(&node_idx) else {
-            return PriorityState::Clear;
-        };
-        Self::check_priority_for_node(node_data, vehicle, in_edge, node_idx, map, vehicles, approach_tree)
-    }
-
-    fn check_priority_for_node(
-        node_data: &IntersectionConflictData,
-        vehicle: &Vehicle,
-        in_edge: EdgeIndex,
-        node_idx: NodeIndex,
-        map: &MapData,
-        vehicles: &[Vehicle],
-        approach_tree: &RTree<ApproachIndexItem>,
-    ) -> PriorityState {
-        if node_data.deadlock_first_move == Some(vehicle.id) {
-            return PriorityState::FirstMove;
-        }
-        let Some(right_edge) = right_incoming_edge(&node_data.incoming_cw, in_edge) else {
-            return PriorityState::Clear;
-        };
-        let in_road = map.graph.edge_weight(in_edge).map(|e| e.road_type.as_str()).unwrap_or("tertiary");
-        let ego_major = is_major_road(in_road);
-        let center = &map.graph[node_idx];
-        let (cx, cy) = geo_to_m_xy(center.lat, center.lng);
-        let search = [cx, cy];
-        for item in approach_tree.locate_within_distance(search, RIGHT_HAND_CHECK_DIST_M as f64) {
-            let Some(other) = vehicles.get(item.vehicle_idx) else { continue; };
-            if other.id == vehicle.id || other.route_pos >= other.route.len() || other.on_turn_connector {
-                continue;
-            }
-            let other_edge = other.route[other.route_pos];
-            if other_edge != right_edge {
-                continue;
-            }
-            let other_road = map.graph.edge_weight(other_edge).map(|e| e.road_type.as_str()).unwrap_or("tertiary");
-            let other_major = is_major_road(other_road);
-            if ego_major && !other_major {
-                continue;
-            }
-            if !ego_major && other_major {
-                return PriorityState::Wait;
-            }
-            return PriorityState::Wait;
-        }
-        PriorityState::Clear
     }
 
     fn first_blocking_conflict_distance(
@@ -3086,10 +3046,12 @@ fn find_connector_lane_id(
     let out_lane_id = *map.lane_by_edge_lane.get(&(out_edge.index(), out_lane))?;
     let in_lane_obj = map.lanes.get(&in_lane_id)?;
     for &conn_id in &in_lane_obj.connections {
-        let conn = map.lanes.get(&conn_id)?;
-        // Connector lanes carry edge_id == u64::MAX and connect to the target lane.
-        if conn.edge_id == u64::MAX && conn.connections.first() == Some(&out_lane_id) {
-            return Some(conn_id);
+        // Use if-let so a missing lane doesn't abort the entire search.
+        if let Some(conn) = map.lanes.get(&conn_id) {
+            // Connector lanes carry edge_id == u64::MAX and link to the target lane.
+            if conn.edge_id == u64::MAX && conn.connections.first() == Some(&out_lane_id) {
+                return Some(conn_id);
+            }
         }
     }
     None
@@ -3110,11 +3072,14 @@ fn planned_turn_connector(vehicle: &Vehicle, map: &MapData) -> Option<PlannedTur
                 let p1  = pts[0];
                 let p2  = *pts.last().unwrap();
                 let mid = pts[pts.len() / 2];
+                let length_m = lane_connector_cubic(clane)
+                    .map(|c| c.arclen(CONNECTOR_ARCLEN_ACC) as f32)
+                    .unwrap_or(clane.path.length_m);
                 return Some(PlannedTurnConnector {
                     // Connector starts exactly at the end of the incoming lane (junction node).
                     entry_progress: 1.0,
                     exit_progress:  0.0,
-                    length_m:       clane.path.length_m,
+                    length_m,
                     p1_lat:   p1[0],  p1_lng:   p1[1],
                     ctrl_lat: mid[0], ctrl_lng: mid[1],
                     p2_lat:   p2[0],  p2_lng:   p2[1],
@@ -3255,12 +3220,6 @@ fn build_conflict_system(map: &MapData) -> ConflictSystem {
         if incoming.len() < 2 || outgoing.is_empty() {
             continue;
         }
-        let mut incoming_cw = incoming.clone();
-        incoming_cw.sort_by(|a, b| {
-            let aa = approach_angle_to_node(map, *a, node);
-            let bb = approach_angle_to_node(map, *b, node);
-            bb.partial_cmp(&aa).unwrap_or(Ordering::Equal)
-        });
         let mut by_movement: HashMap<LaneMovementKey, ConflictPath> = HashMap::new();
         let mut next_cp_id: u64 = 1;
         for &in_edge in &incoming {
@@ -3284,23 +3243,11 @@ fn build_conflict_system(map: &MapData) -> ConflictSystem {
         build_conflicts_for_node(&mut by_movement, &mut next_cp_id);
         nodes.insert(node, IntersectionConflictData {
             by_movement,
-            incoming_cw,
             deadlock_timer_s: 0.0,
             deadlock_first_move: None,
         });
     }
     ConflictSystem { nodes }
-}
-
-fn approach_angle_to_node(map: &MapData, in_edge: EdgeIndex, node: NodeIndex) -> f64 {
-    let Some((src, tgt)) = map.graph.edge_endpoints(in_edge) else { return 0.0; };
-    if tgt != node {
-        return 0.0;
-    }
-    let s = &map.graph[src];
-    let n = &map.graph[node];
-    let (dx, dy) = (n.lng - s.lng, n.lat - s.lat);
-    dy.atan2(dx)
 }
 
 fn build_conflicts_for_node(by_movement: &mut HashMap<LaneMovementKey, ConflictPath>, next_cp_id: &mut u64) {

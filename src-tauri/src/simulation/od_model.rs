@@ -159,6 +159,10 @@ impl OdModel {
 
     /// Generate an OD pair for the given game hour.
     /// Returns `(origin_node, dest_node, TripKind)` or `None` if no valid pair.
+    ///
+    /// Endpoints are each building's road `access_node` (nearest graph vertex to the footprint).
+    /// Those nodes are not restricted to the map bbox edge. For edge-only O/D, the spawn layer
+    /// uses `MapData::boundary_nodes` (transit, random fallback, and one side of external trips).
     pub fn generate_od_pair(
         &self,
         game_hour: f32,

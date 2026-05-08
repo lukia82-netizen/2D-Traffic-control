@@ -7,7 +7,8 @@ use petgraph::graph::NodeIndex;
 use streets_reader::osm_to_street_network;
 
 use crate::map::road_network::{
-    InfraType, IntersectionType, MapData, RoadEdge, RoadGraph, RoadNode,
+    find_boundary_nodes, find_spawn_points, InfraType, IntersectionType, MapData, RoadEdge,
+    RoadGraph, RoadNode,
 };
 use crate::map::tram_network::TramData;
 use crate::simulation::bezier_smooth::BezierPath;
@@ -272,55 +273,6 @@ fn build_lane_directions(lanes: u8) -> Vec<crate::map::road_network::LaneDirecti
             dirs.push(LaneDirection::Right);
             dirs
         }
-    }
-}
-
-fn find_spawn_points(graph: &RoadGraph, bbox: &[f64; 4]) -> Vec<NodeIndex> {
-    let [min_lat, min_lng, max_lat, max_lng] = *bbox;
-    let lat_range = max_lat - min_lat;
-    let lng_range = max_lng - min_lng;
-    let margin = 0.05;
-    let mut spawn_points = Vec::new();
-    for idx in graph.node_indices() {
-        let n = &graph[idx];
-        let near_boundary = n.lat < min_lat + lat_range * margin
-            || n.lat > max_lat - lat_range * margin
-            || n.lng < min_lng + lng_range * margin
-            || n.lng > max_lng - lng_range * margin;
-        let degree = graph.edges(idx).count()
-            + graph
-                .edges_directed(idx, petgraph::Direction::Incoming)
-                .count();
-        if near_boundary || degree >= 3 {
-            spawn_points.push(idx);
-        }
-    }
-    if spawn_points.len() < 4 {
-        graph.node_indices().collect()
-    } else {
-        spawn_points
-    }
-}
-
-fn find_boundary_nodes(graph: &RoadGraph, bbox: &[f64; 4]) -> Vec<NodeIndex> {
-    let [min_lat, min_lng, max_lat, max_lng] = *bbox;
-    let lat_range = max_lat - min_lat;
-    let lng_range = max_lng - min_lng;
-    let margin = 0.03;
-    let boundary: Vec<NodeIndex> = graph
-        .node_indices()
-        .filter(|&idx| {
-            let n = &graph[idx];
-            n.lat < min_lat + lat_range * margin
-                || n.lat > max_lat - lat_range * margin
-                || n.lng < min_lng + lng_range * margin
-                || n.lng > max_lng - lng_range * margin
-        })
-        .collect();
-    if boundary.is_empty() {
-        graph.node_indices().take(4).collect()
-    } else {
-        boundary
     }
 }
 

@@ -213,6 +213,7 @@ export class Game {
   private obbDebugMode: ObbDebugMode = 'visual';
   private latestDebugVisualization: DebugVisualizationPayload | null = null;
   private turnConnectorGfx: PIXI.Graphics | null = null;
+  private conflictGfx: PIXI.Graphics | null = null;
   private turnConnectorPaths: TurnConnectorPath[] = [];
   private showTurnConnectors = false;
   private showTurnConnectorsActiveOnly = false;
@@ -283,11 +284,13 @@ export class Game {
     this.gameClockUI = new GameClockUI();
     this.debugRouteGfx = new PIXI.Graphics();
     this.turnConnectorGfx = new PIXI.Graphics();
+    this.conflictGfx = new PIXI.Graphics();
     this.debugVizGfx = new PIXI.Graphics();
     this.laneLinesGfx = new PIXI.Graphics();
     this.debugConflictLabels = new PIXI.Container();
     this.overlay.congestionLayer.addChild(this.debugRouteGfx);
     this.overlay.congestionLayer.addChild(this.turnConnectorGfx);
+    this.overlay.congestionLayer.addChild(this.conflictGfx);
     this.overlay.congestionLayer.addChild(this.debugVizGfx);
     this.overlay.congestionLayer.addChild(this.laneLinesGfx);
     this.overlay.congestionLayer.addChild(this.debugConflictLabels);
@@ -369,6 +372,7 @@ export class Game {
         this.redrawSelectedRoute();
         this.redrawTurnConnectors();
         this.redrawLaneLines();
+        this.redrawConflictAreas();
         if (this.debugVisualizationEnabled && this.latestDebugVisualization) {
           this.redrawFullDebugVisualization();
         }
@@ -515,7 +519,11 @@ export class Game {
     ui.onLaneLinesToggle = (enabled) => {
       this.showLaneLines = enabled;
       if (this.laneLinesGfx) this.laneLinesGfx.visible = enabled;
+      if (this.turnConnectorGfx) this.turnConnectorGfx.visible = enabled;
+      if (this.conflictGfx) this.conflictGfx.visible = enabled;
       this.redrawLaneLines();
+      this.redrawTurnConnectors();
+      this.redrawConflictAreas();
     };
     ui.setChecked('turn-connectors', this.showTurnConnectors);
     ui.setChecked('turn-connectors-active-only', this.showTurnConnectorsActiveOnly);
@@ -572,6 +580,7 @@ export class Game {
     this.rebuildTurnConnectorPaths();
     this.redrawTurnConnectors();
     this.redrawLaneLines();
+    this.redrawConflictAreas();
     this.editorOverlay.setEnabled(this.editorMode);
     this.editorOverlay.redrawHandles(this.mapData);
     this.mapScenarioEditorUI?.setMapData(this.mapData);
@@ -624,6 +633,7 @@ export class Game {
     this.rebuildTurnConnectorPaths();
     this.redrawTurnConnectors();
     this.redrawLaneLines();
+    this.redrawConflictAreas();
     this.mapScenarioEditorUI?.setMapData(this.mapData);
 
     this.sandboxUI?.setLoadingDone(cityName, sizeM);
@@ -668,6 +678,7 @@ export class Game {
     this.rebuildTurnConnectorPaths();
     this.redrawTurnConnectors();
     this.redrawLaneLines();
+    this.redrawConflictAreas();
     this.editorOverlay.redrawHandles(mapData);
   }
 
@@ -1282,46 +1293,27 @@ export class Game {
     const gfx = this.turnConnectorGfx;
     if (!gfx) return;
     gfx.clear();
-    if (!this.showTurnConnectors || this.turnConnectorPaths.length === 0) return;
+    if (!this.showLaneLines || this.turnConnectorPaths.length === 0) return;
 
     const activeVehicles = [...this.vehicles.values()].filter((v) => v.onTurnConnector);
+    const activePaths = this.turnConnectorPaths.filter((p) =>
+      this.connectorPathIsActive(p.points, activeVehicles),
+    );
+    if (activePaths.length === 0) return;
 
+    // Active-connector highlight — bright cyan glow drawn on top of the base lane lines.
     const toScreen = (pts: [number, number][]) =>
       pts.map(([lng, lat]) => this.map.project([lng, lat]));
-
     const drawScreenPath = (screenPts: { x: number; y: number }[]): void => {
       if (screenPts.length < 2) return;
       gfx.moveTo(screenPts[0].x, screenPts[0].y);
       for (let i = 1; i < screenPts.length; i++) gfx.lineTo(screenPts[i].x, screenPts[i].y);
     };
 
-    // Draw all (or only active) connector lanes with identical style to straight lane lines.
-    for (const path of this.turnConnectorPaths) {
-      if (this.showTurnConnectorsActiveOnly && !this.connectorPathIsActive(path.points, activeVehicles)) continue;
-      const screenPts = toScreen(path.points);
-      // Same colour rule as redrawLaneLines: A→B yellow, B→A green.
-      const color = path.fromNodeOsmId <= path.toNodeOsmId ? 0xfacc15 : 0x22c55e;
-      drawScreenPath(screenPts);
-      gfx.stroke({ color, alpha: 0.94, width: 2.2 });
-      this.drawArrowsAlongPath(gfx, screenPts, color);
-    }
-
-    // Active-connector highlight overlay — bright cyan glow on top.
-    const activePaths = this.turnConnectorPaths.filter((p) =>
-      this.connectorPathIsActive(p.points, activeVehicles),
-    );
-    if (activePaths.length > 0) {
-      for (const path of activePaths) {
-        const screenPts = toScreen(path.points);
-        drawScreenPath(screenPts);
-      }
-      gfx.stroke({ color: 0x111827, alpha: 0.7, width: 7 });
-      for (const path of activePaths) {
-        const screenPts = toScreen(path.points);
-        drawScreenPath(screenPts);
-      }
-      gfx.stroke({ color: 0x22d3ee, alpha: 0.9, width: 3.0 });
-    }
+    for (const path of activePaths) drawScreenPath(toScreen(path.points));
+    gfx.stroke({ color: 0x111827, alpha: 0.7, width: 7 });
+    for (const path of activePaths) drawScreenPath(toScreen(path.points));
+    gfx.stroke({ color: 0x22d3ee, alpha: 0.9, width: 3.0 });
   }
 
   /** Draw direction arrows along a polyline on the given Graphics object. */
@@ -1372,15 +1364,35 @@ export class Game {
 
     for (const lane of this.mapData.lanes) {
       if (!lane.points || lane.points.length < 2) continue;
-      // Connector (junction arc) lanes are rendered by redrawTurnConnectors — skip here.
-      if (lane.isConnector) continue;
       // Opposite directions on the same physical road get distinct colours.
+      // Connector lanes use the same rule (fromNodeOsmId of the incoming road).
       const color = lane.fromNodeOsmId <= lane.toNodeOsmId ? 0xfacc15 : 0x22c55e;
       const screenPts = lane.points.map((p) => this.map.project([p[1], p[0]]));
       gfx.moveTo(screenPts[0].x, screenPts[0].y);
       for (let i = 1; i < screenPts.length; i++) gfx.lineTo(screenPts[i].x, screenPts[i].y);
       gfx.stroke({ color, alpha: 0.94, width: 2.2 });
       this.drawArrowsAlongPath(gfx, screenPts, color);
+    }
+  }
+
+  /** Draw red dots at every ConflictArea (where two connector paths physically cross). */
+  private redrawConflictAreas(): void {
+    const gfx = this.conflictGfx;
+    if (!gfx) return;
+    gfx.clear();
+    if (!this.showLaneLines || !this.mapData) return;
+    const connectorLaneIds = new Set(
+      this.mapData.lanes.filter((l) => l.isConnector).map((l) => l.id),
+    );
+    for (const area of this.mapData.conflictAreas) {
+      // Only show conflict areas that involve at least one connector lane.
+      const hasConnector = area.laneIds.some((id) => connectorLaneIds.has(id));
+      if (!hasConnector) continue;
+      const pt = this.map.project([area.centerLng, area.centerLat]);
+      gfx.circle(pt.x, pt.y, 5);
+      gfx.fill({ color: 0xef4444, alpha: 0.9 });
+      gfx.circle(pt.x, pt.y, 5);
+      gfx.stroke({ color: 0xffffff, alpha: 0.8, width: 1.2 });
     }
   }
 
