@@ -12,7 +12,7 @@ use serde::Serialize;
 use petgraph::graph::{EdgeIndex, NodeIndex};
 use petgraph::visit::EdgeRef;
 
-use crate::map::road_network::{MapData, IntersectionType};
+use crate::map::road_network::{Lane, MapData, IntersectionType};
 use crate::state::SimCommand;
 use crate::time::game_clock::GameClock;
 use crate::time::day_cycle::DayCycle;
@@ -1117,6 +1117,40 @@ fn m_xy_to_geo(x_m: f64, y_m: f64) -> (f64, f64) {
     (y_m / GEO_LAT_M, x_m / GEO_LNG_M)
 }
 
+fn sample_lane_path_at(lane: &Lane, dist_m: f32) -> Option<(f64, f64, f32)> {
+    let pts = &lane.path.points;
+    if pts.len() < 2 {
+        return None;
+    }
+    if lane.path.length_m <= 0.01 {
+        let a = pts[0];
+        let b = pts[1];
+        let (dx, dy) = normalize_xy((b[1] - a[1]) * GEO_LNG_M, (b[0] - a[0]) * GEO_LAT_M);
+        return Some((a[0], a[1], (dx as f32).atan2(dy as f32)));
+    }
+    let mut rem = dist_m.clamp(0.0, lane.path.length_m) as f64;
+    for seg in pts.windows(2) {
+        let a = seg[0];
+        let b = seg[1];
+        let seg_len = geo_dist_approx(a[0], a[1], b[0], b[1]) as f64;
+        if seg_len <= 1e-6 {
+            continue;
+        }
+        if rem <= seg_len {
+            let t = rem / seg_len;
+            let lat = a[0] + (b[0] - a[0]) * t;
+            let lng = a[1] + (b[1] - a[1]) * t;
+            let (dx, dy) = normalize_xy((b[1] - a[1]) * GEO_LNG_M, (b[0] - a[0]) * GEO_LAT_M);
+            return Some((lat, lng, (dx as f32).atan2(dy as f32)));
+        }
+        rem -= seg_len;
+    }
+    let last = pts[pts.len() - 1];
+    let prev = pts[pts.len() - 2];
+    let (dx, dy) = normalize_xy((last[1] - prev[1]) * GEO_LNG_M, (last[0] - prev[0]) * GEO_LAT_M);
+    Some((last[0], last[1], (dx as f32).atan2(dy as f32)))
+}
+
 /// Build a `BezierPath` from three geographic control points (lat/lng).
 /// The curve is constructed in local Cartesian metres (x = east, y = north).
 #[inline]
@@ -2192,30 +2226,33 @@ fn apply_vehicle_physics(
         vehicle.target_lane = compute_vehicle_target_lane(vehicle, map);
     }
 
-    // Lane-based linear position interpolation (straight road segments only):
-    // centerline point + right-normal * lane_center_offset.
+    // Full lane graph path following: sample directly from physical lane path.
+    let lane_id = vehicle.current_lane_id.or_else(|| {
+        map.lanes
+            .values()
+            .find(|l| l.edge_id == edge_idx.index() as u64 && l.lane_index == vehicle.current_lane)
+            .map(|l| l.id)
+    });
+    if let Some(lid) = lane_id {
+        if let Some(lane) = map.lanes.get(&lid) {
+            vehicle.current_lane_id = Some(lid);
+            vehicle.lane_progress_m = (vehicle.edge_progress * lane.path.length_m).clamp(0.0, lane.path.length_m);
+            if let Some((lat, lng, angle)) = sample_lane_path_at(lane, vehicle.lane_progress_m) {
+                vehicle.lat = lat;
+                vehicle.lng = lng;
+                vehicle.angle = angle;
+                return;
+            }
+        }
+    }
+    // Fallback for malformed lane graph data.
     let src = &map.graph[src_idx];
     let tgt = &map.graph[tgt_idx];
     let t   = vehicle.edge_progress as f64;
-    let (sx, sy) = geo_to_m_xy(src.lat, src.lng);
-    let (tx, ty) = geo_to_m_xy(tgt.lat, tgt.lng);
-    let bx = sx + (tx - sx) * t;
-    let by = sy + (ty - sy) * t;
-    let (dir_x, dir_y) = normalize_xy(tx - sx, ty - sy);
-    let right_x = dir_y;
-    let right_y = -dir_x;
-    let edge_w = map.graph.edge_weight(edge_idx);
-    let lane_shift_m = if let Some(w) = edge_w {
-        lane_center_offset_m(vehicle.current_lane, w.lanes.max(1), w.oneway)
-    } else {
-        0.0
-    };
-    let px = bx + right_x * lane_shift_m;
-    let py = by + right_y * lane_shift_m;
-    let (lat, lng) = m_xy_to_geo(px, py);
-    vehicle.lat = lat;
-    vehicle.lng = lng;
-    vehicle.angle = (dir_x as f32).atan2(dir_y as f32);
+    vehicle.lat = src.lat + (tgt.lat - src.lat) * t;
+    vehicle.lng = src.lng + (tgt.lng - src.lng) * t;
+    let (dx, dy) = normalize_xy((tgt.lng - src.lng) * GEO_LNG_M, (tgt.lat - src.lat) * GEO_LAT_M);
+    vehicle.angle = (dx as f32).atan2(dy as f32);
 }
 
 #[derive(Debug, Clone)]
@@ -3295,7 +3332,7 @@ fn bezier_length_m(
 
 /// Serialise all vehicles (including trams) into a packed binary buffer.
 ///
-/// Per-vehicle layout (40 bytes):
+/// Per-vehicle layout (48 bytes):
 /// ```text
 ///   [0..3]   id:              u32  LE
 ///   [4..11]  lat:             f64  LE  ← full double precision
@@ -3308,10 +3345,11 @@ fn bezier_length_m(
 ///   [31]     lane_flags:      u8   (bits 0..6 lane index, bit7 on_turn_connector)
 ///   [32..35] frustration:     f32  LE  (0=calm, 100=rage)
 ///   [36..39] lateral_offset:  f32  LE  (smooth lane pos: 0.0=lane-0 centre, 1.0=lane-1 …)
+///   [40..47] current_lane_id: u64  LE  (`u64::MAX` = unknown)
 /// ```
 fn serialize_vehicles(vehicles: &[Vehicle], tram_sim: &TramSim) -> Vec<u8> {
     let total = vehicles.len() + tram_sim.trams.len();
-    let mut buf = Vec::with_capacity(total * 40);
+    let mut buf = Vec::with_capacity(total * 48);
 
     for v in vehicles {
         push_vehicle_packet(
@@ -3328,6 +3366,7 @@ fn serialize_vehicles(vehicles: &[Vehicle], tram_sim: &TramSim) -> Vec<u8> {
             v.on_turn_connector,
             v.frustration,
             v.current_lateral_offset,
+            v.current_lane_id.unwrap_or(u64::MAX),
         );
     }
 
@@ -3346,13 +3385,14 @@ fn serialize_vehicles(vehicles: &[Vehicle], tram_sim: &TramSim) -> Vec<u8> {
             false,
             t.frustration,
             0.0, // Trams stay on fixed track, no lateral offset
+            u64::MAX,
         );
     }
 
     buf
 }
 
-/// Per-vehicle binary packet layout (40 bytes):
+/// Per-vehicle binary packet layout (48 bytes):
 /// ```text
 ///   [0..3]   id:              u32 LE
 ///   [4..11]  lat:             f64 LE   ← full double precision, eliminates ~0.4 m f32 quantisation noise
@@ -3365,6 +3405,7 @@ fn serialize_vehicles(vehicles: &[Vehicle], tram_sim: &TramSim) -> Vec<u8> {
 ///   [31]     lane_flags:      u8   (bits 0..6 lane index, bit7 on_turn_connector)
 ///   [32..35] frustration:     f32 LE
 ///   [36..39] lateral_offset:  f32 LE (smooth: 0.0=lane-0, 1.0=lane-1, …)
+///   [40..47] current_lane_id: u64 LE (`u64::MAX` when unknown)
 /// ```
 #[inline]
 fn push_vehicle_packet(
@@ -3381,6 +3422,7 @@ fn push_vehicle_packet(
     on_turn_connector: bool,
     frustration: f32,
     lateral_offset: f32,
+    current_lane_id: u64,
 ) {
     buf.extend_from_slice(&id.to_le_bytes());          // [0..3]
     buf.extend_from_slice(&lat.to_le_bytes());         // [4..11]  f64
@@ -3394,4 +3436,5 @@ fn push_vehicle_packet(
     buf.push(lane_flags);                              // [31]
     buf.extend_from_slice(&frustration.to_le_bytes()); // [32..35]
     buf.extend_from_slice(&lateral_offset.to_le_bytes()); // [36..39]
+    buf.extend_from_slice(&current_lane_id.to_le_bytes()); // [40..47]
 }

@@ -19,6 +19,8 @@ const EMPTY_MAP: MapData = {
   buildings: [],
   restrictions: [],
   tramStops: [],
+  lanes: [],
+  conflictAreas: [],
 };
 
 const EDITOR_COLLAPSED_KEY = 'traffic-control-editor-collapsed';

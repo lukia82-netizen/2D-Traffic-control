@@ -12,6 +12,7 @@ use crate::simulation::lane_change::compute_vehicle_target_lane;
 use crate::vehicles::vehicle::Vehicle;
 use crate::vehicles::types::VehicleType;
 use crate::vehicles::driver::DriverProfile;
+use crate::map::road_network::LaneId;
 
 /// Default hard cap on total non-tram vehicles in the simulation.
 /// A conservative start value; the frontend sends SetMaxVehicles to override.
@@ -153,6 +154,11 @@ impl SpawnSystem {
         vehicle.current_lane = initial_target;
         vehicle.current_lateral_offset = initial_target as f32;
         vehicle.target_lateral_offset  = initial_target as f32;
+        let lane_route = build_lane_route_from_edge_route(map, &vehicle.route, initial_target);
+        vehicle.current_lane_id = lane_route.first().copied();
+        vehicle.lane_route = lane_route;
+        vehicle.lane_route_pos = 0;
+        vehicle.lane_progress_m = 0.0;
 
         // Give new vehicles a tiny initial speed so they are not all stuck
         // at edge_progress=0.0 simultaneously.  This ensures a non-zero gap
@@ -247,6 +253,11 @@ impl SpawnSystem {
         vehicle.current_lane = initial_target;
         vehicle.current_lateral_offset = initial_target as f32;
         vehicle.target_lateral_offset  = initial_target as f32;
+        let lane_route = build_lane_route_from_edge_route(map, &vehicle.route, initial_target);
+        vehicle.current_lane_id = lane_route.first().copied();
+        vehicle.lane_route = lane_route;
+        vehicle.lane_route_pos = 0;
+        vehicle.lane_progress_m = 0.0;
         vehicle.speed = 2.0; // slow start — prevents all spawned cars sharing edge_progress=0
 
         Some(vehicle)
@@ -339,6 +350,43 @@ impl SpawnSystem {
         else if roll < 0.95 { DriverProfile::Pirat    }
         else                { DriverProfile::Cautious }
     }
+}
+
+fn build_lane_route_from_edge_route(map: &MapData, route: &[petgraph::graph::EdgeIndex], lane_idx: u8) -> Vec<LaneId> {
+    let mut out = Vec::new();
+    for edge in route {
+        let mut candidates: Vec<&crate::map::road_network::Lane> = map
+            .lanes
+            .values()
+            .filter(|l| l.edge_id == edge.index() as u64 && l.lane_index == lane_idx)
+            .collect();
+        if candidates.is_empty() {
+            candidates = map
+                .lanes
+                .values()
+                .filter(|l| l.edge_id == edge.index() as u64)
+                .collect();
+        }
+        if let Some(chosen) = candidates.into_iter().min_by_key(|l| l.lane_index) {
+            if let Some(prev) = out.last().copied() {
+                // If a connector exists from previous lane to this lane, include it.
+                if let Some(conn) = map
+                    .lanes
+                    .get(&prev)
+                    .and_then(|l| l.connections.iter().copied().find(|c| {
+                        map.lanes
+                            .get(c)
+                            .map(|cl| cl.connections.contains(&chosen.id))
+                            .unwrap_or(false)
+                    }))
+                {
+                    out.push(conn);
+                }
+            }
+            out.push(chosen.id);
+        }
+    }
+    out
 }
 
 // ── Sampling helpers ─────────────────────────────────────────────────────────

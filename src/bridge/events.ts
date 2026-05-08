@@ -20,6 +20,8 @@ export interface VehicleState {
   lateralOffset: number;
   /** Driver frustration 0 (calm) … 100 (rage). */
   frustration: number;
+  /** Full lane graph identifier for current path (`null` when unknown). */
+  currentLaneId: number | null;
 }
 
 export interface CongestionData {
@@ -53,7 +55,7 @@ export interface LightStateUpdate {
 /**
  * Decode a base64-encoded binary vehicle frame.
  *
- * Packet layout (40 bytes):
+ * Packet layout (48 bytes):
  *   [0..3]   id:            u32  LE
  *   [4..11]  lat:           f64  LE  ← double precision, eliminates f32 quantisation jitter
  *   [12..19] lng:           f64  LE  ← double precision
@@ -65,6 +67,7 @@ export interface LightStateUpdate {
  *   [31]     laneFlags:     u8   (bits 0..6: currentLane, bit7: onTurnConnector)
  *   [32..35] frustration:   f32  LE  (0=calm, 100=rage)
  *   [36..39] lateralOffset: f32  LE  (smooth: 0.0=lane-0 centre, 1.0=lane-1 …)
+ *   [40..47] currentLaneId: u64  LE  (u64::MAX => null)
  */
 export function parseVehicleFrame(base64Data: string): VehicleState[] {
   const binaryStr = atob(base64Data);
@@ -74,7 +77,7 @@ export function parseVehicleFrame(base64Data: string): VehicleState[] {
     bytes[i] = binaryStr.charCodeAt(i);
   }
 
-  const PACKET_SIZE = 40;
+  const PACKET_SIZE = 48;
   const count = Math.floor(bytes.byteLength / PACKET_SIZE);
   const view = new DataView(bytes.buffer);
   const vehicles: VehicleState[] = new Array(count);
@@ -82,6 +85,7 @@ export function parseVehicleFrame(base64Data: string): VehicleState[] {
   for (let i = 0; i < count; i++) {
     const base = i * PACKET_SIZE;
     const laneFlags = view.getUint8(base + 31);
+    const laneId = view.getBigUint64(base + 40, true);
     vehicles[i] = {
       id:              view.getUint32 (base,      true),
       lat:             view.getFloat64(base + 4,  true),
@@ -95,6 +99,7 @@ export function parseVehicleFrame(base64Data: string): VehicleState[] {
       onTurnConnector: (laneFlags & 0x80) !== 0,
       frustration:     view.getFloat32(base + 32, true),
       lateralOffset:   view.getFloat32(base + 36, true),
+      currentLaneId:   laneId === BigInt('18446744073709551615') ? null : Number(laneId),
     };
   }
 

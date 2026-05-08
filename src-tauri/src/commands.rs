@@ -75,6 +75,27 @@ pub struct TramStopData {
     pub dwell_s: f32,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ConflictAreaData {
+    pub id: u64,
+    pub center_lat: f64,
+    pub center_lng: f64,
+    pub radius_m: f32,
+    pub lane_ids: Vec<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct LaneData {
+    pub id: u64,
+    pub width: f32,
+    pub connections: Vec<u64>,
+    pub conflict_areas: Vec<u64>,
+    pub points: Vec<[f64; 2]>,
+    pub length_m: f32,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MapDataResponse {
@@ -85,6 +106,8 @@ pub struct MapDataResponse {
     pub buildings: Vec<BuildingData>,
     pub restrictions: Vec<TurnRestrictionData>,
     pub tram_stops: Vec<TramStopData>,
+    pub lanes: Vec<LaneData>,
+    pub conflict_areas: Vec<ConflictAreaData>,
 }
 
 // ── Commands ──────────────────────────────────────────────────────────────────
@@ -376,5 +399,28 @@ fn build_map_response(map_data: &MapData) -> MapDataResponse {
         buildings,
         restrictions,
         tram_stops,
+        lanes: map_data
+            .lanes
+            .values()
+            .map(|l| LaneData {
+                id: l.id,
+                width: l.width,
+                connections: l.connections.clone(),
+                conflict_areas: l.conflict_areas.clone(),
+                points: l.path.points.clone(),
+                length_m: l.path.length_m,
+            })
+            .collect(),
+        conflict_areas: map_data
+            .conflict_areas
+            .values()
+            .map(|c| ConflictAreaData {
+                id: c.id,
+                center_lat: c.center_lat,
+                center_lng: c.center_lng,
+                radius_m: c.radius_m,
+                lane_ids: c.lane_ids.clone(),
+            })
+            .collect(),
     }
 }
