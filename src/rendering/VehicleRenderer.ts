@@ -26,8 +26,8 @@ const DOT_COLORS: Record<number, number> = {
 };
 
 /**
- * Base pixel dimensions at spriteScale = 1.0.
- * CameraManager.getCarVisuals().spriteScale multiplies these.
+ * Base pixel dimensions of the untransformed sprite graphic (drawn once at these sizes).
+ * rect.scale.set() resizes from these base values to the final screen dimensions.
  */
 const VEHICLE_DIMS: Record<number, { w: number; h: number }> = {
   0: { w: 6,  h: 12 }, // Car
@@ -37,22 +37,16 @@ const VEHICLE_DIMS: Record<number, { w: number; h: number }> = {
   4: { w: 7,  h: 52 }, // Tram
 };
 
-/** Target vehicle width as a fraction of one lane width (all zoom levels). */
-const VEHICLE_WIDTH_FILL: Record<number, number> = {
-  0: 0.76, // car
-  1: 0.84, // van
-  2: 0.90, // bus
-  3: 0.94, // truck
-  4: 0.90, // tram
-};
-
-/** Vehicle length as a multiple of rendered width. */
-const VEHICLE_LENGTH_FACTOR: Record<number, number> = {
-  0: 1.9, // car
-  1: 2.2, // van
-  2: 2.8, // bus
-  3: 3.2, // truck
-  4: 4.2, // tram
+/**
+ * Physical vehicle dimensions in metres (must match src-tauri/src/vehicles/types.rs).
+ * Used to derive pixel size from actual map projection → correct proportions at all zoom levels.
+ */
+const VEHICLE_PHYS: Record<number, { widthM: number; lengthM: number }> = {
+  0: { widthM: 1.8, lengthM: 4.5  }, // Car
+  1: { widthM: 2.0, lengthM: 6.0  }, // Van
+  2: { widthM: 2.5, lengthM: 12.0 }, // Bus
+  3: { widthM: 2.6, lengthM: 16.0 }, // Truck
+  4: { widthM: 2.4, lengthM: 20.0 }, // Tram
 };
 
 /** Frustration thresholds for visual bubbles. */
@@ -162,10 +156,22 @@ export class VehicleRenderer {
   private readonly prevVehiclePos: Map<number, { lat: number; lng: number }> = new Map();
   private hiddenGroups: Set<string> = new Set();
 
+
   constructor(overlay: PixiOverlay, map: maplibregl.Map, camera: CameraManager) {
     this.overlay = overlay;
     this.map = map;
     this.camera = camera;
+  }
+
+  /**
+   * Returns pixels per metre at the current map centre using MapLibre projection.
+   * This gives a physically-accurate scale factor for all zoom levels and latitudes.
+   */
+  private pxPerMetre(): number {
+    const c  = this.map.getCenter();
+    const p1 = this.map.project([c.lng, c.lat]);
+    const p2 = this.map.project([c.lng, c.lat + 1 / 111_320]); // 1 m north
+    return Math.abs(p2.y - p1.y);
   }
 
   // ─── Road-group filtering API ──────────────────────────────────────────────
@@ -307,8 +313,8 @@ export class VehicleRenderer {
     infraMap: Map<number, string>,
     _spriteScale: number,
   ): void {
-    const bounds      = this.map.getBounds();
-    const laneWidthPx = this.camera.getLaneOffset() * 2;
+    const bounds    = this.map.getBounds();
+    const pxPerM    = this.pxPerMetre();
     const renderedIds = new Set<number>();
 
     for (const [id, v] of vehicles) {
@@ -321,13 +327,12 @@ export class VehicleRenderer {
         s.lat < bounds.getSouth() || s.lat > bounds.getNorth()
       ) continue;
 
-      const typeId      = v.vehicleType < VEHICLE_TYPES.length ? v.vehicleType : 0;
-      const dims        = VEHICLE_DIMS[typeId]        ?? VEHICLE_DIMS[0];
-      const widthFill   = VEHICLE_WIDTH_FILL[typeId]  ?? VEHICLE_WIDTH_FILL[0];
-      const lengthFactor= VEHICLE_LENGTH_FACTOR[typeId] ?? VEHICLE_LENGTH_FACTOR[0];
-      const infraType   = infraMap.get(id) ?? 'normal';
-      const isTunnel    = infraType === 'tunnel';
-      const isBridge    = infraType === 'bridge';
+      const typeId    = v.vehicleType < VEHICLE_TYPES.length ? v.vehicleType : 0;
+      const dims      = VEHICLE_DIMS[typeId]  ?? VEHICLE_DIMS[0];
+      const phys      = VEHICLE_PHYS[typeId]  ?? VEHICLE_PHYS[0];
+      const infraType = infraMap.get(id) ?? 'normal';
+      const isTunnel  = infraType === 'tunnel';
+      const isBridge  = infraType === 'bridge';
 
       // Acquire or create rectangle graphic
       let rect = this.activeRects.get(id);
@@ -346,13 +351,13 @@ export class VehicleRenderer {
 
       const px = this.map.project([s.lng, s.lat]);
 
-      // Backend now sends true lane-path position; no dynamic screen offset.
       rect.x        = px.x;
       rect.y        = px.y;
       rect.rotation = s.angle;
 
-      const targetWidth  = Math.max(4, laneWidthPx * widthFill);
-      const targetHeight = targetWidth * lengthFactor;
+      // Physical dimensions → pixels via map projection (correct at all zoom levels / latitudes).
+      const targetWidth  = Math.max(2, pxPerM * phys.widthM);
+      const targetHeight = Math.max(4, pxPerM * phys.lengthM);
       rect.scale.set(targetWidth / dims.w, targetHeight / dims.h);
       rect.alpha   = isTunnel ? TUNNEL_ALPHA : 1;
       rect.visible = true;

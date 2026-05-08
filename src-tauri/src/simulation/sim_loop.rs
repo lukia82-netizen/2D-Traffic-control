@@ -12,7 +12,7 @@ use serde::Serialize;
 use petgraph::graph::{EdgeIndex, NodeIndex};
 use petgraph::visit::EdgeRef;
 
-use crate::map::road_network::{Lane, MapData, IntersectionType};
+use crate::map::road_network::{Lane, LaneId, MapData, IntersectionType};
 use crate::state::SimCommand;
 use crate::time::game_clock::GameClock;
 use crate::time::day_cycle::DayCycle;
@@ -2040,29 +2040,52 @@ fn apply_vehicle_physics(
         (edge.length_m, endpoints.0, endpoints.1)
     };
 
-    // ── Turn connector (Bezier arc-length) state machine ──────────────────
+    // ── Turn connector state machine ──────────────────────────────────────
     if vehicle.on_turn_connector {
-        // Build arc-length-parameterised path in local Cartesian metres.
-        let path = bezier_path_from_geo(
-            vehicle.turn_p1_lat, vehicle.turn_p1_lng,
-            vehicle.turn_ctrl_lat, vehicle.turn_ctrl_lng,
-            vehicle.turn_p2_lat, vehicle.turn_p2_lng,
-        );
+        // When a precomputed connector lane is available, follow its polyline exactly
+        // so the vehicle tracks the same path shown by the visual lane lines.
+        let (total_len, new_pos) = if let Some(cid) = vehicle.connector_lane_id {
+            if let Some(clane) = map.lanes.get(&cid) {
+                let total = clane.path.length_m as f64;
+                let dist  = (vehicle.turn_dist_m + vehicle.speed as f64 * real_dt_s as f64).min(total);
+                if let Some((lat, lng, angle)) = sample_lane_path_at(clane, dist as f32) {
+                    vehicle.lat   = lat;
+                    vehicle.lng   = lng;
+                    vehicle.angle = angle;
+                }
+                (total, dist)
+            } else {
+                // Lane was removed; fall back gracefully.
+                vehicle.connector_lane_id = None;
+                let path = bezier_path_from_geo(
+                    vehicle.turn_p1_lat, vehicle.turn_p1_lng,
+                    vehicle.turn_ctrl_lat, vehicle.turn_ctrl_lng,
+                    vehicle.turn_p2_lat, vehicle.turn_p2_lng,
+                );
+                let dist = (vehicle.turn_dist_m + vehicle.speed as f64 * real_dt_s as f64).min(path.total_length);
+                let state = path.get_state(dist);
+                let (lat, lng, angle) = bezier_state_to_geo(&state);
+                vehicle.lat = lat; vehicle.lng = lng; vehicle.angle = angle;
+                (path.total_length, dist)
+            }
+        } else {
+            // No precomputed lane — use quadratic Bezier (legacy / straight-through).
+            let path = bezier_path_from_geo(
+                vehicle.turn_p1_lat, vehicle.turn_p1_lng,
+                vehicle.turn_ctrl_lat, vehicle.turn_ctrl_lng,
+                vehicle.turn_p2_lat, vehicle.turn_p2_lng,
+            );
+            let dist = (vehicle.turn_dist_m + vehicle.speed as f64 * real_dt_s as f64).min(path.total_length);
+            let state = path.get_state(dist);
+            let (lat, lng, angle) = bezier_state_to_geo(&state);
+            vehicle.lat = lat; vehicle.lng = lng; vehicle.angle = angle;
+            (path.total_length, dist)
+        };
 
-        // Advance by exact physical distance — constant speed along the arc.
-        vehicle.turn_dist_m = (vehicle.turn_dist_m
-            + vehicle.speed as f64 * real_dt_s as f64)
-            .min(path.total_length);
-
-        // Query position + heading at the new arc-length distance.
-        let state = path.get_state(vehicle.turn_dist_m);
-        let (lat, lng, angle) = bezier_state_to_geo(&state);
-        vehicle.lat   = lat;
-        vehicle.lng   = lng;
-        vehicle.angle = angle;
+        vehicle.turn_dist_m = new_pos;
 
         // Keep edge_progress monotonic for leader logic while on the connector.
-        let frac = (vehicle.turn_dist_m / path.total_length) as f32;
+        let frac = (vehicle.turn_dist_m / total_len) as f32;
         vehicle.edge_progress =
             vehicle.turn_entry_progress + (1.0 - vehicle.turn_entry_progress) * frac;
         conflict_system.update_reservation_motion_for_vehicle(
@@ -2080,9 +2103,10 @@ fn apply_vehicle_physics(
             vehicle.vehicle_type.params().length_m * 0.5,
         );
 
-        if vehicle.turn_dist_m >= path.total_length {
+        if vehicle.turn_dist_m >= total_len {
             conflict_system.release_all_for_vehicle(vehicle.id);
             vehicle.on_turn_connector = false;
+            vehicle.connector_lane_id = None;
             vehicle.turn_dist_m = 0.0;
             vehicle.turn_from_edge = 0;
             vehicle.turn_to_edge = 0;
@@ -2190,24 +2214,47 @@ fn apply_vehicle_physics(
             vehicle.turn_p2_lat = conn.p2_lat;
             vehicle.turn_p2_lng = conn.p2_lng;
             vehicle.edge_progress = conn.entry_progress;
+            // Store the precomputed connector lane ID so traversal uses the same path.
+            if vehicle.route_pos + 1 < vehicle.route.len() {
+                vehicle.connector_lane_id = find_connector_lane_id(
+                    map, edge_idx,
+                    vehicle.current_lane,
+                    vehicle.route[vehicle.route_pos + 1],
+                    vehicle.target_lane,
+                );
+            }
 
             // Snap lateral offset to target immediately so it doesn't drift
             // perpendicularly to the Bezier while animating during the turn.
             vehicle.current_lateral_offset = vehicle.target_lateral_offset;
 
-            // Immediately place vehicle at arc start using the same BezierPath so
-            // position/heading are consistent with the traversal logic (avoids 1-frame snap).
-            let path0 = bezier_path_from_geo(
-                conn.p1_lat, conn.p1_lng,
-                conn.ctrl_lat, conn.ctrl_lng,
-                conn.p2_lat, conn.p2_lng,
-            );
-            let state0 = path0.get_state(0.0);
-            let (lat0, lng0, angle0) = bezier_state_to_geo(&state0);
-            vehicle.lat   = lat0;
-            vehicle.lng   = lng0;
-            vehicle.angle = angle0;
-            // Do NOT fall through to linear interpolation — Bezier takes over next tick.
+            // Immediately place vehicle at connector start so there is no 1-frame positional snap.
+            // Use the polyline when we have a precomputed connector lane, else fall back to bezier.
+            let placed = if let Some(cid) = vehicle.connector_lane_id {
+                map.lanes.get(&cid)
+                    .and_then(|cl| sample_lane_path_at(cl, 0.0))
+                    .map(|(lat0, lng0, angle0)| {
+                        vehicle.lat   = lat0;
+                        vehicle.lng   = lng0;
+                        vehicle.angle = angle0;
+                    })
+                    .is_some()
+            } else {
+                false
+            };
+            if !placed {
+                let path0 = bezier_path_from_geo(
+                    conn.p1_lat, conn.p1_lng,
+                    conn.ctrl_lat, conn.ctrl_lng,
+                    conn.p2_lat, conn.p2_lng,
+                );
+                let state0 = path0.get_state(0.0);
+                let (lat0, lng0, angle0) = bezier_state_to_geo(&state0);
+                vehicle.lat   = lat0;
+                vehicle.lng   = lng0;
+                vehicle.angle = angle0;
+            }
+            // Do NOT fall through to linear interpolation — connector takes over next tick.
             return;
         }
     }
@@ -3026,28 +3073,73 @@ impl ConflictSystem {
     }
 }
 
+/// Find the precomputed connector lane ID for the given movement.
+/// Returns `None` when no connector lane was built (e.g. straight-through on a single road).
+fn find_connector_lane_id(
+    map: &MapData,
+    in_edge: EdgeIndex,
+    in_lane: u8,
+    out_edge: EdgeIndex,
+    out_lane: u8,
+) -> Option<LaneId> {
+    let in_lane_id  = *map.lane_by_edge_lane.get(&(in_edge.index(),  in_lane))?;
+    let out_lane_id = *map.lane_by_edge_lane.get(&(out_edge.index(), out_lane))?;
+    let in_lane_obj = map.lanes.get(&in_lane_id)?;
+    for &conn_id in &in_lane_obj.connections {
+        let conn = map.lanes.get(&conn_id)?;
+        // Connector lanes carry edge_id == u64::MAX and connect to the target lane.
+        if conn.edge_id == u64::MAX && conn.connections.first() == Some(&out_lane_id) {
+            return Some(conn_id);
+        }
+    }
+    None
+}
+
 fn planned_turn_connector(vehicle: &Vehicle, map: &MapData) -> Option<PlannedTurnConnector> {
     if vehicle.route_pos + 1 >= vehicle.route.len() {
         return None;
     }
-    connector_for_movement_lane(
-        map,
-        vehicle.route[vehicle.route_pos],
-        vehicle.route[vehicle.route_pos + 1],
-        vehicle.current_lane,
-        vehicle.target_lane,
-    )
+    let in_edge  = vehicle.route[vehicle.route_pos];
+    let out_edge = vehicle.route[vehicle.route_pos + 1];
+
+    // Prefer the precomputed connector lane so vehicles follow the same path as the visuals.
+    if let Some(cid) = find_connector_lane_id(map, in_edge, vehicle.current_lane, out_edge, vehicle.target_lane) {
+        if let Some(clane) = map.lanes.get(&cid) {
+            let pts = &clane.path.points;
+            if pts.len() >= 2 {
+                let p1  = pts[0];
+                let p2  = *pts.last().unwrap();
+                let mid = pts[pts.len() / 2];
+                return Some(PlannedTurnConnector {
+                    // Connector starts exactly at the end of the incoming lane (junction node).
+                    entry_progress: 1.0,
+                    exit_progress:  0.0,
+                    length_m:       clane.path.length_m,
+                    p1_lat:   p1[0],  p1_lng:   p1[1],
+                    ctrl_lat: mid[0], ctrl_lng: mid[1],
+                    p2_lat:   p2[0],  p2_lng:   p2[1],
+                });
+            }
+        }
+    }
+
+    // Fallback: dynamic computation for routes without a precomputed connector.
+    connector_for_movement_lane(map, in_edge, out_edge, vehicle.current_lane, vehicle.target_lane)
 }
 
-fn lane_center_offset_m(lane: u8, lanes_total: u8, oneway: bool) -> f64 {
-    const LANE_WIDTH_M: f64 = 3.2;
+fn lane_center_offset_m(
+    lane: u8,
+    lanes_total: u8,
+    oneway: bool,
+    lane_width_m: f64,
+) -> f64 {
+    // Must stay in sync with road_network::lane_center_offset_m.
+    // No direction_sign: the perpendicular normal already flips for the reverse edge.
+    let centered = ((lane as f64) - ((lanes_total as f64 - 1.0) * 0.5)) * lane_width_m;
     if oneway {
-        // OSM axis is road center for oneway carriageways.
-        ((lane as f64 + 0.5) - (lanes_total as f64) * 0.5) * LANE_WIDTH_M
+        centered
     } else {
-        // For two-way represented as opposite directed edges on the same axis,
-        // the axis acts as the direction divider.
-        (lane as f64 + 0.5) * LANE_WIDTH_M
+        centered + (lanes_total as f64 * lane_width_m * 0.5)
     }
 }
 
@@ -3096,8 +3188,9 @@ fn connector_for_movement_lane(
     let right_out_y = -out_fx;
     let (mut p1x, mut p1y) = geo_to_m_xy(p1_lat, p1_lng);
     let (mut p2x, mut p2y) = geo_to_m_xy(p2_lat, p2_lng);
-    let in_shift = lane_center_offset_m(in_lane, in_w.lanes.max(1), in_w.oneway);
-    let out_shift = lane_center_offset_m(out_lane, out_w.lanes.max(1), out_w.oneway);
+    let lane_width_m = map.lane_width_m.max(2.5) as f64;
+    let in_shift = lane_center_offset_m(in_lane, in_w.lanes.max(1), in_w.oneway, lane_width_m);
+    let out_shift = lane_center_offset_m(out_lane, out_w.lanes.max(1), out_w.oneway, lane_width_m);
     p1x += right_in_x * in_shift;
     p1y += right_in_y * in_shift;
     p2x += right_out_x * out_shift;
@@ -3125,6 +3218,29 @@ fn connector_for_movement_lane(
     })
 }
 
+/// Returns which (in_lane, out_lane) pairs are valid for this movement,
+/// following Cities: Skylines-style rules based on turn intent:
+///   Right  → rightmost in-lane  → rightmost out-lane
+///   Straight → each lane maps to the same index (clamped)
+///   Left   → leftmost  in-lane  → leftmost  out-lane
+///   UTurn  → not allowed at intersections
+fn valid_lane_pairs_for_movement(
+    map: &MapData,
+    in_edge: EdgeIndex,
+    out_edge: EdgeIndex,
+    node: NodeIndex,
+) -> Vec<(u8, u8)> {
+    let in_lanes  = map.graph.edge_weight(in_edge) .map(|e| e.lanes.max(1)).unwrap_or(1);
+    let out_lanes = map.graph.edge_weight(out_edge).map(|e| e.lanes.max(1)).unwrap_or(1);
+    let intent = movement_turn_intent(map, (in_edge, out_edge), node);
+    match intent {
+        TurnIntent::Right    => vec![(in_lanes - 1, out_lanes - 1)],
+        TurnIntent::Straight => (0..in_lanes).map(|i| (i, i.min(out_lanes - 1))).collect(),
+        TurnIntent::Left     => vec![(0, 0)],
+        TurnIntent::UTurn    => vec![],   // u-turns disabled at intersections
+    }
+}
+
 fn build_conflict_system(map: &MapData) -> ConflictSystem {
     let mut nodes: HashMap<NodeIndex, IntersectionConflictData> = HashMap::new();
     for node in map.graph.node_indices() {
@@ -3149,28 +3265,23 @@ fn build_conflict_system(map: &MapData) -> ConflictSystem {
         let mut next_cp_id: u64 = 1;
         for &in_edge in &incoming {
             for &out_edge in &outgoing {
-                let in_lanes = map.graph.edge_weight(in_edge).map(|e| e.lanes).unwrap_or(1);
-                let out_lanes = map.graph.edge_weight(out_edge).map(|e| e.lanes).unwrap_or(1);
-                for in_lane in 0..in_lanes {
-                    for out_lane in 0..out_lanes {
-                        if let Some(c) = connector_for_movement_lane(map, in_edge, out_edge, in_lane, out_lane) {
-                            by_movement.insert(LaneMovementKey {
-                                in_edge,
-                                out_edge,
-                                in_lane,
-                                out_lane,
-                            }, ConflictPath {
-                                bezier: c,
-                                points: Vec::new(),
-                            });
-                        }
+                // Only generate connectors for valid lane pairs (turn-rule filtered).
+                for (in_lane, out_lane) in valid_lane_pairs_for_movement(map, in_edge, out_edge, node) {
+                    if let Some(c) = connector_for_movement_lane(map, in_edge, out_edge, in_lane, out_lane) {
+                        by_movement.insert(LaneMovementKey {
+                            in_edge,
+                            out_edge,
+                            in_lane,
+                            out_lane,
+                        }, ConflictPath {
+                            bezier: c,
+                            points: Vec::new(),
+                        });
                     }
                 }
             }
         }
         build_conflicts_for_node(&mut by_movement, &mut next_cp_id);
-        let conflict_count: usize = by_movement.values().map(|p| p.points.len()).sum();
-        let _ = conflict_count;
         nodes.insert(node, IntersectionConflictData {
             by_movement,
             incoming_cw,

@@ -144,6 +144,9 @@ interface TurnConnectorPath {
   p1: [number, number];
   ctrl: [number, number];
   p2: [number, number];
+  /** OSM node IDs used to pick the same direction colour as straight lane lines. */
+  fromNodeOsmId: number;
+  toNodeOsmId: number;
 }
 
 type ObbDebugMode = 'visual' | 'physical';
@@ -203,6 +206,7 @@ export class Game {
   private selectedHudHoodLngLat: [number, number] | null = null;
   private debugRouteGfx: PIXI.Graphics | null = null;
   private debugVizGfx: PIXI.Graphics | null = null;
+  private laneLinesGfx: PIXI.Graphics | null = null;
   private debugConflictLabels: PIXI.Container | null = null;
   /** Full-map CP + threat overlay (Rust `debug_visualization`). */
   private debugVisualizationEnabled = false;
@@ -212,6 +216,7 @@ export class Game {
   private turnConnectorPaths: TurnConnectorPath[] = [];
   private showTurnConnectors = false;
   private showTurnConnectorsActiveOnly = false;
+  private showLaneLines = true;
 
   // Scoring
   private score = 0;
@@ -227,6 +232,8 @@ export class Game {
   private currentBbox: [number, number, number, number] = DEFAULT_BBOX;
   /** null = real OSM data; string = sandbox grid type ('mixed'|'one_lane'|'single_intersection'|…) */
   private currentGridMode: string | null = null;
+  // 3.5 m = standard European city lane (car 1.8m + 1.7m clearance between opposing cars)
+  private currentLaneWidthM = 3.5;
   private bboxPicker: MapBboxPicker | null = null;
   private editorMode = false;
   private editorTool: 'select' | 'move_node' | 'add_road' | 'delete' = 'move_node';
@@ -277,10 +284,12 @@ export class Game {
     this.debugRouteGfx = new PIXI.Graphics();
     this.turnConnectorGfx = new PIXI.Graphics();
     this.debugVizGfx = new PIXI.Graphics();
+    this.laneLinesGfx = new PIXI.Graphics();
     this.debugConflictLabels = new PIXI.Container();
     this.overlay.congestionLayer.addChild(this.debugRouteGfx);
     this.overlay.congestionLayer.addChild(this.turnConnectorGfx);
     this.overlay.congestionLayer.addChild(this.debugVizGfx);
+    this.overlay.congestionLayer.addChild(this.laneLinesGfx);
     this.overlay.congestionLayer.addChild(this.debugConflictLabels);
 
     window.addEventListener('keydown', (ev) => {
@@ -359,6 +368,7 @@ export class Game {
         this.trafficLightRenderer.rebuildOnCameraChange();
         this.redrawSelectedRoute();
         this.redrawTurnConnectors();
+        this.redrawLaneLines();
         if (this.debugVisualizationEnabled && this.latestDebugVisualization) {
           this.redrawFullDebugVisualization();
         }
@@ -456,6 +466,12 @@ export class Game {
       const cityName = this.estimateCurrentCityName();
       void this.reloadMap(this.currentBbox, sizeM, cityName, this.currentGridMode);
     };
+    ui.onLaneWidthChange = (laneWidthM) => {
+      this.currentLaneWidthM = laneWidthM;
+      const sizeM = this.estimateCurrentBboxSizeM();
+      const cityName = this.estimateCurrentCityName();
+      void this.reloadMap(this.currentBbox, sizeM, cityName, this.currentGridMode);
+    };
 
     ui.onOsmModeToggle = (enabled) => {
       this.roadRenderer.setOsmMode(enabled);
@@ -496,9 +512,14 @@ export class Game {
     ui.onDebugVisualizationToggle = (enabled) => {
       void this.setDebugVisualizationMode(enabled);
     };
+    ui.onLaneLinesToggle = (enabled) => {
+      this.showLaneLines = enabled;
+      if (this.laneLinesGfx) this.laneLinesGfx.visible = enabled;
+      this.redrawLaneLines();
+    };
     ui.setChecked('turn-connectors', this.showTurnConnectors);
     ui.setChecked('turn-connectors-active-only', this.showTurnConnectorsActiveOnly);
-    ui.setChecked('debug-visualization', false);
+    ui.applyPersistedSettings();
   }
 
   private wireMapScenarioEditorUI(): void {
@@ -522,7 +543,7 @@ export class Game {
   private async loadMapData(): Promise<void> {
     this.uiRenderer.showNotification('Loading map data…', 'info');
     try {
-      this.mapData = await loadMap(this.currentBbox, this.currentGridMode);
+      this.mapData = await loadMap(this.currentBbox, this.currentGridMode, this.currentLaneWidthM);
       this.uiRenderer.showNotification(
         `Map loaded – ${this.mapData.nodes.length} nodes, ${this.mapData.edges.length} edges`,
         'info',
@@ -550,6 +571,7 @@ export class Game {
     this.trafficLightRenderer.init(this.mapData.nodes, this.mapData.edges);
     this.rebuildTurnConnectorPaths();
     this.redrawTurnConnectors();
+    this.redrawLaneLines();
     this.editorOverlay.setEnabled(this.editorMode);
     this.editorOverlay.redrawHandles(this.mapData);
     this.mapScenarioEditorUI?.setMapData(this.mapData);
@@ -572,7 +594,7 @@ export class Game {
     this.uiRenderer.showNotification(`Przeładowanie – ${modeLabel}…`, 'info');
 
     try {
-      this.mapData = await loadMap(bbox, forceSandbox);
+      this.mapData = await loadMap(bbox, forceSandbox, this.currentLaneWidthM);
       this.uiRenderer.showNotification(
         `Map reloaded – ${this.mapData.nodes.length} nodes, ${this.mapData.edges.length} edges`,
         'info',
@@ -601,6 +623,7 @@ export class Game {
     this.trafficLightRenderer.init(this.mapData.nodes, this.mapData.edges);
     this.rebuildTurnConnectorPaths();
     this.redrawTurnConnectors();
+    this.redrawLaneLines();
     this.mapScenarioEditorUI?.setMapData(this.mapData);
 
     this.sandboxUI?.setLoadingDone(cityName, sizeM);
@@ -644,6 +667,7 @@ export class Game {
     this.trafficLightRenderer.init(mapData.nodes, mapData.edges);
     this.rebuildTurnConnectorPaths();
     this.redrawTurnConnectors();
+    this.redrawLaneLines();
     this.editorOverlay.redrawHandles(mapData);
   }
 
@@ -818,12 +842,10 @@ export class Game {
     lbl.removeChildren();
 
     const DATA = this.latestDebugVisualization;
-    const VEHICLE_WIDTH_FILL: Record<number, number> = {
-      0: 0.76, 1: 0.84, 2: 0.90, 3: 0.94, 4: 0.90,
-    };
-    const VEHICLE_LENGTH_FACTOR: Record<number, number> = {
-      0: 1.9, 1: 2.2, 2: 2.8, 3: 3.2, 4: 4.2,
-    };
+    // Physical vehicle dimensions in metres (mirrors VEHICLE_PHYS in VehicleRenderer.ts)
+    const VEHICLE_PHYS_W = [1.8, 2.0, 2.5, 2.6, 2.4];
+    const VEHICLE_PHYS_L = [4.5, 6.0, 12.0, 16.0, 20.0];
+
     const metersToPixelsAt = (lng: number, lat: number, meters: number): number => {
       const p0 = this.map.project([lng, lat]);
       const p1 = this.map.project([lng + meters / 111_320.0, lat]);
@@ -836,11 +858,13 @@ export class Game {
       const px = this.map.project([s.lng, s.lat]);
       const cx = px.x;
       const cy = px.y;
-      const laneWidthPx = this.camera.getLaneOffset() * 2;
-      const widthFill = VEHICLE_WIDTH_FILL[v.vehicleType] ?? VEHICLE_WIDTH_FILL[0];
-      const lengthFactor = VEHICLE_LENGTH_FACTOR[v.vehicleType] ?? VEHICLE_LENGTH_FACTOR[0];
-      const width = Math.max(4, laneWidthPx * widthFill);
-      const length = width * lengthFactor;
+      const mc = this.map.getCenter();
+      const p1m = this.map.project([mc.lng, mc.lat]);
+      const p2m = this.map.project([mc.lng, mc.lat + 1 / 111_320]);
+      const pxPerM = Math.abs(p2m.y - p1m.y);
+      const typeId = v.vehicleType < 5 ? v.vehicleType : 0;
+      const width  = Math.max(2, pxPerM * (VEHICLE_PHYS_W[typeId] ?? 1.8));
+      const length = Math.max(4, pxPerM * (VEHICLE_PHYS_L[typeId] ?? 4.5));
       const hx = width * 0.5;
       const hy = length * 0.5;
       const c = Math.cos(s.angle);
@@ -860,12 +884,26 @@ export class Game {
     for (const th of DATA.vehicleThreats) {
       for (const id of th.collidingConflictPointIds ?? []) touchedConflictIds.add(id);
     }
-    const laneColor = 0x22ff22;
+    // Fixed high-contrast palette for lane debug paths (left/right lanes are visually distinct).
+    const lanePalette = [
+      0xfacc15, // yellow
+      0x22c55e, // green
+      0x38bdf8, // cyan
+      0xf97316, // orange
+      0xa78bfa, // violet
+      0xfb7185, // rose
+      0x2dd4bf, // teal
+      0xeab308, // amber
+      0x84cc16, // lime
+      0x60a5fa, // blue
+      0xf43f5e, // red
+      0xc084fc, // purple
+    ] as const;
     const laneLegend = new Map<string, { color: number; label: string }>();
     for (const lp of DATA.lanePaths ?? []) {
       if (!lp.points || lp.points.length < 2) continue;
       const pts = lp.points.map(([lng, lat]) => this.map.project([lng, lat]));
-      const c = laneColor;
+      const c = lanePalette[lp.colorIdx % lanePalette.length];
       if (!laneLegend.has(lp.lanePathId)) {
         const parts = lp.lanePathId.split(':');
         const label = parts.length === 4
@@ -1192,46 +1230,51 @@ export class Game {
   private rebuildTurnConnectorPaths(): void {
     this.turnConnectorPaths = [];
     if (!this.mapData) return;
-    const backendTurnConnectors = this.mapData.turnConnectors ?? [];
-    if (backendTurnConnectors.length > 0) {
-      this.turnConnectorPaths = backendTurnConnectors.map((tc) => ({
-        points: tc.bezierLut,
-        p1: tc.bezierLut[0] ?? [0, 0],
-        ctrl: tc.bezierLut[Math.floor(tc.bezierLut.length / 2)] ?? [0, 0],
-        p2: tc.bezierLut[tc.bezierLut.length - 1] ?? [0, 0],
-      }));
+    // Prefer backend-computed connector lanes (isConnector = true) which already have
+    // correct lane-offset geometry produced by populate_lane_graph / build_lane_connector.
+    const connectorLanes = this.mapData.lanes.filter((l) => l.isConnector);
+    if (connectorLanes.length > 0) {
+      this.turnConnectorPaths = connectorLanes.map((l) => {
+        // Backend points are [lat, lng]; drawing needs [lng, lat].
+        const pts = l.points.map(([lat, lng]) => [lng, lat] as [number, number]);
+        const mid = pts[Math.floor(pts.length / 2)] ?? pts[0] ?? [0, 0];
+        return {
+          points: pts,
+          p1: pts[0] ?? [0, 0],
+          ctrl: mid,
+          p2: pts[pts.length - 1] ?? [0, 0],
+          fromNodeOsmId: l.fromNodeOsmId,
+          toNodeOsmId: l.toNodeOsmId,
+        };
+      });
       return;
     }
-
+    // Fallback: compute from edge graph (no lane offset, road-centerline only).
     const nodeById = new Map(this.mapData.nodes.map((n) => [n.id, n]));
     const incomingByNode = new Map<number, typeof this.mapData.edges>();
     const outgoingByNode = new Map<number, typeof this.mapData.edges>();
-
     for (const edge of this.mapData.edges) {
       if (!incomingByNode.has(edge.to)) incomingByNode.set(edge.to, []);
       if (!outgoingByNode.has(edge.from)) outgoingByNode.set(edge.from, []);
       incomingByNode.get(edge.to)!.push(edge);
       outgoingByNode.get(edge.from)!.push(edge);
     }
-
     for (const junction of this.mapData.nodes) {
       const incoming = incomingByNode.get(junction.id) ?? [];
       const outgoing = outgoingByNode.get(junction.id) ?? [];
       if (incoming.length === 0 || outgoing.length === 0) continue;
-
       for (const inEdge of incoming) {
         for (const outEdge of outgoing) {
-          if (inEdge.from === outEdge.to) continue;
+          if (inEdge.from === outEdge.to) continue;  // skip U-turns
           const inSrc = nodeById.get(inEdge.from);
           const outTgt = nodeById.get(outEdge.to);
           if (!inSrc || !outTgt) continue;
           const angle = this.turnAngleRad(inSrc.lng, inSrc.lat, junction.lng, junction.lat, outTgt.lng, outTgt.lat);
           if (angle < TURN_CONNECTOR_MIN_ANGLE_RAD) continue;
-          const path = this.buildTurnConnectorPath(inSrc, junction, outTgt, inEdge.lengthM, outEdge.lengthM);
+          const path = this.buildTurnConnectorPath(inSrc, junction, outTgt, inEdge.lengthM, outEdge.lengthM, inEdge.from, outEdge.to);
           if (path.points.length >= 2) this.turnConnectorPaths.push(path);
         }
       }
-
     }
   }
 
@@ -1241,53 +1284,103 @@ export class Game {
     gfx.clear();
     if (!this.showTurnConnectors || this.turnConnectorPaths.length === 0) return;
 
-    const activeVehicles = this.showTurnConnectorsActiveOnly
-      ? [...this.vehicles.values()].filter((v) => v.onTurnConnector)
-      : [];
+    const activeVehicles = [...this.vehicles.values()].filter((v) => v.onTurnConnector);
 
-    const drawPath = (pathPoints: [number, number][]): void => {
-      const pts = pathPoints.map(([lng, lat]) => this.map.project([lng, lat]));
-      if (pts.length < 2) return;
-      gfx.moveTo(pts[0].x, pts[0].y);
-      for (let i = 1; i < pts.length; i++) {
-        gfx.lineTo(pts[i].x, pts[i].y);
-      }
+    const toScreen = (pts: [number, number][]) =>
+      pts.map(([lng, lat]) => this.map.project([lng, lat]));
+
+    const drawScreenPath = (screenPts: { x: number; y: number }[]): void => {
+      if (screenPts.length < 2) return;
+      gfx.moveTo(screenPts[0].x, screenPts[0].y);
+      for (let i = 1; i < screenPts.length; i++) gfx.lineTo(screenPts[i].x, screenPts[i].y);
     };
 
+    // Draw all (or only active) connector lanes with identical style to straight lane lines.
     for (const path of this.turnConnectorPaths) {
-      if (
-        this.showTurnConnectorsActiveOnly &&
-        !this.connectorPathIsActive(path.points, activeVehicles)
-      ) {
-        continue;
-      }
-      drawPath(path.points);
+      if (this.showTurnConnectorsActiveOnly && !this.connectorPathIsActive(path.points, activeVehicles)) continue;
+      const screenPts = toScreen(path.points);
+      // Same colour rule as redrawLaneLines: A→B yellow, B→A green.
+      const color = path.fromNodeOsmId <= path.toNodeOsmId ? 0xfacc15 : 0x22c55e;
+      drawScreenPath(screenPts);
+      gfx.stroke({ color, alpha: 0.94, width: 2.2 });
+      this.drawArrowsAlongPath(gfx, screenPts, color);
     }
-    // Outer glow-like under-stroke for high contrast against roads/map.
-    gfx.stroke({ color: 0x111827, alpha: 0.9, width: 7 });
 
-    for (const path of this.turnConnectorPaths) {
-      if (
-        this.showTurnConnectorsActiveOnly &&
-        !this.connectorPathIsActive(path.points, activeVehicles)
-      ) {
-        continue;
+    // Active-connector highlight overlay — bright cyan glow on top.
+    const activePaths = this.turnConnectorPaths.filter((p) =>
+      this.connectorPathIsActive(p.points, activeVehicles),
+    );
+    if (activePaths.length > 0) {
+      for (const path of activePaths) {
+        const screenPts = toScreen(path.points);
+        drawScreenPath(screenPts);
       }
-      drawPath(path.points);
+      gfx.stroke({ color: 0x111827, alpha: 0.7, width: 7 });
+      for (const path of activePaths) {
+        const screenPts = toScreen(path.points);
+        drawScreenPath(screenPts);
+      }
+      gfx.stroke({ color: 0x22d3ee, alpha: 0.9, width: 3.0 });
     }
-    gfx.stroke({ color: 0x22d3ee, alpha: 1.0, width: 4 });
+  }
 
-    // Control-point markers: P1 (green), C (yellow), P2 (magenta).
-    for (const path of this.turnConnectorPaths) {
-      if (
-        this.showTurnConnectorsActiveOnly &&
-        !this.connectorPathIsActive(path.points, activeVehicles)
-      ) {
-        continue;
+  /** Draw direction arrows along a polyline on the given Graphics object. */
+  private drawArrowsAlongPath(
+    gfx: import('pixi.js').Graphics,
+    screenPts: { x: number; y: number }[],
+    color: number,
+  ): void {
+    if (screenPts.length < 2) return;
+    const spacingPx = 70;
+    const minSegPx = 18;
+    const arrowLen = 8;
+    const wing = 3.5;
+    let carried = 0;
+    for (let i = 1; i < screenPts.length; i++) {
+      const a = screenPts[i - 1];
+      const b = screenPts[i];
+      const vx = b.x - a.x;
+      const vy = b.y - a.y;
+      const segLen = Math.hypot(vx, vy);
+      if (segLen < minSegPx) continue;
+      const len = segLen;
+      const dx = vx / len;
+      const dy = vy / len;
+      const px = -dy;
+      const py = dx;
+      let t = (spacingPx - carried) / segLen;
+      while (t <= 1) {
+        const x = a.x + vx * t;
+        const y = a.y + vy * t;
+        gfx.moveTo(x - dx * 2 + px * wing, y - dy * 2 + py * wing);
+        gfx.lineTo(x + dx * arrowLen,      y + dy * arrowLen);
+        gfx.lineTo(x - dx * 2 - px * wing, y - dy * 2 - py * wing);
+        gfx.stroke({ color, alpha: 0.95, width: 1.8 });
+        t += spacingPx / segLen;
       }
-      this.drawTurnMarker(gfx, path.p1, 0x22c55e, 5);
-      this.drawTurnMarker(gfx, path.ctrl, 0xfacc15, 5);
-      this.drawTurnMarker(gfx, path.p2, 0xe879f9, 5);
+      const distFromLast = (1 - (t - spacingPx / segLen)) * segLen;
+      carried = distFromLast > 0 ? distFromLast : 0;
+      if (carried >= spacingPx) carried = 0;
+    }
+  }
+
+  private redrawLaneLines(): void {
+    const gfx = this.laneLinesGfx;
+    if (!gfx) return;
+    gfx.clear();
+    if (!this.showLaneLines || !this.mapData) return;
+
+    for (const lane of this.mapData.lanes) {
+      if (!lane.points || lane.points.length < 2) continue;
+      // Connector (junction arc) lanes are rendered by redrawTurnConnectors — skip here.
+      if (lane.isConnector) continue;
+      // Opposite directions on the same physical road get distinct colours.
+      const color = lane.fromNodeOsmId <= lane.toNodeOsmId ? 0xfacc15 : 0x22c55e;
+      const screenPts = lane.points.map((p) => this.map.project([p[1], p[0]]));
+      gfx.moveTo(screenPts[0].x, screenPts[0].y);
+      for (let i = 1; i < screenPts.length; i++) gfx.lineTo(screenPts[i].x, screenPts[i].y);
+      gfx.stroke({ color, alpha: 0.94, width: 2.2 });
+      this.drawArrowsAlongPath(gfx, screenPts, color);
     }
   }
 
@@ -1311,6 +1404,8 @@ export class Game {
     outTgt: { lng: number; lat: number },
     inLenM: number,
     outLenM: number,
+    fromNodeOsmId = 0,
+    toNodeOsmId = 1,
   ): TurnConnectorPath {
     const entryT = Math.max(0, Math.min(1, 1 - TURN_CONNECTOR_ENTRY_M / Math.max(inLenM, 1)));
     const exitT = Math.max(0, Math.min(1, TURN_CONNECTOR_EXIT_M / Math.max(outLenM, 1)));
@@ -1374,6 +1469,8 @@ export class Game {
       p1: [p1Lng, p1Lat],
       ctrl: [ctrlLng, ctrlLat],
       p2: [p2Lng, p2Lat],
+      fromNodeOsmId,
+      toNodeOsmId,
     };
   }
 
@@ -1399,18 +1496,6 @@ export class Game {
     const dLatM = (lat2 - lat1) * 111_320;
     const dLngM = (lng2 - lng1) * 71_700;
     return Math.hypot(dLatM, dLngM);
-  }
-
-  private drawTurnMarker(
-    gfx: PIXI.Graphics,
-    lngLat: [number, number],
-    color: number,
-    radiusPx: number,
-  ): void {
-    const p = this.map.project(lngLat);
-    gfx.circle(p.x, p.y, radiusPx);
-    gfx.fill({ color, alpha: 0.95 });
-    gfx.stroke({ color: 0x0b1020, alpha: 0.95, width: 2 });
   }
 
   private bindEditorPointerHandlers(): void {
@@ -1840,6 +1925,7 @@ export class Game {
     this.sandboxUI?.destroy();
     this.debugRouteGfx?.destroy();
     this.debugVizGfx?.destroy();
+    this.laneLinesGfx?.destroy();
     this.debugConflictLabels?.destroy();
     this.turnConnectorGfx?.destroy();
     this.mapScenarioEditorUI?.destroy();

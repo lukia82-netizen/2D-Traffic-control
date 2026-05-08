@@ -227,9 +227,11 @@ fn build_map_data_from_network(network: &StreetNetwork) -> MapData {
         tram_data,
         is_sandbox: false,
         sandbox_simple_cross_tl: false,
+        lane_width_m: 3.5,
         turn_connectors: Vec::new(),
         lanes: HashMap::new(),
         conflict_areas: HashMap::new(),
+        lane_by_edge_lane: HashMap::new(),
     }
 }
 

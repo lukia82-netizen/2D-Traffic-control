@@ -964,6 +964,7 @@ body.editor-only-app #app-mode-toggle {
 .sbx-header {
   display: flex;
   align-items: center;
+  justify-content: space-between;
   gap: 8px;
   padding: 10px 12px 8px;
   border-bottom: 1px solid rgba(100,140,255,0.15);
@@ -981,6 +982,20 @@ body.editor-only-app #app-mode-toggle {
   font-weight: 600;
   font-size: 13px;
   color: #a8c0ff;
+}
+.sbx-reset-btn {
+  padding: 2px 8px;
+  border-radius: 5px;
+  border: 1px solid rgba(248, 113, 113, 0.45);
+  background: rgba(248, 113, 113, 0.15);
+  color: #fecaca;
+  font-size: 10px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.sbx-reset-btn:hover {
+  background: rgba(248, 113, 113, 0.28);
+  color: #ffe4e6;
 }
 
 /* Sections */

@@ -98,6 +98,11 @@ pub struct LaneData {
     pub conflict_areas: Vec<u64>,
     pub points: Vec<[f64; 2]>,
     pub length_m: f32,
+    pub from_node_osm_id: u64,
+    pub to_node_osm_id: u64,
+    pub lane_index: u8,
+    /// True for connector lanes (junction crossing arcs); false for straight road lanes.
+    pub is_connector: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -129,10 +134,12 @@ pub struct TurnConnectorData {
 /// Load a map from Overpass API or build a sandbox grid.
 /// `force_sandbox`: when `Some`, skip Overpass.
 ///   Values: `"mixed"` | `"one_lane"` | `"two_lane"` | `"three_lane"` | `"single_road"` | `"single_intersection"`
+/// `lane_width_m`: optional lane width override used for lane offset generation.
 #[command]
 pub async fn load_map(
     bbox: BBox,
     force_sandbox: Option<String>,
+    lane_width_m: Option<f32>,
     state: State<'_, AppState>,
 ) -> Result<MapDataResponse, String> {
     log::info!(
@@ -178,6 +185,10 @@ pub async fn load_map(
                 )
             })
     };
+    if let Some(width) = lane_width_m {
+        map_data.lane_width_m = width.clamp(2.0, 6.0);
+    }
+
     apply_overrides_from_disk(&mut map_data)?;
     map_data.rebuild_all_geometry();
     crate::map::road_network::populate_lane_graph(&mut map_data);
@@ -694,6 +705,11 @@ fn build_map_response(map_data: &MapData) -> MapDataResponse {
                 conflict_areas: l.conflict_areas.clone(),
                 points: l.path.points.clone(),
                 length_m: l.path.length_m,
+                from_node_osm_id: l.from_node_osm_id,
+                to_node_osm_id: l.to_node_osm_id,
+                lane_index: l.lane_index,
+                // edge_id == u64::MAX marks connector (junction crossing) lanes.
+                is_connector: l.edge_id == u64::MAX,
             })
             .collect(),
         conflict_areas: map_data

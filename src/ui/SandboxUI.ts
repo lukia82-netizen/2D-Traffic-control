@@ -29,9 +29,11 @@ export type MapBgToggleCb    = (visible: boolean) => void;
 export type TurnConnectorsToggleCb = (visible: boolean) => void;
 export type TurnConnectorsActiveOnlyToggleCb = (activeOnly: boolean) => void;
 export type DebugVisualizationToggleCb = (enabled: boolean) => void;
+export type LaneLinesToggleCb = (enabled: boolean) => void;
 /** center = [lng, lat], sizeM = metres per side */
 export type ReloadMapCb        = (center: [number, number], sizeM: number) => void;
 export type MaxVehiclesCb      = (count: number) => void;
+export type LaneWidthCb        = (laneWidthM: number) => void;
 export type BboxPickCb         = () => void;
 /**
  * Called when the user changes the map/grid mode.
@@ -49,6 +51,7 @@ const GRID_TYPES = [
   { label: '2 pasy',       value: 'two_lane',      hint: 'secondary 70' },
   { label: '3 pasy',       value: 'three_lane',    hint: 'primary 70' },
 ] as const;
+const UI_STORAGE_PREFIX = 'sandbox-ui:';
 
 // ─── City & size presets ─────────────────────────────────────────────────────
 
@@ -98,6 +101,9 @@ export class SandboxUI {
   private gridTypeBtns: Map<string, HTMLButtonElement> = new Map();
   private gridSubsection!: HTMLElement;
   private mapModeBtns: Map<string, HTMLButtonElement> = new Map();
+  private gameViewBtn: HTMLButtonElement | null = null;
+  private osmViewBtn: HTMLButtonElement | null = null;
+  private readonly checkboxDefaults: Map<string, boolean> = new Map();
 
   // Callbacks wired by game.ts
   onLayerToggle:       LayerToggleCb    = () => undefined;
@@ -108,13 +114,16 @@ export class SandboxUI {
   onTurnConnectorsToggle: TurnConnectorsToggleCb = () => undefined;
   onTurnConnectorsActiveOnlyToggle: TurnConnectorsActiveOnlyToggleCb = () => undefined;
   onDebugVisualizationToggle: DebugVisualizationToggleCb = () => undefined;
+  onLaneLinesToggle: LaneLinesToggleCb = () => undefined;
   onReloadMap:         ReloadMapCb      = () => undefined;
   onMaxVehiclesChange: MaxVehiclesCb    = () => undefined;
+  onLaneWidthChange:   LaneWidthCb      = () => undefined;
   onBboxPickRequest:   BboxPickCb       = () => undefined;
   /** Fires when the user changes the map/grid mode. Triggers on selection (not on reload). */
   onMapModeChange:     MapModeCb        = () => undefined;
 
   constructor() {
+    this.restoreModeState();
     this.panel = this.buildPanel();
     document.body.appendChild(this.panel);
   }
@@ -128,7 +137,19 @@ export class SandboxUI {
 
   setChecked(id: string, checked: boolean): void {
     const cb = this.checkboxes.get(id);
-    if (cb) cb.checked = checked;
+    if (!cb) return;
+    cb.checked = checked;
+    this.persistCheckbox(id, checked);
+  }
+
+  /** Applies restored UI state after callbacks are wired by game.ts. */
+  applyPersistedSettings(): void {
+    this.onOsmModeToggle(this.osmMode);
+    this.onMapModeChange(this.currentForceSandbox);
+    for (const [id, cb] of this.checkboxes) {
+      this.persistCheckbox(id, cb.checked);
+      cb.dispatchEvent(new Event('change'));
+    }
   }
 
   /** Call after a map reload completes to update status label and reset button. */
@@ -152,6 +173,7 @@ export class SandboxUI {
     panel.appendChild(this.buildHeader());
     panel.appendChild(this.buildMapModeSection());   // ← NEW: OSM vs Sandbox grid
     panel.appendChild(this.buildAreaSection());
+    panel.appendChild(this.buildLaneWidthSection());
     panel.appendChild(this.buildMaxVehiclesSection());
     panel.appendChild(this.buildViewModeSection());
     panel.appendChild(this.buildLayerSection());
@@ -164,7 +186,16 @@ export class SandboxUI {
   private buildHeader(): HTMLElement {
     const h = document.createElement('div');
     h.className = 'sbx-header';
-    h.innerHTML = `<span class="sbx-badge">SANDBOX</span>`;
+    const badge = document.createElement('span');
+    badge.className = 'sbx-badge';
+    badge.textContent = 'SANDBOX';
+    const resetBtn = document.createElement('button');
+    resetBtn.className = 'sbx-reset-btn';
+    resetBtn.textContent = 'Reset';
+    resetBtn.title = 'Przywróć domyślne ustawienia panelu Sandbox';
+    resetBtn.addEventListener('click', () => this.resetPersistedSettings());
+    h.appendChild(badge);
+    h.appendChild(resetBtn);
     return h;
   }
 
@@ -188,6 +219,7 @@ export class SandboxUI {
       btn.textContent = label;
       btn.addEventListener('click', () => {
         this.mapMode = id as 'osm' | 'sandbox';
+        this.persistModeState();
         this.mapModeBtns.forEach((b, k) => b.classList.toggle('active', k === id));
         this.gridSubsection.style.display = id === 'sandbox' ? '' : 'none';
         this.onMapModeChange(this.currentForceSandbox);
@@ -212,6 +244,7 @@ export class SandboxUI {
       btn.title = gt.hint;
       btn.addEventListener('click', () => {
         this.selectedGridType = gt.value;
+        this.persistModeState();
         this.gridTypeBtns.forEach((b, k) => b.classList.toggle('active', k === gt.value));
         this.onMapModeChange(this.currentForceSandbox);
       });
@@ -288,6 +321,50 @@ export class SandboxUI {
 
   // ── Max vehicles ─────────────────────────────────────────────────────────
 
+  private buildLaneWidthSection(): HTMLElement {
+    const sec = this.makeSection('SZEROKOŚĆ PASA');
+    const row = document.createElement('div');
+    row.className = 'sbx-input-row';
+
+    const input = document.createElement('input');
+    input.type = 'range';
+    input.min = '2.5';
+    input.max = '5.0';
+    input.step = '0.1';
+    input.value = '3.5';
+    input.style.width = '100%';
+
+    const value = document.createElement('div');
+    value.className = 'sbx-area-status';
+    value.textContent = '3.5 m  (auto 1.8m + 1.7m luzu)';
+
+    const describeWidth = (w: number): string => {
+      // clearance between two opposing cars (width 1.8 m each)
+      const gap = (w - 1.8).toFixed(1);
+      return `${w.toFixed(1)} m  (luzu ${gap} m)`;
+    };
+
+    const apply = () => {
+      const laneWidthM = Math.max(2.5, Math.min(5.0, Number(input.value) || 3.5));
+      input.value = laneWidthM.toFixed(1);
+      value.textContent = describeWidth(laneWidthM);
+      this.onLaneWidthChange(laneWidthM);
+    };
+
+    input.addEventListener('input', () => {
+      const laneWidthM = Math.max(2.5, Math.min(5.0, Number(input.value) || 3.5));
+      value.textContent = describeWidth(laneWidthM);
+    });
+    input.addEventListener('change', apply);
+
+    row.appendChild(input);
+    sec.appendChild(row);
+    sec.appendChild(value);
+    return sec;
+  }
+
+  // ── Max vehicles ─────────────────────────────────────────────────────────
+
   private buildMaxVehiclesSection(): HTMLElement {
     const sec = this.makeSection('MAKS. POJAZDÓW');
 
@@ -340,16 +417,20 @@ export class SandboxUI {
       return btn;
     };
 
-    const gameBtn = makeBtn('Gra', true, () => {
+    const gameBtn = makeBtn('Gra', !this.osmMode, () => {
       this.osmMode = false;
+      this.persistModeState();
       this.updateLegendSwatches();
       this.onOsmModeToggle(false);
     });
-    const osmBtn = makeBtn('OSM', false, () => {
+    const osmBtn = makeBtn('OSM', this.osmMode, () => {
       this.osmMode = true;
+      this.persistModeState();
       this.updateLegendSwatches();
       this.onOsmModeToggle(true);
     });
+    this.gameViewBtn = gameBtn;
+    this.osmViewBtn = osmBtn;
 
     row.appendChild(gameBtn);
     row.appendChild(osmBtn);
@@ -409,6 +490,10 @@ export class SandboxUI {
       'debug-visualization', 'Tryb debug skrzyżowań (klawisz D)', '#f43f5e', false,
       (checked) => this.onDebugVisualizationToggle(checked),
     ));
+    sec.appendChild(this.buildCheckRow(
+      'lane-lines', 'Linie pasów (debug)', '#facc15', true,
+      (checked) => this.onLaneLinesToggle(checked),
+    ));
 
     return sec;
   }
@@ -425,9 +510,13 @@ export class SandboxUI {
 
     const cb = document.createElement('input');
     cb.type = 'checkbox';
-    cb.checked = defaultOn;
-    cb.addEventListener('change', () => onChange(cb.checked));
+    cb.checked = this.restoreCheckbox(id, defaultOn);
+    cb.addEventListener('change', () => {
+      this.persistCheckbox(id, cb.checked);
+      onChange(cb.checked);
+    });
     this.checkboxes.set(id, cb);
+    this.checkboxDefaults.set(id, defaultOn);
 
     const swatch = document.createElement('span');
     swatch.className = 'sbx-swatch';
@@ -512,6 +601,58 @@ export class SandboxUI {
       if (legendLine) legendLine.style.background = color;
     }
     // Vehicles / buildings swatches don't change with OSM mode
+  }
+
+  private persistCheckbox(id: string, value: boolean): void {
+    localStorage.setItem(`${UI_STORAGE_PREFIX}cb:${id}`, value ? '1' : '0');
+  }
+
+  private restoreCheckbox(id: string, fallback: boolean): boolean {
+    const raw = localStorage.getItem(`${UI_STORAGE_PREFIX}cb:${id}`);
+    if (raw === '1') return true;
+    if (raw === '0') return false;
+    return fallback;
+  }
+
+  private restoreModeState(): void {
+    const rawMapMode = localStorage.getItem(`${UI_STORAGE_PREFIX}mapMode`);
+    this.mapMode = rawMapMode === 'osm' ? 'osm' : 'sandbox';
+    const rawGrid = localStorage.getItem(`${UI_STORAGE_PREFIX}gridType`);
+    this.selectedGridType = GRID_TYPES.some((g) => g.value === rawGrid) ? rawGrid as string : 'single_intersection';
+    this.osmMode = localStorage.getItem(`${UI_STORAGE_PREFIX}osmMode`) === '1';
+  }
+
+  private persistModeState(): void {
+    localStorage.setItem(`${UI_STORAGE_PREFIX}mapMode`, this.mapMode);
+    localStorage.setItem(`${UI_STORAGE_PREFIX}gridType`, this.selectedGridType);
+    localStorage.setItem(`${UI_STORAGE_PREFIX}osmMode`, this.osmMode ? '1' : '0');
+  }
+
+  private resetPersistedSettings(): void {
+    // Reset mode/view to defaults.
+    this.mapMode = 'sandbox';
+    this.selectedGridType = 'single_intersection';
+    this.osmMode = false;
+    this.persistModeState();
+    this.mapModeBtns.forEach((b, k) => b.classList.toggle('active', k === this.mapMode));
+    this.gridTypeBtns.forEach((b, k) => b.classList.toggle('active', k === this.selectedGridType));
+    this.gridSubsection.style.display = '';
+    this.gameViewBtn?.classList.add('active');
+    this.osmViewBtn?.classList.remove('active');
+
+    // Reset all layer toggles to their default values.
+    for (const [id, cb] of this.checkboxes) {
+      const fallback = this.checkboxDefaults.get(id) ?? cb.checked;
+      cb.checked = fallback;
+      this.persistCheckbox(id, fallback);
+    }
+
+    // Apply immediately in running session.
+    this.onOsmModeToggle(false);
+    this.onMapModeChange(this.currentForceSandbox);
+    for (const [, cb] of this.checkboxes) {
+      cb.dispatchEvent(new Event('change'));
+    }
   }
 }
 

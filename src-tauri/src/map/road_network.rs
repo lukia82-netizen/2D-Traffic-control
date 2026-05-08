@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use kurbo::{BezPath, PathEl, Point, Vec2};
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef;
 use serde::{Deserialize, Serialize};
@@ -154,10 +155,14 @@ pub struct MapData {
     pub is_sandbox: bool,
     /// Single-intersection sandbox (+ cross): 2-phase manual TL (N–S / E–W, no lefts) at init.
     pub sandbox_simple_cross_tl: bool,
+    /// Physical lane width used to offset lanes from the road centerline.
+    pub lane_width_m: f32,
     pub turn_connectors: Vec<TurnConnector>,
     /// Full lane graph used by lane-based movement and conflict reservation.
     pub lanes: HashMap<LaneId, Lane>,
     pub conflict_areas: HashMap<ConflictAreaId, ConflictArea>,
+    /// Index: (edge_index, lane_index) → LaneId for fast connector lookup.
+    pub lane_by_edge_lane: HashMap<(usize, u8), LaneId>,
 }
 
 // ── Demo network ─────────────────────────────────────────────────────────────
@@ -317,9 +322,11 @@ pub fn build_demo_road_network(grid_type: &str, bbox: [f64; 4]) -> MapData {
         tram_data,
         is_sandbox: true,
         sandbox_simple_cross_tl: false,
+        lane_width_m: 3.5,
         turn_connectors: Vec::new(),
         lanes: HashMap::new(),
         conflict_areas: HashMap::new(),
+        lane_by_edge_lane: HashMap::new(),
     };
     populate_lane_graph(&mut map);
     map
@@ -368,21 +375,29 @@ pub fn build_single_road_network(bbox: [f64; 4]) -> MapData {
     node_index_map.insert(1,   end_node);
 
     let half_m = haversine_distance_m(cy, cx - half_lng, cy, cx);
-    let make_edge = |len: f32| RoadEdge {
+    // oneway: false because we add two directed edges (one per direction),
+    // so the lane offset logic can place them on opposite sides of the centerline.
+    let make_edge = |len: f32, reversed: bool| RoadEdge {
         osm_id: 0,
         lanes:  1,
         max_speed: 13.89, // 50 km/h
-        oneway: true,
+        oneway: false,
         infra_type: InfraType::Normal,
         layer: 0,
         length_m: len,
-        lane_directions: vec![LaneDirection::Straight],
+        lane_directions: if reversed {
+            vec![LaneDirection::Straight]
+        } else {
+            vec![LaneDirection::Straight]
+        },
         decision_points: [len * 0.25, len * 0.5, len * 0.75],
         road_type: "secondary".to_string(),
         has_tram_track: false,
     };
-    graph.add_edge(start_node, mid_node, make_edge(half_m));
-    graph.add_edge(mid_node,   end_node, make_edge(half_m));
+    graph.add_edge(start_node, mid_node, make_edge(half_m, false));
+    graph.add_edge(mid_node, start_node, make_edge(half_m, true));
+    graph.add_edge(mid_node,   end_node, make_edge(half_m, false));
+    graph.add_edge(end_node,   mid_node, make_edge(half_m, true));
 
     let bbox = compute_bbox(&graph);
     let spawn_points   = vec![start_node];
@@ -408,9 +423,11 @@ pub fn build_single_road_network(bbox: [f64; 4]) -> MapData {
         tram_data,
         is_sandbox: true,
         sandbox_simple_cross_tl: false,
+        lane_width_m: 3.5,
         turn_connectors: Vec::new(),
         lanes: HashMap::new(),
         conflict_areas: HashMap::new(),
+        lane_by_edge_lane: HashMap::new(),
     };
     populate_lane_graph(&mut map);
     map
@@ -474,11 +491,13 @@ pub fn build_single_intersection_network(bbox: [f64; 4]) -> MapData {
     node_index_map.insert(103, west);
     node_index_map.insert(104, east);
 
+    // oneway: false because we add two directed edges (one per direction).
+    // This allows lane_center_offset_m to separate them onto opposite carriageway sides.
     let make_edge = |len: f32| RoadEdge {
         osm_id: 0,
         lanes: 1,
         max_speed: 11.11, // 40 km/h
-        oneway: true,
+        oneway: false,
         infra_type: InfraType::Normal,
         layer: 0,
         length_m: len,
@@ -526,9 +545,11 @@ pub fn build_single_intersection_network(bbox: [f64; 4]) -> MapData {
         tram_data,
         is_sandbox: true,
         sandbox_simple_cross_tl: false,
+        lane_width_m: 3.5,
         turn_connectors: Vec::new(),
         lanes: HashMap::new(),
         conflict_areas: HashMap::new(),
+        lane_by_edge_lane: HashMap::new(),
     };
     populate_lane_graph(&mut map);
     map
@@ -698,9 +719,11 @@ pub fn build_road_network(osm_data: OsmData) -> MapData {
         tram_data,
         is_sandbox: false,
         sandbox_simple_cross_tl: false,
+        lane_width_m: 3.5,
         turn_connectors: Vec::new(),
         lanes: HashMap::new(),
         conflict_areas: HashMap::new(),
+        lane_by_edge_lane: HashMap::new(),
     };
     populate_lane_graph(&mut map);
     map
@@ -978,8 +1001,51 @@ fn find_boundary_nodes(graph: &RoadGraph, bbox: &[f64; 4]) -> Vec<NodeIndex> {
     }
 }
 
+/// Turn class used for lane-connectivity rules.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TurnClass { Right, Straight, Left, UTurn }
+
+/// Classify the turn made by traversing `in_edge` → `out_edge` through `node`.
+fn classify_turn_at_node(
+    graph: &RoadGraph,
+    in_edge: petgraph::graph::EdgeIndex,
+    out_edge: petgraph::graph::EdgeIndex,
+    node: petgraph::graph::NodeIndex,
+) -> TurnClass {
+    let Some((in_src, in_tgt)) = graph.edge_endpoints(in_edge) else { return TurnClass::Straight; };
+    let Some((out_src, out_tgt)) = graph.edge_endpoints(out_edge) else { return TurnClass::Straight; };
+    if in_tgt != node || out_src != node { return TurnClass::Straight; }
+    // U-turn: the destination of out_edge is the source of in_edge.
+    if out_tgt == in_src { return TurnClass::UTurn; }
+    let n = &graph[node];
+    let s = &graph[in_src];
+    let t = &graph[out_tgt];
+    let in_x  = (n.lng - s.lng) as f32;
+    let in_y  = (n.lat - s.lat) as f32;
+    let out_x = (t.lng - n.lng) as f32;
+    let out_y = (t.lat - n.lat) as f32;
+    let in_len  = (in_x*in_x   + in_y*in_y)  .sqrt().max(1e-6);
+    let out_len = (out_x*out_x + out_y*out_y).sqrt().max(1e-6);
+    let dot = ((in_x/in_len)*(out_x/out_len) + (in_y/in_len)*(out_y/out_len)).clamp(-1.0, 1.0);
+    // Very small deviation → straight continuation (no connector needed).
+    if dot.acos() < 0.25 { return TurnClass::Straight; }
+    // Cross product > 0 → counter-clockwise → left turn (right-hand traffic convention).
+    let cross = in_x * out_y - in_y * out_x;
+    if cross > 0.0 { TurnClass::Left } else { TurnClass::Right }
+}
+
+/// Return the (in_lane, out_lane) pairs that are valid for a given turn class.
+fn valid_connector_pairs(in_lanes: u8, out_lanes: u8, turn: TurnClass) -> Vec<(u8, u8)> {
+    match turn {
+        TurnClass::Right    => vec![(in_lanes - 1, out_lanes - 1)],
+        TurnClass::Straight => (0..in_lanes).map(|i| (i, i.min(out_lanes - 1))).collect(),
+        TurnClass::Left     => vec![(0, 0)],
+        TurnClass::UTurn    => vec![],
+    }
+}
+
 pub fn populate_lane_graph(map: &mut MapData) {
-    const LANE_WIDTH_M: f32 = 3.2;
+    let lane_width_m = map.lane_width_m.max(2.5);
     let mut lanes: HashMap<LaneId, Lane> = HashMap::new();
     let mut by_edge_lane: HashMap<(usize, u8), LaneId> = HashMap::new();
     let mut next_lane_id: LaneId = 1;
@@ -991,22 +1057,33 @@ pub fn populate_lane_graph(map: &mut MapData) {
         let to = &map.graph[edge_ref.target()];
         let (sx, sy) = geo_to_m_xy(from.lat, from.lng);
         let (tx, ty) = geo_to_m_xy(to.lat, to.lng);
-        let dx = tx - sx;
-        let dy = ty - sy;
-        let len = (dx * dx + dy * dy).sqrt().max(1.0);
-        let ux = dx / len;
-        let uy = dy / len;
-        let nx = uy;
-        let ny = -ux;
+        let center_path = edge_centerline_bezpath_m(sx, sy, tx, ty);
+        let center_samples = sample_bezpath_points_m(&center_path, 12);
 
         for lane_idx in 0..edge.lanes.max(1) {
-            let offset_m = lane_center_offset_m(lane_idx, edge.lanes.max(1), edge.oneway);
-            let psx = sx + nx * offset_m;
-            let psy = sy + ny * offset_m;
-            let ptx = tx + nx * offset_m;
-            let pty = ty + ny * offset_m;
-            let (plat, plng) = m_xy_to_geo(psx, psy);
-            let (qlat, qlng) = m_xy_to_geo(ptx, pty);
+            let offset_m = lane_center_offset_m(
+                lane_idx,
+                edge.lanes.max(1),
+                edge.oneway,
+                lane_width_m as f64,
+            );
+            log::debug!(
+                "populate_lane_graph: edge {}→{} oneway={} lane={}/{} offset={:+.2}m",
+                from.osm_id, to.osm_id, edge.oneway,
+                lane_idx, edge.lanes.max(1), offset_m
+            );
+            let lane_samples = offset_polyline_m(&center_samples, offset_m);
+            let mut points: Vec<[f64; 2]> = Vec::with_capacity(lane_samples.len());
+            let mut length_m = 0.0f32;
+            let mut prev_xy: Option<(f64, f64)> = None;
+            for (x, y) in lane_samples {
+                let (lat, lng) = m_xy_to_geo(x, y);
+                points.push([lat, lng]);
+                if let Some((px, py)) = prev_xy {
+                    length_m += ((x - px).powi(2) + (y - py).powi(2)).sqrt() as f32;
+                }
+                prev_xy = Some((x, y));
+            }
 
             let lane_id = next_lane_id;
             next_lane_id += 1;
@@ -1014,10 +1091,10 @@ pub fn populate_lane_graph(map: &mut MapData) {
             lanes.insert(lane_id, Lane {
                 id: lane_id,
                 path: BezierPath {
-                    points: vec![[plat, plng], [qlat, qlng]],
-                    length_m: edge.length_m,
+                    points,
+                    length_m: length_m.max(0.5),
                 },
-                width: LANE_WIDTH_M,
+                width: lane_width_m,
                 connections: Vec::new(),
                 conflict_areas: Vec::new(),
                 from_node_osm_id: from.osm_id,
@@ -1028,8 +1105,11 @@ pub fn populate_lane_graph(map: &mut MapData) {
         }
     }
 
-    // Build lane connections at each node using lane-index pairing and
-    // create physical Bezier connector lanes.
+    // Build lane connections at each node using Cities:Skylines-style rules:
+    //   Right turn  → rightmost in-lane  → rightmost out-lane
+    //   Straight    → lane i             → lane i (clamped)
+    //   Left turn   → leftmost  in-lane  → leftmost  out-lane
+    //   U-turn      → skipped
     for node in map.graph.node_indices() {
         let incoming: Vec<_> = map.graph
             .edges_directed(node, petgraph::Direction::Incoming)
@@ -1042,16 +1122,20 @@ pub fn populate_lane_graph(map: &mut MapData) {
         if incoming.is_empty() || outgoing.is_empty() {
             continue;
         }
+        // For each incoming lane build the connector set once.
+        let mut in_lane_conns: std::collections::HashMap<LaneId, Vec<LaneId>> = std::collections::HashMap::new();
         for (in_edge, in_lanes) in &incoming {
             for in_lane in 0..*in_lanes {
                 let Some(&in_lane_id) = by_edge_lane.get(&(in_edge.index(), in_lane)) else { continue; };
-                let mut conns = Vec::new();
+                let mut conns: Vec<LaneId> = Vec::new();
                 for (out_edge, out_lanes) in &outgoing {
-                    if in_edge == out_edge {
-                        continue;
-                    }
-                    let out_lane = in_lane.min(out_lanes.saturating_sub(1));
-                    if let Some(&out_lane_id) = by_edge_lane.get(&(out_edge.index(), out_lane)) {
+                    // Classify the turn to determine which lane pairs are valid.
+                    let turn = classify_turn_at_node(&map.graph, *in_edge, *out_edge, node);
+                    let pairs = valid_connector_pairs(*in_lanes, *out_lanes, turn);
+                    // Check if this in_lane is part of any valid pair.
+                    for (valid_in, valid_out) in pairs {
+                        if valid_in != in_lane { continue; }
+                        let Some(&out_lane_id) = by_edge_lane.get(&(out_edge.index(), valid_out)) else { continue; };
                         let Some(connector) = build_lane_connector(&lanes, in_lane_id, out_lane_id, next_lane_id) else {
                             conns.push(out_lane_id);
                             continue;
@@ -1060,14 +1144,17 @@ pub fn populate_lane_graph(map: &mut MapData) {
                         let connector_id = connector.id;
                         conns.push(connector_id);
                         lanes.insert(connector_id, connector);
-                        if let Some(out) = lanes.get_mut(&connector_id) {
-                            out.connections.push(out_lane_id);
+                        if let Some(c) = lanes.get_mut(&connector_id) {
+                            c.connections.push(out_lane_id);
                         }
                     }
                 }
-                if let Some(l) = lanes.get_mut(&in_lane_id) {
-                    l.connections = conns;
-                }
+                in_lane_conns.insert(in_lane_id, conns);
+            }
+        }
+        for (lid, conns) in in_lane_conns {
+            if let Some(l) = lanes.get_mut(&lid) {
+                l.connections = conns;
             }
         }
     }
@@ -1128,16 +1215,120 @@ pub fn populate_lane_graph(map: &mut MapData) {
 
     map.lanes = lanes;
     map.conflict_areas = areas;
+    map.lane_by_edge_lane = by_edge_lane;
 }
 
 #[inline]
-fn lane_center_offset_m(lane: u8, lanes_total: u8, oneway: bool) -> f64 {
-    const LANE_WIDTH_M: f64 = 3.2;
+fn lane_center_offset_m(
+    lane: u8,
+    lanes_total: u8,
+    oneway: bool,
+    lane_width_m: f64,
+) -> f64 {
+    // Symmetric lane placement around a ONE carriageway.
+    // For a one-way road the carriageway IS the centerline, so lanes fan out symmetrically.
+    // For a two-way road each directed edge already carries traffic in one direction only;
+    // we offset its lane(s) to the RIGHT of travel (positive = right of the tangent normal).
+    // The normal direction automatically flips for the opposite edge, so using the same
+    // positive offset puts each carriageway on the geometrically correct side without any
+    // direction_sign — adding direction_sign would cancel the normal flip and cause overlap.
+    let centered = ((lane as f64) - ((lanes_total as f64 - 1.0) * 0.5)) * lane_width_m;
     if oneway {
-        ((lane as f64 + 0.5) - (lanes_total as f64) * 0.5) * LANE_WIDTH_M
+        centered
     } else {
-        (lane as f64 + 0.5) * LANE_WIDTH_M
+        // Shift this direction's lanes to the right side of the centerline.
+        centered + (lanes_total as f64 * lane_width_m * 0.5)
     }
+}
+
+fn edge_centerline_bezpath_m(sx: f64, sy: f64, tx: f64, ty: f64) -> BezPath {
+    let mut p = BezPath::new();
+    p.move_to(Point::new(sx, sy));
+    p.line_to(Point::new(tx, ty));
+    p
+}
+
+fn sample_bezpath_points_m(path: &BezPath, segments_per_curve: usize) -> Vec<(f64, f64)> {
+    let mut out: Vec<(f64, f64)> = Vec::new();
+    let n = segments_per_curve.max(4);
+    let mut current: Option<Point> = None;
+
+    for el in path.elements() {
+        match *el {
+            PathEl::MoveTo(p) => {
+                current = Some(p);
+                out.push((p.x, p.y));
+            }
+            PathEl::LineTo(p1) => {
+                if let Some(p0) = current {
+                    for i in 1..=n {
+                        let t = i as f64 / n as f64;
+                        out.push((p0.x + (p1.x - p0.x) * t, p0.y + (p1.y - p0.y) * t));
+                    }
+                }
+                current = Some(p1);
+            }
+            PathEl::QuadTo(p1, p2) => {
+                if let Some(p0) = current {
+                    for i in 1..=n {
+                        let t = i as f64 / n as f64;
+                        let u = 1.0 - t;
+                        let x = u * u * p0.x + 2.0 * u * t * p1.x + t * t * p2.x;
+                        let y = u * u * p0.y + 2.0 * u * t * p1.y + t * t * p2.y;
+                        out.push((x, y));
+                    }
+                }
+                current = Some(p2);
+            }
+            PathEl::CurveTo(p1, p2, p3) => {
+                if let Some(p0) = current {
+                    for i in 1..=n {
+                        let t = i as f64 / n as f64;
+                        let u = 1.0 - t;
+                        let x = u * u * u * p0.x
+                            + 3.0 * u * u * t * p1.x
+                            + 3.0 * u * t * t * p2.x
+                            + t * t * t * p3.x;
+                        let y = u * u * u * p0.y
+                            + 3.0 * u * u * t * p1.y
+                            + 3.0 * u * t * t * p2.y
+                            + t * t * t * p3.y;
+                        out.push((x, y));
+                    }
+                }
+                current = Some(p3);
+            }
+            PathEl::ClosePath => {}
+        }
+    }
+    out
+}
+
+fn offset_polyline_m(points: &[(f64, f64)], offset_m: f64) -> Vec<(f64, f64)> {
+    if points.len() < 2 {
+        return points.to_vec();
+    }
+    let mut out = Vec::with_capacity(points.len());
+    for i in 0..points.len() {
+        let (px, py) = points[i];
+        let (tx, ty) = if i == 0 {
+            (points[1].0 - px, points[1].1 - py)
+        } else if i + 1 == points.len() {
+            (px - points[i - 1].0, py - points[i - 1].1)
+        } else {
+            (points[i + 1].0 - points[i - 1].0, points[i + 1].1 - points[i - 1].1)
+        };
+        let tangent = Vec2::new(tx, ty);
+        let len = (tangent.x * tangent.x + tangent.y * tangent.y).sqrt();
+        if len <= 1e-9 {
+            out.push((px, py));
+            continue;
+        }
+        let nx = tangent.y / len;
+        let ny = -tangent.x / len;
+        out.push((px + nx * offset_m, py + ny * offset_m));
+    }
+    out
 }
 
 #[inline]

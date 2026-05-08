@@ -111,6 +111,8 @@ pub struct Vehicle {
     pub turn_from_edge: usize,
     /// Edge index of outgoing edge targeted by current connector traversal.
     pub turn_to_edge: usize,
+    /// ID of the precomputed connector lane being followed (overrides Bezier when set).
+    pub connector_lane_id: Option<LaneId>,
 }
 
 impl Vehicle {
@@ -172,6 +174,7 @@ impl Vehicle {
             turn_p2_lng: lng,
             turn_from_edge: 0,
             turn_to_edge: 0,
+            connector_lane_id: None,
         }
     }
 

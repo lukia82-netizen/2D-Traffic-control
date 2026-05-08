@@ -80,6 +80,11 @@ export interface LaneData {
   conflictAreas: number[];
   points: [number, number][];
   lengthM: number;
+  fromNodeOsmId: number;
+  toNodeOsmId: number;
+  laneIndex: number;
+  /** True for connector (junction-crossing arc) lanes; false for straight road lanes. */
+  isConnector: boolean;
 }
 
 export interface ConflictAreaData {
@@ -119,10 +124,12 @@ export interface TurnConnector {
  * forceSandbox: when provided, skip Overpass and build the sandbox grid.
  *   Values: 'mixed' | 'one_lane' | 'two_lane' | 'three_lane'
  *   Pass null/undefined to use the real OSM map.
+ * laneWidthM: physical lane width used for lane offset generation.
  */
 export async function loadMap(
   bbox: [number, number, number, number],
   forceSandbox?: string | null,
+  laneWidthM?: number,
 ): Promise<MapData> {
   return invoke<MapData>('load_map', {
     bbox: {
@@ -132,6 +139,7 @@ export async function loadMap(
       north: bbox[3],
     },
     forceSandbox: forceSandbox ?? null,
+    laneWidthM: laneWidthM ?? null,
   });
 }
 
