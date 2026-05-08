@@ -160,26 +160,44 @@ export interface IdmDebugPayload {
   threatKind: string;
   threatLineStyle: string;
   threatPoint: [number, number] | null;
+  stopLinePoint: [number, number] | null;
+  turnEntryPoint: [number, number] | null;
   hoodLngLat: [number, number];
   rearBumperLngLat: [number, number];
   routePoints: [number, number][];
 }
 
 export interface DebugConflictPoint {
+  id: number;
   lng: number;
   lat: number;
+  radiusM: number;
   reservedBy: number | null;
+  collidingWithObb: boolean;
 }
 
 export interface DebugVehicleThreat {
   vehicleId: number;
+  centerLngLat: [number, number];
   hoodLngLat: [number, number];
   rearBumperLngLat: [number, number];
   threatLngLat: [number, number] | null;
+  rightArrowLngLat: [number, number];
+  rightArrowActive: boolean;
+  hasSignalPriority: boolean;
+  yieldToVehicleLngLat: [number, number] | null;
+  yieldToVehicleId: number | null;
+  reservationPath: [number, number][] | null;
+  comfortBrakeEndLngLat: [number, number];
+  emergencyBrakeEndLngLat: [number, number];
+  emergencyBrakingActive: boolean;
+  obbCorners: [number, number][];
+  collidingConflictPointIds: number[];
   lineStyle: string;
   threatKind: string;
   leaderVehicleId: number | null;
   conflictReserverId: number | null;
+  debugState: string | null;
 }
 
 export interface DebugVisualizationPayload {

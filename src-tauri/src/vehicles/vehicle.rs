@@ -13,6 +13,10 @@ pub struct Vehicle {
     pub speed: f32,
     /// Current acceleration m/s²
     pub accel: f32,
+    /// OBB half length in metres for collision checks.
+    pub obb_half_length_m: f32,
+    /// OBB half width in metres for collision checks.
+    pub obb_half_width_m: f32,
     pub vehicle_type: VehicleType,
     pub driver_profile: DriverProfile,
 
@@ -121,6 +125,8 @@ impl Vehicle {
             angle: 0.0,
             speed: 0.0,
             accel: 0.0,
+            obb_half_length_m: vehicle_type.params().length_m * 0.5,
+            obb_half_width_m: vehicle_type.params().width_m * 0.5,
             vehicle_type,
             driver_profile,
             personal_compliance,
