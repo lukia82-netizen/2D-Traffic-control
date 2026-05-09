@@ -452,12 +452,40 @@ fn build_lane_route_from_edge_route(
                     .get(&prev)
                     .is_some_and(|l| l.edge_id != chosen.edge_id)
                 {
+                    let candidate_diag = map
+                        .lanes
+                        .values()
+                        .filter(|l| l.edge_id == chosen.edge_id)
+                        .map(|cand| {
+                            let direct = map
+                                .lanes
+                                .get(&prev)
+                                .is_some_and(|pl| pl.connections.contains(&cand.id));
+                            let via_connector = map
+                                .lanes
+                                .get(&prev)
+                                .is_some_and(|pl| {
+                                    pl.connections.iter().copied().any(|c| {
+                                        map.lanes
+                                            .get(&c)
+                                            .map(|cl| cl.connections.contains(&cand.id))
+                                            .unwrap_or(false)
+                                    })
+                                });
+                            format!(
+                                "{{lane_id:{} lane_idx:{} direct:{} via_conn:{}}}",
+                                cand.id, cand.lane_index, direct, via_connector
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
                     log::warn!(
-                        "Lane route gap: missing connector lane {} -> {} (edge {} -> {})",
+                        "Lane route gap: missing connector lane {} -> {} (edge {} -> {}). candidates=[{}]",
                         prev,
                         chosen.id,
                         map.lanes.get(&prev).map(|l| l.edge_id).unwrap_or(u64::MAX),
-                        chosen.edge_id
+                        chosen.edge_id,
+                        candidate_diag
                     );
                 }
             }

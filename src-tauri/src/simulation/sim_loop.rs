@@ -2142,10 +2142,14 @@ fn apply_vehicle_physics(
                 }
             }
             if !sync_vehicle_lane_route_state(vehicle, map) {
+                let active_lane = vehicle.current_lane_id;
+                let next_edge = vehicle.route.get(vehicle.route_pos).map(|e| e.index());
                 log::warn!(
-                    "AUTO {} STRACILO CEL NA SKRZYZOWANIU: brak lane-route handover (route_pos={})",
+                    "AUTO {} STRACILO CEL NA SKRZYZOWANIU: brak lane-route handover (route_pos={}, active_lane_id={:?}, next_edge={:?})",
                     vehicle.id,
-                    vehicle.route_pos
+                    vehicle.route_pos,
+                    active_lane,
+                    next_edge
                 );
             }
             vehicle.connector_lane_id = None;
@@ -2233,8 +2237,18 @@ fn apply_vehicle_physics(
             }
         }
         if can_enter_connector && vehicle.edge_progress >= conn.entry_progress {
+            let edge_progress_before_entry = vehicle.edge_progress;
             vehicle.on_turn_connector = true;
-            vehicle.turn_dist_m = 0.0;
+            // If we crossed entry within this frame, start the connector with
+            // matching distance to avoid snapping backward to connector start.
+            let overshoot_ratio = if conn.entry_progress < 1.0 {
+                ((edge_progress_before_entry - conn.entry_progress) / (1.0 - conn.entry_progress))
+                    .clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            vehicle.turn_dist_m = (conn.length_m as f64 * overshoot_ratio as f64)
+                .clamp(0.0, conn.length_m as f64);
             vehicle.turn_from_edge = edge_idx.index();
             if vehicle.route_pos + 1 < vehicle.route.len() {
                 vehicle.turn_to_edge = vehicle.route[vehicle.route_pos + 1].index();
@@ -2280,7 +2294,8 @@ fn apply_vehicle_physics(
                 map.lanes
                     .get(&cid)
                     .and_then(|cl| {
-                        sample_connector_kurbo_at(cl, 0.0).or_else(|| sample_lane_path_at(cl, 0.0))
+                        sample_connector_kurbo_at(cl, vehicle.turn_dist_m as f32)
+                            .or_else(|| sample_lane_path_at(cl, vehicle.turn_dist_m as f32))
                     })
                     .map(|(lat0, lng0, angle0)| {
                         vehicle.lat = lat0;
@@ -2300,7 +2315,7 @@ fn apply_vehicle_physics(
                     conn.p2_lat,
                     conn.p2_lng,
                 );
-                let state0 = path0.get_state(0.0);
+                let state0 = path0.get_state(vehicle.turn_dist_m);
                 let (lat0, lng0, angle0) = bezier_state_to_geo(&state0);
                 vehicle.lat = lat0;
                 vehicle.lng = lng0;
@@ -2323,7 +2338,21 @@ fn apply_vehicle_physics(
 
         // Recompute which lane to target based on the upcoming turn.
         vehicle.target_lane = compute_vehicle_target_lane(vehicle, map);
-        let _ = sync_vehicle_lane_route_state(vehicle, map);
+        if !sync_vehicle_lane_route_state(vehicle, map) {
+            let active_lane = vehicle.current_lane_id;
+            let next_edge = vehicle.route.get(vehicle.route_pos).map(|e| e.index());
+            let lane_conn_count = active_lane
+                .and_then(|lid| map.lanes.get(&lid).map(|l| l.connections.len()))
+                .unwrap_or(0);
+            log::warn!(
+                "AUTO {} EDGE-END: brak sukcesora lane na nowym odcinku (route_pos={}, active_lane_id={:?}, active_lane_connections={}, next_edge={:?})",
+                vehicle.id,
+                vehicle.route_pos,
+                active_lane,
+                lane_conn_count,
+                next_edge
+            );
+        }
         vehicle.lane_progress_m = 0.0;
     }
 
@@ -3195,6 +3224,16 @@ fn planned_turn_connector(vehicle: &Vehicle, map: &MapData) -> Option<PlannedTur
         if let Some(clane) = map.lanes.get(&cid) {
             let pts = &clane.path.points;
             if pts.len() >= 2 {
+                let curr_len = map
+                    .graph
+                    .edge_weight(in_edge)
+                    .map(|e| e.length_m.max(1.0))
+                    .unwrap_or(1.0);
+                let next_len = map
+                    .graph
+                    .edge_weight(out_edge)
+                    .map(|e| e.length_m.max(1.0))
+                    .unwrap_or(1.0);
                 let p1 = pts[0];
                 let p2 = *pts.last().unwrap();
                 let mid = pts[pts.len() / 2];
@@ -3202,9 +3241,9 @@ fn planned_turn_connector(vehicle: &Vehicle, map: &MapData) -> Option<PlannedTur
                     .map(|c| c.arclen(CONNECTOR_ARCLEN_ACC) as f32)
                     .unwrap_or(clane.path.length_m);
                 return Some(PlannedTurnConnector {
-                    // Connector starts exactly at the end of the incoming lane (junction node).
-                    entry_progress: 1.0,
-                    exit_progress: 0.0,
+                    // Keep transition points consistent with connector endpoint insets.
+                    entry_progress: (1.0 - TURN_CONNECTOR_ENTRY_M / curr_len).clamp(0.0, 1.0),
+                    exit_progress: (TURN_CONNECTOR_EXIT_M / next_len).clamp(0.0, 1.0),
                     length_m,
                     p1_lat: p1[0],
                     p1_lng: p1[1],
