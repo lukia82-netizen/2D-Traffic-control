@@ -219,6 +219,14 @@ export class Game {
   private showTurnConnectorsActiveOnly = false;
   private showLaneLines = true;
 
+  // ── Traffic Motion Debug layer ─────────────────────────────────────────────
+  /** Whether the "Tryb Debugowania Ruchu" overlay is active. */
+  private showTrafficDebug = false;
+  private trafficDebugGfx: PIXI.Graphics | null = null;
+  private trafficDebugLabels: PIXI.Container | null = null;
+  /** Fast O(1) lane lookup rebuilt whenever map data changes. */
+  private laneById: Map<number, MapData['lanes'][0]> = new Map();
+
   // Scoring
   private score = 0;
   private gameOver = false;
@@ -294,6 +302,14 @@ export class Game {
     this.overlay.congestionLayer.addChild(this.debugVizGfx);
     this.overlay.congestionLayer.addChild(this.laneLinesGfx);
     this.overlay.congestionLayer.addChild(this.debugConflictLabels);
+
+    // Traffic motion debug — lives in the topmost layer so it renders above all roads/vehicles
+    this.trafficDebugGfx = new PIXI.Graphics();
+    this.trafficDebugLabels = new PIXI.Container();
+    this.trafficDebugGfx.visible = false;
+    this.trafficDebugLabels.visible = false;
+    this.overlay.trafficDebugLayer.addChild(this.trafficDebugGfx);
+    this.overlay.trafficDebugLayer.addChild(this.trafficDebugLabels);
 
     window.addEventListener('keydown', (ev) => {
       if (!this.tauriAvailable) return;
@@ -375,6 +391,9 @@ export class Game {
         this.redrawConflictAreas();
         if (this.debugVisualizationEnabled && this.latestDebugVisualization) {
           this.redrawFullDebugVisualization();
+        }
+        if (this.showTrafficDebug && this.latestDebugVisualization) {
+          this.redrawTrafficDebugLayer();
         }
       }
     });
@@ -525,6 +544,9 @@ export class Game {
       this.redrawTurnConnectors();
       this.redrawConflictAreas();
     };
+    ui.onTrafficDebugToggle = (enabled) => {
+      void this.setTrafficDebugMode(enabled);
+    };
     ui.setChecked('turn-connectors', this.showTurnConnectors);
     ui.setChecked('turn-connectors-active-only', this.showTurnConnectorsActiveOnly);
     ui.applyPersistedSettings();
@@ -578,6 +600,7 @@ export class Game {
     this.trafficLightUI.init(this.mapData.nodes);
     this.trafficLightRenderer.init(this.mapData.nodes, this.mapData.edges);
     this.rebuildTurnConnectorPaths();
+    this.rebuildLaneById();
     this.redrawTurnConnectors();
     this.redrawLaneLines();
     this.redrawConflictAreas();
@@ -631,6 +654,7 @@ export class Game {
     this.trafficLightUI.init(this.mapData.nodes);
     this.trafficLightRenderer.init(this.mapData.nodes, this.mapData.edges);
     this.rebuildTurnConnectorPaths();
+    this.rebuildLaneById();
     this.redrawTurnConnectors();
     this.redrawLaneLines();
     this.redrawConflictAreas();
@@ -676,6 +700,7 @@ export class Game {
     this.trafficLightUI.init(mapData.nodes);
     this.trafficLightRenderer.init(mapData.nodes, mapData.edges);
     this.rebuildTurnConnectorPaths();
+    this.rebuildLaneById();
     this.redrawTurnConnectors();
     this.redrawLaneLines();
     this.redrawConflictAreas();
@@ -689,6 +714,17 @@ export class Game {
     this.gameClockUI.setTimeScaleValue(scenario.timeScale);
     if (this.tauriAvailable) {
       setMaxVehicles(scenario.maxVehicles).catch(console.error);
+    }
+  }
+
+  // ─── Lane lookup cache ─────────────────────────────────────────────────────
+
+  /** Rebuild O(1) lane lookup table from the current map data. */
+  private rebuildLaneById(): void {
+    this.laneById.clear();
+    if (!this.mapData) return;
+    for (const lane of this.mapData.lanes) {
+      this.laneById.set(lane.id, lane);
     }
   }
 
@@ -834,13 +870,40 @@ export class Game {
       this.debugConflictLabels.visible = enabled;
     }
     if (!enabled) {
-      this.latestDebugVisualization = null;
       this.debugVizGfx?.clear();
       this.debugConflictLabels?.removeChildren();
+      // Only clear cached data when neither debug mode needs it
+      if (!this.showTrafficDebug) {
+        this.latestDebugVisualization = null;
+      }
     }
-    if (this.tauriAvailable) {
-      await setDebugVisualization(enabled).catch(console.error);
+    await this.syncBackendDebugState();
+  }
+
+  /** Enable/disable the "Tryb Debugowania Ruchu" traffic motion debug overlay. */
+  private async setTrafficDebugMode(enabled: boolean): Promise<void> {
+    this.showTrafficDebug = enabled;
+    if (this.trafficDebugGfx) this.trafficDebugGfx.visible = enabled;
+    if (this.trafficDebugLabels) this.trafficDebugLabels.visible = enabled;
+    if (!enabled) {
+      this.trafficDebugGfx?.clear();
+      this.trafficDebugLabels?.removeChildren();
+      // Only clear cached data when neither debug mode needs it
+      if (!this.debugVisualizationEnabled) {
+        this.latestDebugVisualization = null;
+      }
     }
+    await this.syncBackendDebugState();
+  }
+
+  /**
+   * Ensures the Rust backend emits `debug_visualization` events whenever
+   * at least one of the two debug modes (intersection debug / traffic debug) is active.
+   */
+  private async syncBackendDebugState(): Promise<void> {
+    if (!this.tauriAvailable) return;
+    const needed = this.debugVisualizationEnabled || this.showTrafficDebug;
+    await setDebugVisualization(needed).catch(console.error);
   }
 
   private redrawFullDebugVisualization(): void {
@@ -1185,6 +1248,200 @@ export class Game {
         distanceToLeader: 0,
       });
       await setDebugVehicle(null).catch(console.error);
+    }
+  }
+
+  // ─── Traffic Motion Debug layer ────────────────────────────────────────────
+
+  /**
+   * Full-map traffic motion debug overlay.
+   * Drawn on the topmost layer (trafficDebugLayer) so it is always visible
+   * above roads, vehicles and the editor overlay.
+   *
+   * Covers four sub-layers per vehicle:
+   *   a) IDM leader line – red dashed from vehicle front to leader rear + distance label
+   *   b) Current lane / connector path – bright blue (α 0.3)
+   *   c) Conflict lines – yellow to blocked CPs, thick red when yielding
+   *   d) Floating status label – speed, target lane, driver state
+   *
+   * Plus a global intersection-conflict-point map:
+   *   Green circle = free, Red circle = reserved (with reserver ID)
+   */
+  private redrawTrafficDebugLayer(): void {
+    if (!this.showTrafficDebug || !this.latestDebugVisualization) return;
+    const gfx = this.trafficDebugGfx;
+    const lbl = this.trafficDebugLabels;
+    if (!gfx || !lbl) return;
+
+    gfx.clear();
+    lbl.removeChildren();
+
+    const DATA = this.latestDebugVisualization;
+
+    // Helper – geo distance in metres (equirectangular approximation)
+    const geoDistM = (lat1: number, lng1: number, lat2: number, lng2: number): number =>
+      Math.hypot((lat2 - lat1) * 111_320, (lng2 - lng1) * 71_700);
+
+    // Helper – dashed line between two screen points
+    const drawDashed = (
+      x0: number, y0: number, x1: number, y1: number,
+      width: number, color: number, alpha = 0.95,
+      dashLen = 6, gapLen = 4,
+    ): void => {
+      const dx = x1 - x0;
+      const dy = y1 - y0;
+      const len = Math.hypot(dx, dy);
+      if (len < 4) return;
+      const ux = dx / len;
+      const uy = dy / len;
+      let t = 0;
+      let on = true;
+      let cx = x0;
+      let cy = y0;
+      while (t < len) {
+        const step = on ? dashLen : gapLen;
+        const nt = Math.min(len, t + step);
+        const nx = x0 + ux * nt;
+        const ny = y0 + uy * nt;
+        if (on) {
+          gfx.moveTo(cx, cy);
+          gfx.lineTo(nx, ny);
+        }
+        cx = nx;
+        cy = ny;
+        t = nt;
+        on = !on;
+      }
+      gfx.stroke({ color, alpha, width });
+    };
+
+    // ── 3. Intersection conflict-point map ─────────────────────────────────
+    // Drawn first so vehicle-specific lines appear on top.
+    for (const cp of DATA.conflictPoints) {
+      const p = this.map.project([cp.lng, cp.lat]);
+      const reserved = cp.reservedBy != null && cp.reservedBy !== undefined;
+      const col = reserved ? 0xef4444 : 0x22c55e;
+      const radius = 5;
+      gfx.circle(p.x, p.y, radius);
+      gfx.fill({ color: col, alpha: 0.5 });
+      gfx.stroke({ color: col, alpha: 0.92, width: 1.5 });
+
+      if (reserved) {
+        const t = new PIXI.Text({
+          text: `#${cp.reservedBy}`,
+          style: { fontFamily: 'monospace', fontSize: 8, fill: 0xfca5a5 },
+        });
+        t.x = p.x + 7;
+        t.y = p.y - 9;
+        t.alpha = 0.92;
+        lbl.addChild(t);
+      }
+    }
+
+    // Build fast lookups
+    const threatById = new Map(DATA.vehicleThreats.map((t) => [t.vehicleId, t]));
+    const conflictById = new Map(DATA.conflictPoints.map((c) => [c.id, c]));
+
+    // ── Per-vehicle debug ──────────────────────────────────────────────────
+    for (const th of DATA.vehicleThreats) {
+      const vehicleState = this.vehicles.get(th.vehicleId);
+      const hoodPx = this.map.project(th.hoodLngLat);
+
+      // ── a) IDM Leader line ─────────────────────────────────────────────
+      if (th.leaderVehicleId != null) {
+        const leaderThreat = threatById.get(th.leaderVehicleId);
+        if (leaderThreat) {
+          const leaderRearPx = this.map.project(leaderThreat.rearBumperLngLat);
+          drawDashed(
+            hoodPx.x, hoodPx.y,
+            leaderRearPx.x, leaderRearPx.y,
+            1.5, 0xef4444, 0.92,
+          );
+          // Distance label at midpoint
+          const distM = geoDistM(
+            th.hoodLngLat[1], th.hoodLngLat[0],
+            leaderThreat.rearBumperLngLat[1], leaderThreat.rearBumperLngLat[0],
+          );
+          const midX = (hoodPx.x + leaderRearPx.x) * 0.5;
+          const midY = (hoodPx.y + leaderRearPx.y) * 0.5;
+          const distTxt = new PIXI.Text({
+            text: `${distM.toFixed(1)}m`,
+            style: { fontFamily: 'monospace', fontSize: 8, fill: 0xfca5a5 },
+          });
+          distTxt.x = midX + 3;
+          distTxt.y = midY - 9;
+          distTxt.alpha = 0.92;
+          lbl.addChild(distTxt);
+        }
+      }
+
+      // ── b) Lane / connector path ───────────────────────────────────────
+      // Reservation path through intersection (connector) – bright blue, α 0.5
+      if (th.reservationPath && th.reservationPath.length >= 2) {
+        const rp = th.reservationPath.map(([lng, lat]) => this.map.project([lng, lat]));
+        gfx.moveTo(rp[0].x, rp[0].y);
+        for (let i = 1; i < rp.length; i++) gfx.lineTo(rp[i].x, rp[i].y);
+        gfx.stroke({ color: 0x60a5fa, alpha: 0.55, width: 5 });
+      }
+
+      // Current lane from the static lane graph – bright blue, α 0.3
+      if (vehicleState?.currentLaneId != null) {
+        const lane = this.laneById.get(vehicleState.currentLaneId);
+        if (lane && lane.points.length >= 2) {
+          // Lane points are stored as [lat, lng]; project needs [lng, lat]
+          const pts = lane.points.map(([lat, lng]) => this.map.project([lng, lat]));
+          gfx.moveTo(pts[0].x, pts[0].y);
+          for (let i = 1; i < pts.length; i++) gfx.lineTo(pts[i].x, pts[i].y);
+          const isConnector = lane.isConnector;
+          gfx.stroke({
+            color: 0x60a5fa,
+            alpha: isConnector ? 0.5 : 0.3,
+            width: isConnector ? 6 : 3.5,
+          });
+        }
+      }
+
+      // ── c) Conflict lines ──────────────────────────────────────────────
+      // Yellow line to each CP the vehicle's OBB is currently colliding with
+      for (const cpId of th.collidingConflictPointIds ?? []) {
+        const cp = conflictById.get(cpId);
+        if (!cp) continue;
+        const cpPx = this.map.project([cp.lng, cp.lat]);
+        gfx.moveTo(hoodPx.x, hoodPx.y);
+        gfx.lineTo(cpPx.x, cpPx.y);
+        gfx.stroke({ color: 0xfacc15, alpha: 0.88, width: 1.5 });
+      }
+
+      // Thick red line to the threat point when the vehicle is yielding due to
+      // an occupied conflict point (conflictReserverId set = someone else holds the CP)
+      if (th.threatLngLat && th.conflictReserverId != null) {
+        const p1 = this.map.project(th.threatLngLat);
+        gfx.moveTo(hoodPx.x, hoodPx.y);
+        gfx.lineTo(p1.x, p1.y);
+        gfx.stroke({ color: 0xef4444, alpha: 0.95, width: 4 });
+      }
+
+      // ── d) Floating status label ───────────────────────────────────────
+      const speedMs = vehicleState?.speed ?? 0;
+      const speedKmh = Math.round(speedMs * 3.6);
+      const laneId = vehicleState?.currentLaneId != null
+        ? String(vehicleState.currentLaneId)
+        : '?';
+      const state = th.debugState ?? 'IDLE';
+      const centerPx = this.map.project(th.centerLngLat);
+
+      const statusText = new PIXI.Text({
+        text: `V:${speedKmh}km/h | L:${laneId} | ${state}`,
+        style: {
+          fontFamily: 'monospace',
+          fontSize: 8,
+          fill: 0xfef9c3,
+        },
+      });
+      statusText.x = centerPx.x - statusText.width * 0.5;
+      statusText.y = centerPx.y - 20;
+      statusText.alpha = 0.95;
+      lbl.addChild(statusText);
     }
   }
 
@@ -1851,6 +2108,9 @@ export class Game {
     if (this.debugVisualizationEnabled && this.latestDebugVisualization) {
       this.redrawFullDebugVisualization();
     }
+    if (this.showTrafficDebug && this.latestDebugVisualization) {
+      this.redrawTrafficDebugLayer();
+    }
 
     if (this.gameClockUI.paused || this.gameOver) return;
 
@@ -1940,6 +2200,8 @@ export class Game {
     this.laneLinesGfx?.destroy();
     this.debugConflictLabels?.destroy();
     this.turnConnectorGfx?.destroy();
+    this.trafficDebugGfx?.destroy();
+    this.trafficDebugLabels?.destroy();
     this.mapScenarioEditorUI?.destroy();
     this.edgeEditorPanel?.remove();
     this.toolSwitchPanel?.remove();
