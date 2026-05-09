@@ -398,8 +398,44 @@ fn build_lane_route_from_edge_route(
                 .filter(|l| l.edge_id == edge.index() as u64)
                 .collect();
         }
-        if let Some(chosen) = candidates.into_iter().min_by_key(|l| l.lane_index) {
+        // Choose a lane that is actually reachable from previous lane via:
+        //   prev -> chosen (direct) OR prev -> connector -> chosen.
+        let chosen_opt = if let Some(prev) = out.last().copied() {
+            let reachability_rank = |lane: &crate::map::road_network::Lane| -> i32 {
+                let Some(prev_lane) = map.lanes.get(&prev) else {
+                    return 3;
+                };
+                // Best case: direct continuation.
+                if prev_lane.connections.contains(&lane.id) {
+                    return 0;
+                }
+                // Otherwise look for a connector continuation.
+                let via_connector = prev_lane.connections.iter().copied().any(|c| {
+                    map.lanes
+                        .get(&c)
+                        .map(|cl| cl.connections.contains(&lane.id))
+                        .unwrap_or(false)
+                });
+                if via_connector { 1 } else { 3 }
+            };
+            candidates
+                .into_iter()
+                .min_by_key(|l| (reachability_rank(l), l.lane_index))
+        } else {
+            candidates.into_iter().min_by_key(|l| l.lane_index)
+        };
+
+        if let Some(chosen) = chosen_opt {
             if let Some(prev) = out.last().copied() {
+                // Direct prev -> chosen continuation exists.
+                let direct = map
+                    .lanes
+                    .get(&prev)
+                    .is_some_and(|l| l.connections.contains(&chosen.id));
+                if direct {
+                    out.push(chosen.id);
+                    continue;
+                }
                 // If a connector exists from previous lane to this lane, include it.
                 let connector = map.lanes.get(&prev).and_then(|l| {
                     l.connections.iter().copied().find(|c| {
