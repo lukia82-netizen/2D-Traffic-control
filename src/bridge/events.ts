@@ -182,52 +182,12 @@ export interface IdmDebugPayload {
   hoodLngLat: [number, number];
   rearBumperLngLat: [number, number];
   routePoints: [number, number][];
-}
-
-export interface DebugConflictPoint {
-  id: number;
-  lng: number;
-  lat: number;
-  radiusM: number;
-  reservedBy: number | null;
-  collidingWithObb: boolean;
-}
-
-export interface DebugVehicleThreat {
-  vehicleId: number;
-  centerLngLat: [number, number];
-  hoodLngLat: [number, number];
-  rearBumperLngLat: [number, number];
-  threatLngLat: [number, number] | null;
-  rightArrowLngLat: [number, number];
-  rightArrowActive: boolean;
-  hasSignalPriority: boolean;
-  yieldToVehicleLngLat: [number, number] | null;
-  yieldToVehicleId: number | null;
-  reservationPath: [number, number][] | null;
-  routeConflictPointIds: number[];
-  comfortBrakeEndLngLat: [number, number];
-  emergencyBrakeEndLngLat: [number, number];
-  emergencyBrakingActive: boolean;
-  obbCorners: [number, number][];
-  collidingConflictPointIds: number[];
-  lineStyle: string;
-  threatKind: string;
-  leaderVehicleId: number | null;
-  conflictReserverId: number | null;
-  debugState: string | null;
-}
-
-export interface DebugLanePath {
-  lanePathId: string;
-  colorIdx: number;
-  points: [number, number][];
-}
-
-export interface DebugVisualizationPayload {
-  lanePaths: DebugLanePath[];
-  conflictPoints: DebugConflictPoint[];
-  vehicleThreats: DebugVehicleThreat[];
+  /** P1 → control → P2 in [lng, lat] while on a turn connector (Bezier debug). */
+  bezierControlPathLngLat?: [number, number][];
+  /** Planned lane graph ids from current lane onward (includes connector lane ids). */
+  laneRouteIds?: number[];
+  /** When IDM is braking hard, short cause string for HUD. */
+  brakeReason?: string | null;
 }
 
 /**
@@ -256,14 +216,3 @@ export async function listenIdmDebug(
   return unlisten;
 }
 
-/**
- * Full-map debug overlay (conflict points + per-vehicle threat rays). ~60 Hz when enabled in sim.
- */
-export async function listenDebugVisualization(
-  cb: (data: DebugVisualizationPayload) => void,
-): Promise<() => void> {
-  const unlisten = await listen<DebugVisualizationPayload>('debug_visualization', (event) => {
-    cb(event.payload);
-  });
-  return unlisten;
-}

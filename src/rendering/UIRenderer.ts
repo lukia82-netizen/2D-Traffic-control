@@ -27,6 +27,9 @@ export class UIRenderer {
   private readonly telemetryDesired: HTMLElement;
   private readonly telemetryAccel: HTMLElement;
   private readonly telemetryDistance: HTMLElement;
+  private readonly telemetryTurnT: HTMLElement;
+  private readonly telemetryLaneRoute: HTMLElement;
+  private readonly telemetryBrake: HTMLElement;
   private readonly telemetryHint: HTMLElement;
 
   // Game-over overlay elements
@@ -54,6 +57,9 @@ export class UIRenderer {
     this.telemetryDesired = this.require('telemetry-desired');
     this.telemetryAccel = this.require('telemetry-accel');
     this.telemetryDistance = this.require('telemetry-distance');
+    this.telemetryTurnT = this.require('telemetry-turn-t');
+    this.telemetryLaneRoute = this.require('telemetry-lane-route');
+    this.telemetryBrake = this.require('telemetry-brake');
     this.telemetryHint = this.require('vehicle-telemetry-hint');
 
     this.gameOverOverlay = this.require('game-over-overlay');
@@ -126,6 +132,8 @@ export class UIRenderer {
     threatKind: string;
     threatPoint: [number, number] | null;
     threatLineStyle: string;
+    brakeReason?: string | null;
+    laneRouteIds?: number[];
   }): void {
     this.idmDebugLine.textContent = `vehicle: ${data.vehicleId}`;
     this.idmDebugLine2.textContent =
@@ -133,8 +141,13 @@ export class UIRenderer {
     this.idmDebugLine3.textContent =
       `accel: ${data.acceleration.toFixed(2)} m/s² | dv: ${data.deltaV.toFixed(1)} | stop: ${data.distToStopLine.toFixed(1)} m`;
     const telem = `dist leader: ${data.distanceToLeader.toFixed(1)} m | style: ${data.threatLineStyle}`;
+    const brake = data.brakeReason ? ` | ⚠ ${data.brakeReason}` : '';
+    const lanes =
+      data.laneRouteIds && data.laneRouteIds.length > 0
+        ? ` | lanes: ${data.laneRouteIds.slice(0, 8).join('→')}${data.laneRouteIds.length > 8 ? '…' : ''}`
+        : '';
     this.idmDebugLine4.textContent =
-      `red: ${data.redBlocking ? 'YES' : 'NO'} | curve: ${data.onCurve ? 'YES' : 'NO'} | t: ${data.turnT.toFixed(3)} | L/W/R: ${data.shapeLengthM.toFixed(1)}/${data.shapeWidthM.toFixed(1)}/${data.shapeRadiusM.toFixed(1)} m | threat: ${data.threatKind}${data.leaderVehicleId != null ? ` | L#${data.leaderVehicleId}` : ''}${data.conflictReserverId != null ? ` | CP:${data.conflictReserverId}` : ''} | ${telem}`;
+      `red: ${data.redBlocking ? 'YES' : 'NO'} | curve: ${data.onCurve ? 'YES' : 'NO'} | t: ${data.turnT.toFixed(3)} | L/W/R: ${data.shapeLengthM.toFixed(1)}/${data.shapeWidthM.toFixed(1)}/${data.shapeRadiusM.toFixed(1)} m | threat: ${data.threatKind}${data.leaderVehicleId != null ? ` | L#${data.leaderVehicleId}` : ''}${data.conflictReserverId != null ? ` | reserver:${data.conflictReserverId}` : ''} | ${telem}${lanes}${brake}`;
     this.idmDebugLine4.style.color = data.redBlocking ? '#ff6b6b' : (data.onCurve ? '#67e8f9' : '#7fffb0');
   }
 
@@ -144,13 +157,21 @@ export class UIRenderer {
     desiredSpeed: number;
     acceleration: number;
     distanceToLeader: number;
+    turnT?: number;
+    onCurve?: boolean;
+    laneRouteIds?: number[];
+    brakeReason?: string | null;
   }): void {
     if (data.vehicleId === null) {
-      this.telemetryHint.textContent = 'Klik pojazd — dane na żywo';
+      this.telemetryHint.textContent =
+        'Klik na mapie w pojazd (Pixi ma pointer-events:none — trafiasz w MapLibre).';
       this.telemetrySpeed.textContent = 'Current Speed: -- m/s';
       this.telemetryDesired.textContent = 'Desired Speed: -- m/s';
       this.telemetryAccel.textContent = 'Acceleration: -- m/s²';
       this.telemetryDistance.textContent = 'Distance to Leader: -- m';
+      this.telemetryTurnT.textContent = 'Bezier t (connector): --';
+      this.telemetryLaneRoute.textContent = 'Lane route ids: --';
+      this.telemetryBrake.textContent = 'Brake: —';
       return;
     }
     this.telemetryHint.textContent = `Pojazd #${data.vehicleId}`;
@@ -159,6 +180,21 @@ export class UIRenderer {
     this.telemetryAccel.textContent = `Acceleration: ${data.acceleration.toFixed(2)} m/s²`;
     this.telemetryDistance.textContent =
       `Distance to Leader: ${data.distanceToLeader.toFixed(2)} m (along path / IDM gap)`;
+    const tt = data.turnT;
+    const oc = data.onCurve;
+    this.telemetryTurnT.textContent =
+      tt !== undefined
+        ? `Bezier t (connector): ${tt.toFixed(3)}${oc ? ' (on curve)' : ''}`
+        : 'Bezier t (connector): --';
+    const ids = data.laneRouteIds;
+    this.telemetryLaneRoute.textContent =
+      ids && ids.length > 0
+        ? `Lane route ids: ${ids.join(' → ')}`
+        : 'Lane route ids: (empty — fallback path)';
+    this.telemetryBrake.textContent =
+      data.brakeReason != null && data.brakeReason !== ''
+        ? `Brake: ${data.brakeReason}`
+        : 'Brake: —';
   }
 
   /**

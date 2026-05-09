@@ -181,11 +181,6 @@ export async function setDebugVehicle(vehicleId: number | null): Promise<void> {
   return invoke<void>('set_debug_vehicle', { vehicleId });
 }
 
-/** Enable Cities-Skylines-style intersection debug (Rust emits `debug_visualization` events). */
-export async function setDebugVisualization(enabled: boolean): Promise<void> {
-  return invoke<void>('set_debug_visualization', { enabled });
-}
-
 /**
  * Converts PascalCase/CamelCase → snake_case for Rust traffic-light mode
  * (e.g. 'SemiAuto' → 'semi_auto').

@@ -1,6 +1,6 @@
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::cmp::Ordering;
 use parking_lot::RwLock;
 use std::sync::Arc;
@@ -101,60 +101,12 @@ struct IdmDebugPayload {
     hood_lng_lat: [f64; 2],
     rear_bumper_lng_lat: [f64; 2],
     route_points: Vec<[f64; 2]>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct DebugConflictPointPayload {
-    id: u64,
-    lng: f64,
-    lat: f64,
-    radius_m: f32,
-    reserved_by: Option<u32>,
-    colliding_with_obb: bool,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct DebugLanePathPayload {
-    lane_path_id: String,
-    color_idx: u8,
-    points: Vec<[f64; 2]>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct DebugVehicleThreatPayload {
-    vehicle_id: u32,
-    center_lng_lat: [f64; 2],
-    hood_lng_lat: [f64; 2],
-    rear_bumper_lng_lat: [f64; 2],
-    threat_lng_lat: Option<[f64; 2]>,
-    right_arrow_lng_lat: [f64; 2],
-    right_arrow_active: bool,
-    has_signal_priority: bool,
-    yield_to_vehicle_lng_lat: Option<[f64; 2]>,
-    yield_to_vehicle_id: Option<u32>,
-    reservation_path: Option<Vec<[f64; 2]>>,
-    route_conflict_point_ids: Vec<u64>,
-    comfort_brake_end_lng_lat: [f64; 2],
-    emergency_brake_end_lng_lat: [f64; 2],
-    emergency_braking_active: bool,
-    obb_corners: Vec<[f64; 2]>,
-    colliding_conflict_point_ids: Vec<u64>,
-    line_style: String,
-    threat_kind: String,
-    leader_vehicle_id: Option<u32>,
-    conflict_reserver_id: Option<u32>,
-    debug_state: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct DebugVisualizationPayload {
-    lane_paths: Vec<DebugLanePathPayload>,
-    conflict_points: Vec<DebugConflictPointPayload>,
-    vehicle_threats: Vec<DebugVehicleThreatPayload>,
+    /// Quadratic Bezier P1 → control → P2 in \[lng, lat\] while `on_curve` (for debug arrows).
+    bezier_control_path_lng_lat: Vec<[f64; 2]>,
+    /// Planned lane graph segment ids from current lane onward (includes connectors).
+    lane_route_ids: Vec<u64>,
+    /// Short human-readable braking cause when acceleration is strongly negative.
+    brake_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -237,7 +189,6 @@ pub fn run_simulation(
     let mut high_frustration_timer = 0.0f32;
     let mut idm_overlay_timer = 0.0f32;
     let mut selected_debug_vehicle: Option<u32> = None;
-    let mut debug_visualization_enabled = false;
 
     // ── Build subsystems from map ────────────────────────────────────────────
     let (mut intersections, mut spawn_system, mut od_model, mut tram_sim, mut conflict_system) = {
@@ -296,7 +247,6 @@ pub fn run_simulation(
                     &mut intersections,
                     &mut spawn_system,
                     &mut selected_debug_vehicle,
-                    &mut debug_visualization_enabled,
                 ),
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -484,156 +434,6 @@ pub fn run_simulation(
                 vec![0.0f32; vehicles.len()]
             };
 
-            if debug_visualization_enabled
-                && !idm_steps.is_empty()
-                && idm_steps.len() == vehicles.len()
-            {
-                let guard = graph_lock.read();
-                if let Some(map) = guard.as_ref() {
-                    let lane_paths = conflict_system.debug_lane_paths_snapshot();
-                    let mut conflict_points = conflict_system.debug_conflict_points_snapshot();
-                    let vehicle_threats: Vec<DebugVehicleThreatPayload> = vehicles
-                        .iter()
-                        .zip(idm_steps.iter())
-                        .map(|(v, s)| {
-                            let hood = hood_lng_lat_m(v);
-                            let mut right_arrow_active = true;
-                            let mut has_signal_priority = false;
-                            if let Some(green) = signal_priority_state(v, map, &intersections) {
-                                has_signal_priority = green;
-                                if green {
-                                    let right_rule_enabled = if let Some((movement, _)) =
-                                        vehicle_next_movement(v, map)
-                                    {
-                                        if let Some((_, tgt_node)) = map.graph.edge_endpoints(movement.0) {
-                                            movement_turn_intent(map, movement, tgt_node) == TurnIntent::Left
-                                        } else {
-                                            false
-                                        }
-                                    } else {
-                                        false
-                                    };
-                                    right_arrow_active = right_rule_enabled;
-                                }
-                            }
-                            let right_arrow = {
-                                let arrow_len_m = 12.0f64;
-                                // Direction=(x=east, y=north) => Right=(y, -x).
-                                let dir_x = (v.angle as f64).sin();
-                                let dir_y = (v.angle as f64).cos();
-                                let right_x = dir_y;
-                                let right_y = -dir_x;
-                                let east = right_x * arrow_len_m;
-                                let north = right_y * arrow_len_m;
-                                [hood[0] + east / GEO_LNG_M, hood[1] + north / GEO_LAT_M]
-                            };
-                            let mut yield_to_pos = None;
-                            let mut yield_to_id = None;
-                            let reservation_path = if v.on_turn_connector {
-                                let samples = 14usize;
-                                let mut pts = Vec::with_capacity(samples + 1);
-                                for j in 0..=samples {
-                                    let t = j as f32 / samples as f32;
-                                    let (lat, lng) = bezier_point_lat_lng(
-                                        v.turn_p1_lat,
-                                        v.turn_p1_lng,
-                                        v.turn_ctrl_lat,
-                                        v.turn_ctrl_lng,
-                                        v.turn_p2_lat,
-                                        v.turn_p2_lng,
-                                        t,
-                                    );
-                                    pts.push([lng, lat]);
-                                }
-                                Some(pts)
-                            } else {
-                                None
-                            };
-                            let route_conflict_point_ids = if let Some((movement, _)) = vehicle_next_movement(v, map) {
-                                if let Some((_, node_idx)) = map.graph.edge_endpoints(movement.0) {
-                                    conflict_system.route_conflict_point_ids(
-                                        lane_movement_key_for_vehicle(v, movement),
-                                        node_idx,
-                                    )
-                                } else {
-                                    Vec::new()
-                                }
-                            } else {
-                                Vec::new()
-                            };
-                            if s.obstacle.kind == ObstacleKind::PriorityStopLine {
-                                yield_to_pos = s.obstacle.point_lng_lat;
-                                yield_to_id = s.obstacle.leader_vehicle_id;
-                            }
-                            let debug_state = match s.obstacle.kind {
-                                ObstacleKind::PriorityStopLine => Some("YIELDING".to_string()),
-                                ObstacleKind::ConflictPoint | ObstacleKind::ReservationStopLine
-                                    if s.obstacle.gap_m <= 40.0 =>
-                                {
-                                    Some("RESERVING".to_string())
-                                }
-                                _ => None,
-                            };
-                            let comfort_d = stopping_distance_m(v.speed, v.driver_profile.params().comfort_decel);
-                            let emergency_d = stopping_distance_m(v.speed, emergency_decel_mps2(v));
-                            let emergency_braking_active = emergency_braking_needed(v, s.obstacle);
-                            let colliding_conflict_point_ids: Vec<u64> = conflict_points
-                                .iter()
-                                .filter_map(|cp| {
-                                    let p_m = DVec2::new(cp.lng * GEO_LNG_M, cp.lat * GEO_LAT_M);
-                                    if is_colliding_with_point(v, p_m, cp.radius_m) {
-                                        Some(cp.id)
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .collect();
-                            DebugVehicleThreatPayload {
-                                vehicle_id: v.id,
-                                center_lng_lat: obb_center_lng_lat(v),
-                                hood_lng_lat: hood,
-                                rear_bumper_lng_lat: rear_bumper_lng_lat_vehicle(v),
-                                threat_lng_lat: s.obstacle.point_lng_lat,
-                                right_arrow_lng_lat: right_arrow,
-                                right_arrow_active,
-                                has_signal_priority,
-                                yield_to_vehicle_lng_lat: yield_to_pos,
-                                yield_to_vehicle_id: yield_to_id,
-                                reservation_path,
-                                route_conflict_point_ids,
-                                comfort_brake_end_lng_lat: brake_projection_from_hood(v, comfort_d),
-                                emergency_brake_end_lng_lat: brake_projection_from_hood(v, emergency_d),
-                                emergency_braking_active,
-                                obb_corners: obb_corners_lng_lat(v),
-                                colliding_conflict_point_ids,
-                                line_style: threat_line_style_label(s.obstacle.kind).to_string(),
-                                threat_kind: obstacle_kind_label(s.obstacle.kind).to_string(),
-                                leader_vehicle_id: s.obstacle.leader_vehicle_id,
-                                conflict_reserver_id: s.obstacle.conflict_reserver_id,
-                                debug_state,
-                            }
-                        })
-                        .collect();
-                    let mut touched_ids = HashSet::new();
-                    for th in &vehicle_threats {
-                        for cp_id in &th.colliding_conflict_point_ids {
-                            touched_ids.insert(*cp_id);
-                        }
-                    }
-                    for cp in &mut conflict_points {
-                        cp.colliding_with_obb = touched_ids.contains(&cp.id);
-                    }
-                    let _ = app_handle.emit(
-                        "debug_visualization",
-                        &DebugVisualizationPayload {
-                            lane_paths,
-                            conflict_points,
-                            vehicle_threats,
-                        },
-                    );
-                }
-            }
-
             // Apply physics — always uses PHYSICS_DT (fixed step)
             {
                 let guard = graph_lock.read();
@@ -782,7 +582,10 @@ pub fn run_simulation(
                                     .map(|(_, conn)| [conn.p1_lng, conn.p1_lat]),
                                 hood_lng_lat: hood_lng_lat_m(ego),
                                 rear_bumper_lng_lat: rear_bumper_lng_lat_vehicle(ego),
-                                route_points: build_route_points(ego, map),
+                                route_points: build_debug_target_path_points(ego, map),
+                                bezier_control_path_lng_lat: bezier_debug_control_polyline_lng_lat(ego),
+                                lane_route_ids: ego.lane_route.clone(),
+                                brake_reason: idm_brake_caption(accel_i, &obstacle, ego),
                             };
                             let _ = app_handle.emit("idm_debug", payload);
                         }
@@ -881,7 +684,6 @@ fn handle_command(
     intersections: &mut IntersectionManager,
     spawn_system: &mut SpawnSystem,
     selected_debug_vehicle: &mut Option<u32>,
-    debug_visualization_enabled: &mut bool,
 ) {
     match cmd {
         SimCommand::Pause                  => clock.pause(),
@@ -901,15 +703,85 @@ fn handle_command(
         SimCommand::SetDebugVehicle(id) => {
             *selected_debug_vehicle = id;
         }
-        SimCommand::SetDebugVisualization(on) => {
-            *debug_visualization_enabled = on;
-        }
         SimCommand::Stop => {}
     }
 }
 
-fn build_route_points(vehicle: &Vehicle, map: &MapData) -> Vec<[f64; 2]> {
-    let mut points = Vec::new();
+/// Lane polyline as \[lng, lat\] samples (same order as frontend `lane.points`).
+fn lane_centerline_lng_lat(lane: &crate::map::road_network::Lane) -> Vec<[f64; 2]> {
+    lane.path
+        .points
+        .iter()
+        .map(|p| [p[1], p[0]])
+        .collect()
+}
+
+/// Index into `lane_route` to begin the purple debug polyline (handles post-connector frame lag).
+fn lane_route_polyline_start_index(vehicle: &Vehicle, map: &MapData) -> usize {
+    if vehicle.lane_route.is_empty() {
+        return 0;
+    }
+    let fallback = || vehicle.lane_route_pos.min(vehicle.lane_route.len().saturating_sub(1));
+
+    if vehicle.on_turn_connector {
+        return vehicle
+            .connector_lane_id
+            .and_then(|cid| vehicle.lane_route.iter().position(|&id| id == cid))
+            .or_else(|| {
+                vehicle
+                    .current_lane_id
+                    .and_then(|cid| vehicle.lane_route.iter().position(|&id| id == cid))
+            })
+            .unwrap_or_else(fallback);
+    }
+
+    let from_lane_id = vehicle
+        .current_lane_id
+        .and_then(|cid| vehicle.lane_route.iter().position(|&id| id == cid));
+
+    let from_edge = vehicle.route.get(vehicle.route_pos).and_then(|edge_idx| {
+        let eid = edge_idx.index() as u64;
+        vehicle.lane_route.iter().position(|&lid| {
+            map.lanes
+                .get(&lid)
+                .is_some_and(|l| l.edge_id == eid)
+        })
+    });
+
+    from_lane_id
+        .or(from_edge)
+        .unwrap_or_else(fallback)
+}
+
+/// Full remaining **lane graph** path (current lane → connectors → …), else graph-node fallback.
+fn build_debug_target_path_points(vehicle: &Vehicle, map: &MapData) -> Vec<[f64; 2]> {
+    let mut points: Vec<[f64; 2]> = vec![[vehicle.lng, vehicle.lat]];
+
+    if !vehicle.lane_route.is_empty() {
+        let start_i = lane_route_polyline_start_index(vehicle, map);
+
+        for &lane_id in vehicle.lane_route.iter().skip(start_i) {
+            let Some(lane) = map.lanes.get(&lane_id) else {
+                continue;
+            };
+            let seg = lane_centerline_lng_lat(lane);
+            for p in seg {
+                if let Some(last) = points.last() {
+                    let dup = (last[0] - p[0]).abs() < 1e-8 && (last[1] - p[1]).abs() < 1e-8;
+                    if dup {
+                        continue;
+                    }
+                }
+                points.push(p);
+            }
+        }
+        if points.len() >= 2 {
+            return points;
+        }
+    }
+
+    // Fallback: coarse edge-end polyline + Bezier samples on connector (legacy).
+    points.clear();
     points.push([vehicle.lng, vehicle.lat]);
     if vehicle.on_turn_connector {
         let samples = 12usize;
@@ -937,6 +809,54 @@ fn build_route_points(vehicle: &Vehicle, map: &MapData) -> Vec<[f64; 2]> {
         }
     }
     points
+}
+
+fn bezier_debug_control_polyline_lng_lat(vehicle: &Vehicle) -> Vec<[f64; 2]> {
+    if !vehicle.on_turn_connector {
+        return Vec::new();
+    }
+    vec![
+        [vehicle.turn_p1_lng, vehicle.turn_p1_lat],
+        [vehicle.turn_ctrl_lng, vehicle.turn_ctrl_lat],
+        [vehicle.turn_p2_lng, vehicle.turn_p2_lat],
+    ]
+}
+
+fn idm_brake_caption(accel: f32, obstacle: &ClosestObstacle, ego: &Vehicle) -> Option<String> {
+    if accel > -0.45 {
+        return None;
+    }
+    if ego.route_pos.saturating_add(1) >= ego.route.len()
+        && matches!(obstacle.kind, ObstacleKind::Vehicle)
+        && obstacle.gap_m > 300.0
+    {
+        return Some("End of path (no next edge)".to_string());
+    }
+    match obstacle.kind {
+        ObstacleKind::Vehicle => obstacle
+            .leader_vehicle_id
+            .map(|id| format!("Leader #{id}"))
+            .or_else(|| Some("Vehicle ahead".to_string())),
+        ObstacleKind::ConflictPoint => Some(
+            obstacle
+                .conflict_reserver_id
+                .map(|id| format!("Conflict patch — reserver #{id}"))
+                .unwrap_or_else(|| "Conflict geometry".to_string()),
+        ),
+        ObstacleKind::ReservationStopLine => obstacle.conflict_reserver_id.map(|id| {
+            format!("Waiting for reservation (#{id})")
+        }),
+        ObstacleKind::PriorityStopLine => {
+            if let Some(id) = obstacle.leader_vehicle_id {
+                Some(format!("Yield / priority (vehicle #{id})"))
+            } else {
+                Some("Yield / priority".to_string())
+            }
+        }
+        ObstacleKind::TrafficSignalStopLine => Some("Traffic signal".to_string()),
+        ObstacleKind::StopSignStopLine => Some("Stop sign".to_string()),
+        ObstacleKind::YieldTarget => Some("Yield sign".to_string()),
+    }
 }
 
 // ── Physics helpers ────────────────────────────────────────────────────────────
@@ -1271,17 +1191,6 @@ fn emergency_decel_mps2(vehicle: &Vehicle) -> f32 {
     (params.comfort_decel * 1.8).max(vtype.max_decel * 1.25).max(3.0)
 }
 
-#[inline]
-fn brake_projection_from_hood(vehicle: &Vehicle, distance_m: f32) -> [f64; 2] {
-    let hood = hood_lng_lat_m(vehicle);
-    let dir_x = (vehicle.angle as f64).sin();
-    let dir_y = (vehicle.angle as f64).cos();
-    [
-        hood[0] + dir_x * distance_m as f64 / GEO_LNG_M,
-        hood[1] + dir_y * distance_m as f64 / GEO_LAT_M,
-    ]
-}
-
 fn has_exit_space_after_intersection(
     vehicle: &Vehicle,
     map: &MapData,
@@ -1317,53 +1226,11 @@ fn vehicle_obb_isometry_and_shape(vehicle: &Vehicle) -> (Isometry2<f32>, Cuboid)
     (iso, cuboid)
 }
 
-fn obb_center_lng_lat(vehicle: &Vehicle) -> [f64; 2] {
-    let (iso, _) = vehicle_obb_isometry_and_shape(vehicle);
-    [iso.translation.x as f64 / GEO_LNG_M, iso.translation.y as f64 / GEO_LAT_M]
-}
-
-fn obb_corners_lng_lat(vehicle: &Vehicle) -> Vec<[f64; 2]> {
-    let (iso, shape) = vehicle_obb_isometry_and_shape(vehicle);
-    let hx = shape.half_extents.x as f64;
-    let hy = shape.half_extents.y as f64;
-    let local = [(-hx, -hy), (hx, -hy), (hx, hy), (-hx, hy)];
-    local
-        .iter()
-        .map(|(lx, ly)| {
-            let p = iso.transform_point(&parry2d::na::Point2::new(*lx as f32, *ly as f32));
-            [p.x as f64 / GEO_LNG_M, p.y as f64 / GEO_LAT_M]
-        })
-        .collect()
-}
-
 fn is_colliding_with_point(vehicle: &Vehicle, point_pos_m: DVec2, point_radius_m: f32) -> bool {
     let (veh_iso, veh_shape) = vehicle_obb_isometry_and_shape(vehicle);
     let point_iso = Isometry2::new(Vector2::new(point_pos_m.x as f32, point_pos_m.y as f32), 0.0);
     let point_ball = Ball::new(point_radius_m.max(0.1));
     intersection_test(&veh_iso, &veh_shape, &point_iso, &point_ball).unwrap_or(false)
-}
-
-fn signal_priority_state(
-    vehicle: &Vehicle,
-    map: &MapData,
-    intersections: &IntersectionManager,
-) -> Option<bool> {
-    if vehicle.route_pos >= vehicle.route.len() {
-        return None;
-    }
-    let edge_idx = vehicle.route[vehicle.route_pos];
-    let (_, tgt) = map.graph.edge_endpoints(edge_idx)?;
-    let itype = &map.graph[tgt].intersection_type;
-    if !matches!(itype, IntersectionType::TrafficLight | IntersectionType::PedestrianCrossing) {
-        return None;
-    }
-    let tgt_osm_id = map.graph[tgt].osm_id;
-    Some(intersections.can_vehicle_proceed(
-        tgt_osm_id,
-        vehicle.has_stopped_at_stop_sign,
-        vehicle,
-        map,
-    ))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2061,6 +1928,14 @@ fn apply_vehicle_physics(
             }
 
             vehicle.target_lane = compute_vehicle_target_lane(vehicle, map);
+            if let Some(edge_idx) = vehicle.route.get(vehicle.route_pos) {
+                let eid = edge_idx.index() as u64;
+                if let Some(idx) = vehicle.lane_route.iter().position(|&lid| {
+                    map.lanes.get(&lid).is_some_and(|l| l.edge_id == eid)
+                }) {
+                    vehicle.lane_route_pos = idx;
+                }
+            }
         }
         return;
     }
@@ -2863,67 +2738,6 @@ impl ConflictSystem {
                 Some((d, [lng, lat], owner))
             })
             .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal))
-    }
-
-    fn debug_conflict_points_snapshot(&self) -> Vec<DebugConflictPointPayload> {
-        let mut out = Vec::new();
-        for node in self.nodes.values() {
-            for path in node.by_movement.values() {
-                for p in &path.points {
-                    let lng = p.pos.x / GEO_LNG_M;
-                    let lat = p.pos.y / GEO_LAT_M;
-                    out.push(DebugConflictPointPayload {
-                        id: p.id,
-                        lng,
-                        lat,
-                        radius_m: p.radius_m,
-                        reserved_by: p.reserved_by,
-                        colliding_with_obb: false,
-                    });
-                }
-            }
-        }
-        out
-    }
-
-    fn debug_lane_paths_snapshot(&self) -> Vec<DebugLanePathPayload> {
-        let mut out = Vec::new();
-        for node in self.nodes.values() {
-            for (k, path) in &node.by_movement {
-                let (poly, _) = sample_connector_polyline(&path.bezier, 20);
-                let points: Vec<[f64; 2]> = poly
-                    .into_iter()
-                    .map(|p| [p.x / GEO_LNG_M, p.y / GEO_LAT_M])
-                    .collect();
-                let color_idx = ((k.in_lane as u16 * 3 + k.out_lane as u16) % 12) as u8;
-                out.push(DebugLanePathPayload {
-                    lane_path_id: format!(
-                        "{}:{}:{}:{}",
-                        k.in_edge.index(),
-                        k.out_edge.index(),
-                        k.in_lane,
-                        k.out_lane
-                    ),
-                    color_idx,
-                    points,
-                });
-            }
-        }
-        out
-    }
-
-    fn route_conflict_point_ids(
-        &self,
-        movement: LaneMovementKey,
-        node_idx: NodeIndex,
-    ) -> Vec<u64> {
-        let Some(node) = self.nodes.get(&node_idx) else {
-            return Vec::new();
-        };
-        let Some(path) = node.by_movement.get(&movement) else {
-            return Vec::new();
-        };
-        path.points.iter().map(|p| p.id).collect()
     }
 
     fn release_passed_for_vehicle(

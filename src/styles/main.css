@@ -42,6 +42,21 @@ html, body {
   display: block;
 }
 
+/* Second Pixi surface: pick-debug only, stacked above .sandbox-panel (120) so paths stay visible */
+#pixi-pick-debug {
+  position: absolute;
+  inset: 0;
+  width: 100vw;
+  height: 100vh;
+  z-index: 150;
+  pointer-events: none;
+}
+
+#pixi-pick-debug canvas {
+  display: block;
+  pointer-events: none;
+}
+
 #hud-overlay {
   position: absolute;
   inset: 0;

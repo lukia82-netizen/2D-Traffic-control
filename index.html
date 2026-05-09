@@ -34,11 +34,14 @@
       <!-- Telemetry for clicked vehicle -->
       <div id="vehicle-telemetry-panel">
         <div id="vehicle-telemetry-title">Telemetria auta</div>
-        <div id="vehicle-telemetry-hint">Klik pojazd — dane na żywo</div>
+        <div id="vehicle-telemetry-hint">Klik na mapie w pojazd (warstwa Pixi nie przechwytuje myszy).</div>
         <div id="telemetry-speed">Current Speed: -- m/s</div>
         <div id="telemetry-desired">Desired Speed: -- m/s</div>
         <div id="telemetry-accel">Acceleration: -- m/s²</div>
         <div id="telemetry-distance">Distance to Leader: -- m</div>
+        <div id="telemetry-turn-t">Bezier t (connector): --</div>
+        <div id="telemetry-lane-route">Lane route ids: --</div>
+        <div id="telemetry-brake">Brake: —</div>
       </div>
 
       <!-- Top-right: Frustration / Rage Meter -->
@@ -167,6 +170,9 @@
       </div>
 
     </div>
+
+    <!-- Click-inspect route / IDM overlay — above sandbox panel (z-index), pointer-events:none -->
+    <div id="pixi-pick-debug"></div>
 
     <script type="module" src="/src/main.ts"></script>
   </body>

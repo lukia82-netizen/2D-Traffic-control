@@ -329,15 +329,6 @@ pub fn set_debug_vehicle(vehicle_id: Option<u32>, state: State<AppState>) -> Res
     send_sim_command(&state, SimCommand::SetDebugVehicle(vehicle_id))
 }
 
-/// Enable/disable full-map debug overlay (conflict points, threats, bumper markers).
-#[command]
-pub fn set_debug_visualization(
-    enabled: bool,
-    state: State<AppState>,
-) -> Result<(), String> {
-    send_sim_command(&state, SimCommand::SetDebugVisualization(enabled))
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MoveNodePayload {

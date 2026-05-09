@@ -130,6 +130,30 @@ export function projectPoint(
 }
 
 /**
+ * Same as {@link projectPoint}, but expressed in the coordinate system of
+ * another absolutely positioned layer (e.g. `#pixi-pick-debug` canvas).
+ *
+ * MapLibre returns pixels relative to the map container; if that host and the
+ * overlay host share `inset:0`, the offset is zero — otherwise this keeps
+ * debug lines aligned with the map.
+ */
+export function projectPointForOverlay(
+  map: maplibregl.Map,
+  lng: number,
+  lat: number,
+  overlayHost: HTMLElement | null,
+): { x: number; y: number } {
+  const p = map.project([lng, lat]);
+  if (!overlayHost) return { x: p.x, y: p.y };
+  const mapRect = map.getContainer().getBoundingClientRect();
+  const overlayRect = overlayHost.getBoundingClientRect();
+  return {
+    x: p.x + (mapRect.left - overlayRect.left),
+    y: p.y + (mapRect.top - overlayRect.top),
+  };
+}
+
+/**
  * Batch-project an array of [lng, lat] pairs using MapLibre's optimised
  * internal projection.
  */

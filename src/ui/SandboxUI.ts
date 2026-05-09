@@ -487,7 +487,7 @@ export class SandboxUI {
       (checked) => this.onTurnConnectorsActiveOnlyToggle(checked),
     ));
     sec.appendChild(this.buildCheckRow(
-      'debug-visualization', 'Tryb debug skrzyżowań (klawisz D)', '#f43f5e', false,
+      'debug-visualization', 'Warstwa trasy po kliknięciu + IDM (D)', '#f43f5e', false,
       (checked) => this.onDebugVisualizationToggle(checked),
     ));
     sec.appendChild(this.buildCheckRow(

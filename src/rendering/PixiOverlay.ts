@@ -15,9 +15,15 @@ import * as PIXI from 'pixi.js';
  *   8 – frustrationLayer Frustration bubble indicators above vehicles
  *   9 – trafficLights    Traffic light state sprites
  *  10 – congestionLayer  Congestion heat overlay
+ *  11 – editorOverlay    Node/edge handles in editor mode
+ *
+ * Click-inspect graphics live on a **separate** `pickDebugApp` canvas (`#pixi-pick-debug`, high CSS z-index)
+ * so routes are not hidden under the sandbox panel.
  */
 export class PixiOverlay {
   app!: PIXI.Application;
+  /** Minimal second stage for pick-debug only (mounted in `#pixi-pick-debug`). */
+  pickDebugApp?: PIXI.Application;
 
   buildings!: PIXI.Container;
   roads!: PIXI.Container;
@@ -31,6 +37,8 @@ export class PixiOverlay {
   trafficLights!: PIXI.Container;
   congestionLayer!: PIXI.Container;
   editorOverlay!: PIXI.Container;
+  /** Route polyline, threat rays, floating brake HUD for picked vehicle. */
+  pickDebugLayer!: PIXI.Container;
 
   private readonly containerId: string;
 
@@ -86,6 +94,24 @@ export class PixiOverlay {
     this.app.stage.addChild(this.congestionLayer);
     this.app.stage.addChild(this.editorOverlay);
 
+    this.pickDebugApp = new PIXI.Application();
+    await this.pickDebugApp.init({
+      resizeTo: window,
+      backgroundAlpha: 0,
+      antialias: true,
+      resolution: window.devicePixelRatio ?? 1,
+      autoDensity: true,
+      roundPixels: false,
+      preference: 'webgl',
+    });
+    const pickHost = document.getElementById('pixi-pick-debug');
+    if (!pickHost) {
+      throw new Error('PixiOverlay: #pixi-pick-debug not found (add to index.html)');
+    }
+    pickHost.appendChild(this.pickDebugApp.canvas);
+    this.pickDebugLayer = new PIXI.Container();
+    this.pickDebugApp.stage.addChild(this.pickDebugLayer);
+
     window.addEventListener('resize', () => this.resize());
   }
 
@@ -93,6 +119,22 @@ export class PixiOverlay {
     // PixiJS resizeTo:window already handles canvas resize;
     // this hook lets subrenderers react if needed.
     this.app.renderer.resize(window.innerWidth, window.innerHeight);
+    // pickDebugApp uses resizeTo: window — ResizePlugin keeps it in sync.
+  }
+
+  /** Renders the pick-debug stage (call after mutating its Graphics on the map render tick). */
+  renderPickDebug(): void {
+    this.pickDebugApp?.render();
+  }
+
+  /** Tear down the pick-debug WebGL surface (call before dropping Game references). */
+  destroyPickDebugApp(): void {
+    try {
+      this.pickDebugApp?.destroy({ removeView: true }, { children: true, texture: true });
+    } catch {
+      // ignore double-destroy
+    }
+    this.pickDebugApp = undefined;
   }
 
   get width(): number {
