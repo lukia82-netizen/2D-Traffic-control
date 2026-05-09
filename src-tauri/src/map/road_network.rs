@@ -1052,6 +1052,7 @@ fn classify_turn_at_node(
 }
 
 /// Return the (in_lane, out_lane) pairs that are valid for a given turn class.
+#[allow(dead_code)]
 fn valid_connector_pairs(in_lanes: u8, out_lanes: u8, turn: TurnClass) -> Vec<(u8, u8)> {
     match turn {
         TurnClass::Right    => vec![(in_lanes - 1, out_lanes - 1)],
@@ -1059,6 +1060,117 @@ fn valid_connector_pairs(in_lanes: u8, out_lanes: u8, turn: TurnClass) -> Vec<(u
         TurnClass::Left     => vec![(0, 0)],
         TurnClass::UTurn    => vec![],
     }
+}
+
+/// Map \(N\) incoming lanes to \(M\) outgoing lanes: lane `i→i` for `i < min(N,M)`;
+/// remaining outgoing lanes attach to the **rightmost** incoming lane `N-1`;
+/// extra incoming lanes attach to outgoing `M-1`.
+#[inline]
+fn proportional_lane_pairs(n: u8, m: u8) -> Vec<(u8, u8)> {
+    if n == 0 || m == 0 {
+        return Vec::new();
+    }
+    let mut pairs = Vec::new();
+    let k = n.min(m);
+    for i in 0..k {
+        pairs.push((i, i));
+    }
+    if m > n {
+        let ri = n.saturating_sub(1);
+        for j in n..m {
+            pairs.push((ri, j));
+        }
+    } else if n > m {
+        let ro = m.saturating_sub(1);
+        for i in m..n {
+            pairs.push((i, ro));
+        }
+    }
+    pairs
+}
+
+#[inline]
+fn lane_already_reaches_to(
+    connection_ids: &[LaneId],
+    lanes: &HashMap<LaneId, Lane>,
+    to_lane_id: LaneId,
+) -> bool {
+    for &cid in connection_ids {
+        if cid == to_lane_id {
+            return true;
+        }
+        if lanes
+            .get(&cid)
+            .is_some_and(|cl| cl.edge_id == u64::MAX && cl.connections.contains(&to_lane_id))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Insert a lane→lane link via cubic connector (preferred) unless one already appears in `conns`.
+fn append_lane_turn_connection(
+    lanes: &mut HashMap<LaneId, Lane>,
+    from_lane_id: LaneId,
+    to_lane_id: LaneId,
+    next_lane_id: &mut LaneId,
+    conns: &mut Vec<LaneId>,
+) {
+    if lane_already_reaches_to(conns, lanes, to_lane_id) {
+        return;
+    }
+    if let Some(connector) =
+        build_lane_connector_with_fallback(lanes, from_lane_id, to_lane_id, *next_lane_id)
+    {
+        *next_lane_id += 1;
+        let cid = connector.id;
+        lanes.insert(cid, connector);
+        if let Some(c) = lanes.get_mut(&cid) {
+            if !c.connections.contains(&to_lane_id) {
+                c.connections.push(to_lane_id);
+            }
+        }
+        if !conns.contains(&cid) {
+            conns.push(cid);
+        }
+    }
+}
+
+pub fn ensure_lane_connector_between(map: &mut MapData, from_lane_id: LaneId, to_lane_id: LaneId) -> Option<LaneId> {
+    if from_lane_id == to_lane_id {
+        return None;
+    }
+    {
+        let from = map.lanes.get(&from_lane_id)?;
+        if from.connections.contains(&to_lane_id) {
+            return None;
+        }
+        for &c in &from.connections {
+            if map
+                .lanes
+                .get(&c)
+                .is_some_and(|cl| cl.edge_id == u64::MAX && cl.connections.contains(&to_lane_id))
+            {
+                return Some(c);
+            }
+        }
+    }
+    let next_lane_id = map.lanes.keys().max().copied().unwrap_or(0).saturating_add(1);
+    let connector = build_lane_connector_with_fallback(&map.lanes, from_lane_id, to_lane_id, next_lane_id)?;
+    let cid = connector.id;
+    map.lanes.insert(cid, connector);
+    if let Some(c) = map.lanes.get_mut(&cid) {
+        if !c.connections.contains(&to_lane_id) {
+            c.connections.push(to_lane_id);
+        }
+    }
+    if let Some(from_lane) = map.lanes.get_mut(&from_lane_id) {
+        if !from_lane.connections.contains(&cid) {
+            from_lane.connections.push(cid);
+        }
+    }
+    Some(cid)
 }
 
 pub fn populate_lane_graph(map: &mut MapData) {
@@ -1140,31 +1252,34 @@ pub fn populate_lane_graph(map: &mut MapData) {
         if incoming.is_empty() || outgoing.is_empty() {
             continue;
         }
-        // For each incoming lane build the connector set once.
+        // For each incoming lane build outgoing connections at this node using **proportional**
+        // lane mapping \(N→M\) for every incoming/outgoing directed edge pair.
+        // U-turns intentionally get no connectors (matches prior behaviour).
         let mut in_lane_conns: std::collections::HashMap<LaneId, Vec<LaneId>> = std::collections::HashMap::new();
         for (in_edge, in_lanes) in &incoming {
             for in_lane in 0..*in_lanes {
                 let Some(&in_lane_id) = by_edge_lane.get(&(in_edge.index(), in_lane)) else { continue; };
                 let mut conns: Vec<LaneId> = Vec::new();
                 for (out_edge, out_lanes) in &outgoing {
-                    // Classify the turn to determine which lane pairs are valid.
                     let turn = classify_turn_at_node(&map.graph, *in_edge, *out_edge, node);
-                    let pairs = valid_connector_pairs(*in_lanes, *out_lanes, turn);
-                    // Check if this in_lane is part of any valid pair.
-                    for (valid_in, valid_out) in pairs {
-                        if valid_in != in_lane { continue; }
-                        let Some(&out_lane_id) = by_edge_lane.get(&(out_edge.index(), valid_out)) else { continue; };
-                        let Some(connector) = build_lane_connector(&lanes, in_lane_id, out_lane_id, next_lane_id) else {
-                            conns.push(out_lane_id);
+                    if matches!(turn, TurnClass::UTurn) {
+                        continue;
+                    }
+                    let pairs = proportional_lane_pairs(*in_lanes, *out_lanes);
+                    for (vin, vout) in pairs {
+                        if vin != in_lane {
+                            continue;
+                        }
+                        let Some(&out_lane_id) = by_edge_lane.get(&(out_edge.index(), vout)) else {
                             continue;
                         };
-                        next_lane_id += 1;
-                        let connector_id = connector.id;
-                        conns.push(connector_id);
-                        lanes.insert(connector_id, connector);
-                        if let Some(c) = lanes.get_mut(&connector_id) {
-                            c.connections.push(out_lane_id);
-                        }
+                        append_lane_turn_connection(
+                            &mut lanes,
+                            in_lane_id,
+                            out_lane_id,
+                            &mut next_lane_id,
+                            &mut conns,
+                        );
                     }
                 }
                 in_lane_conns.insert(in_lane_id, conns);
@@ -1488,6 +1603,107 @@ fn build_lane_connector(
     p0y -= in_dir.1 * inset_back;
     p3x += out_dir.0 * inset_fwd;
     p3y += out_dir.1 * inset_fwd;
+    let h = CONNECTOR_CUBIC_HANDLE_M;
+    let p0 = Point::new(p0x, p0y);
+    let p1 = Point::new(p0x + in_dir.0 * h, p0y + in_dir.1 * h);
+    let p2 = Point::new(p3x - out_dir.0 * h, p3y - out_dir.1 * h);
+    let p3 = Point::new(p3x, p3y);
+    let cubic = CubicBez::new(p0, p1, p2, p3);
+    let length_m = cubic.arclen(CONNECTOR_ARCLEN_ACC) as f32;
+
+    const SAMPLES: usize = 40;
+    let mut points = Vec::with_capacity(SAMPLES + 1);
+    for i in 0..=SAMPLES {
+        let t = i as f64 / SAMPLES as f64;
+        let p = cubic.eval(t);
+        let (lat, lng) = m_xy_to_geo(p.x, p.y);
+        points.push([lat, lng]);
+    }
+    let connector_cubic_m = Some([
+        [p0.x, p0.y],
+        [p1.x, p1.y],
+        [p2.x, p2.y],
+        [p3.x, p3.y],
+    ]);
+    Some(Lane {
+        id: lane_id,
+        path: BezierPath {
+            points,
+            length_m: length_m.max(0.5),
+        },
+        connector_cubic_m,
+        width: from.width.min(to.width),
+        connections: Vec::new(),
+        conflict_areas: Vec::new(),
+        from_node_osm_id: from.from_node_osm_id,
+        to_node_osm_id: to.to_node_osm_id,
+        edge_id: u64::MAX,
+        lane_index: 0,
+    })
+}
+
+/// Always produces a connector lane with cubic + sampled `BezierPath` when endpoints exist.
+/// Used when the strict geometry check in [`build_lane_connector`] fails (merged junction points).
+fn build_lane_connector_with_fallback(
+    lanes: &HashMap<LaneId, Lane>,
+    from_lane_id: LaneId,
+    to_lane_id: LaneId,
+    lane_id: LaneId,
+) -> Option<Lane> {
+    if let Some(c) = build_lane_connector(lanes, from_lane_id, to_lane_id, lane_id) {
+        return Some(c);
+    }
+    let from = lanes.get(&from_lane_id)?;
+    let to = lanes.get(&to_lane_id)?;
+    let p0_geo = *from.path.points.last()?;
+    let p3_geo = *to.path.points.first()?;
+    let prev = if from.path.points.len() >= 2 {
+        from.path.points[from.path.points.len() - 2]
+    } else {
+        p0_geo
+    };
+    let next = if to.path.points.len() >= 2 {
+        to.path.points[1]
+    } else {
+        p3_geo
+    };
+
+    let (mut p0x, mut p0y) = geo_to_m_xy(p0_geo[0], p0_geo[1]);
+    let (mut p3x, mut p3y) = geo_to_m_xy(p3_geo[0], p3_geo[1]);
+    let (prx, pry) = geo_to_m_xy(prev[0], prev[1]);
+    let (nx, ny) = geo_to_m_xy(next[0], next[1]);
+    let mut in_dir = normalize_xy(p0x - prx, p0y - pry);
+    let mut out_dir = normalize_xy(nx - p3x, ny - p3y);
+
+    let back_len = ((p0x - prx).powi(2) + (p0y - pry).powi(2)).sqrt();
+    let fwd_len = ((nx - p3x).powi(2) + (ny - p3y).powi(2)).sqrt();
+    if in_dir == (0.0, 0.0) {
+        in_dir = normalize_xy(p3x - p0x, p3y - p0y);
+        if in_dir == (0.0, 0.0) {
+            in_dir = (1.0, 0.0);
+        }
+    }
+    if out_dir == (0.0, 0.0) {
+        out_dir = in_dir;
+    }
+
+    let inset_back = CONNECTOR_ENDPOINT_INSET_M.min(back_len * 0.88).max(0.0);
+    let inset_fwd = CONNECTOR_ENDPOINT_INSET_M.min(fwd_len * 0.88).max(0.0);
+    p0x -= in_dir.0 * inset_back;
+    p0y -= in_dir.1 * inset_back;
+    p3x += out_dir.0 * inset_fwd;
+    p3y += out_dir.1 * inset_fwd;
+
+    let chord = ((p3x - p0x).powi(2) + (p3y - p0y).powi(2)).sqrt();
+    if chord < 1.5 {
+        // Pull endpoints apart so the cubic is well-conditioned.
+        const NUDGE: f64 = 3.0;
+        p0x -= in_dir.0 * NUDGE;
+        p0y -= in_dir.1 * NUDGE;
+        p3x += out_dir.0 * NUDGE;
+        p3y += out_dir.1 * NUDGE;
+    }
+
     let h = CONNECTOR_CUBIC_HANDLE_M;
     let p0 = Point::new(p0x, p0y);
     let p1 = Point::new(p0x + in_dir.0 * h, p0y + in_dir.1 * h);

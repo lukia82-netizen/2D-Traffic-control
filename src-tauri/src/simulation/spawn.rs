@@ -5,7 +5,9 @@ use rand::Rng;
 use rand::SeedableRng;
 use rand_distr::{Distribution, Normal};
 
-use crate::map::road_network::{IntersectionType, LaneId, MapData};
+use crate::map::road_network::{
+    ensure_lane_connector_between, IntersectionType, LaneId, MapData,
+};
 use crate::simulation::lane_change::compute_vehicle_target_lane;
 use crate::simulation::od_model::{OdModel, TripKind};
 use crate::simulation::pathfinding::{find_path, REF_SPEED_MS};
@@ -70,7 +72,7 @@ impl SpawnSystem {
         &mut self,
         dt_real_s: f32,
         multiplier: f32,
-        map: &MapData,
+        map: &mut MapData,
         od_model: &OdModel,
         current_vehicle_count: usize,
     ) -> Vec<Vehicle> {
@@ -96,7 +98,7 @@ impl SpawnSystem {
         new_vehicles
     }
 
-    fn spawn_one(&mut self, map: &MapData, od_model: &OdModel) -> Option<Vehicle> {
+    fn spawn_one(&mut self, map: &mut MapData, od_model: &OdModel) -> Option<Vehicle> {
         let driver_profile = self.random_driver_profile();
         let vehicle_type = self.random_vehicle_type();
 
@@ -179,7 +181,7 @@ impl SpawnSystem {
         dt_real_s: f32,
         multiplier: f32,
         game_hour: f32,
-        map: &MapData,
+        map: &mut MapData,
         od_model: &OdModel,
         current_vehicle_count: usize,
     ) -> Vec<Vehicle> {
@@ -207,7 +209,7 @@ impl SpawnSystem {
 
     fn spawn_one_with_hour(
         &mut self,
-        map: &MapData,
+        map: &mut MapData,
         od_model: &OdModel,
         game_hour: f32,
     ) -> Option<Vehicle> {
@@ -465,7 +467,7 @@ fn compute_final_edge_exit_progress(
 }
 
 fn build_lane_route_from_edge_route(
-    map: &MapData,
+    map: &mut MapData,
     route: &[petgraph::graph::EdgeIndex],
     lane_idx: u8,
 ) -> Vec<LaneId> {
@@ -511,22 +513,26 @@ fn build_lane_route_from_edge_route(
         };
 
         if let Some(chosen) = chosen_opt {
+            let chosen_id = chosen.id;
+            let chosen_edge = chosen.edge_id;
             if let Some(prev) = out.last().copied() {
                 // Direct prev -> chosen continuation exists.
                 let direct = map
                     .lanes
                     .get(&prev)
-                    .is_some_and(|l| l.connections.contains(&chosen.id));
+                    .is_some_and(|l| l.connections.contains(&chosen_id));
                 if direct {
-                    out.push(chosen.id);
+                    out.push(chosen_id);
                     continue;
                 }
                 // If a connector exists from previous lane to this lane, include it.
                 let connector = map.lanes.get(&prev).and_then(|l| {
                     l.connections.iter().copied().find(|c| {
                         map.lanes
-                            .get(c)
-                            .map(|cl| cl.connections.contains(&chosen.id))
+                            .get(&c)
+                            .map(|cl| {
+                                cl.edge_id == u64::MAX && cl.connections.contains(&chosen_id)
+                            })
                             .unwrap_or(false)
                     })
                 });
@@ -535,21 +541,29 @@ fn build_lane_route_from_edge_route(
                 } else if map
                     .lanes
                     .get(&prev)
-                    .is_some_and(|l| l.edge_id != chosen.edge_id)
+                    .is_some_and(|l| l.edge_id != chosen_edge)
                 {
-                    let candidate_diag = map
-                        .lanes
-                        .values()
-                        .filter(|l| l.edge_id == chosen.edge_id)
-                        .map(|cand| {
-                            let direct = map
-                                .lanes
-                                .get(&prev)
-                                .is_some_and(|pl| pl.connections.contains(&cand.id));
-                            let via_connector = map
-                                .lanes
-                                .get(&prev)
-                                .is_some_and(|pl| {
+                    ensure_lane_connector_between(map, prev, chosen_id);
+                    let connector_retry = map.lanes.get(&prev).and_then(|l| {
+                        l.connections.iter().copied().find(|c| {
+                            map.lanes.get(&c).map(|cl| {
+                                cl.edge_id == u64::MAX && cl.connections.contains(&chosen_id)
+                            }).unwrap_or(false)
+                        })
+                    });
+                    if let Some(conn) = connector_retry {
+                        out.push(conn);
+                    } else {
+                        let candidate_diag = map
+                            .lanes
+                            .values()
+                            .filter(|l| l.edge_id == chosen_edge)
+                            .map(|cand| {
+                                let direct = map
+                                    .lanes
+                                    .get(&prev)
+                                    .is_some_and(|pl| pl.connections.contains(&cand.id));
+                                let via_connector = map.lanes.get(&prev).is_some_and(|pl| {
                                     pl.connections.iter().copied().any(|c| {
                                         map.lanes
                                             .get(&c)
@@ -557,24 +571,25 @@ fn build_lane_route_from_edge_route(
                                             .unwrap_or(false)
                                     })
                                 });
-                            format!(
-                                "{{lane_id:{} lane_idx:{} direct:{} via_conn:{}}}",
-                                cand.id, cand.lane_index, direct, via_connector
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    log::warn!(
-                        "Lane route gap: missing connector lane {} -> {} (edge {} -> {}). candidates=[{}]",
-                        prev,
-                        chosen.id,
-                        map.lanes.get(&prev).map(|l| l.edge_id).unwrap_or(u64::MAX),
-                        chosen.edge_id,
-                        candidate_diag
-                    );
+                                format!(
+                                    "{{lane_id:{} lane_idx:{} direct:{} via_conn:{}}}",
+                                    cand.id, cand.lane_index, direct, via_connector
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        log::warn!(
+                            "Lane route gap: missing connector lane {} -> {} (edge {} -> {}). candidates=[{}]",
+                            prev,
+                            chosen_id,
+                            map.lanes.get(&prev).map(|l| l.edge_id).unwrap_or(u64::MAX),
+                            chosen_edge,
+                            candidate_diag
+                        );
+                    }
                 }
             }
-            out.push(chosen.id);
+            out.push(chosen_id);
         }
     }
     out

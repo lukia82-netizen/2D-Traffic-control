@@ -370,8 +370,8 @@ pub fn run_simulation(
             // If the first edge already has a vehicle within SPAWN_CLEARANCE_M
             // of the spawn node, the spawn is skipped (accumulator retries later).
             {
-                let guard = graph_lock.read();
-                if let Some(map) = guard.as_ref() {
+                let mut guard = graph_lock.write();
+                if let Some(map) = guard.as_mut() {
                     let new_vehicles = spawn_system.tick_with_hour(
                         PHYSICS_DT,
                         spawn_multiplier,
@@ -693,7 +693,7 @@ pub fn run_simulation(
                             let lane_leader = immediate_same_lane_leader_id(
                                 idx,
                                 v,
-                                vehicles,
+                                &vehicles,
                                 &edge_lane_vehicles,
                                 map_ld,
                             );
