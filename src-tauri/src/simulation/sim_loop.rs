@@ -129,6 +129,24 @@ struct IdmDebugPayload {
     comfort_braking_distance_m: f32,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LeaderDebugEntry {
+    vehicle_id: u32,
+    /// Vehicle leader encoded in the dominant IDM obstacle when it is a same-lane car (`vehicle`).
+    idm_leader_vehicle_id: Option<u32>,
+    /// Closest vehicle ahead in the same edge+lane bucket (physical queue predecessor).
+    lane_leader_vehicle_id: Option<u32>,
+    /// `true` when IDM follows a vehicle leader that is not the immediate predecessor — lane-route / sensor inconsistency.
+    sensor_mismatch: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LeaderDebugPayload {
+    entries: Vec<LeaderDebugEntry>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct LaneMovementKey {
     in_edge: EdgeIndex,
@@ -650,6 +668,46 @@ pub fn run_simulation(
                             };
                             let _ = app_handle.emit("idm_debug", payload);
                         }
+                    }
+                }
+                let guard_ld = graph_lock.read();
+                if let Some(map_ld) = guard_ld.as_ref() {
+                    if idm_steps.len() == vehicles.len() {
+                        let mut entries: Vec<LeaderDebugEntry> = Vec::new();
+                        for (idx, v) in vehicles.iter().enumerate() {
+                            if v.route_pos >= v.route.len() || v.vehicle_type as u8 == 4 {
+                                continue;
+                            }
+                            if v.speed > 3.5 {
+                                continue;
+                            }
+                            let Some(step) = idm_steps.get(idx) else {
+                                continue;
+                            };
+                            let obs = step.obstacle;
+                            let idm_leader = if matches!(obs.kind, ObstacleKind::Vehicle) {
+                                obs.leader_vehicle_id
+                            } else {
+                                None
+                            };
+                            let lane_leader = immediate_same_lane_leader_id(
+                                idx,
+                                v,
+                                vehicles,
+                                &edge_lane_vehicles,
+                                map_ld,
+                            );
+                            let sensor_mismatch = !v.on_turn_connector
+                                && matches!(obs.kind, ObstacleKind::Vehicle)
+                                && idm_leader != lane_leader;
+                            entries.push(LeaderDebugEntry {
+                                vehicle_id: v.id,
+                                idm_leader_vehicle_id: idm_leader,
+                                lane_leader_vehicle_id: lane_leader,
+                                sensor_mismatch,
+                            });
+                        }
+                        let _ = app_handle.emit("leader_debug", &LeaderDebugPayload { entries });
                     }
                 }
             }
@@ -1180,6 +1238,55 @@ fn find_leader_obstacle_same_edge_lane(
     free_leader_obstacle()
 }
 
+/// Immediate predecessor on the same directed edge and lane index (sorted bucket),
+/// ignoring lane-graph continuation — ground truth for a simple queue on one lane.
+fn immediate_same_lane_leader_id(
+    ego_idx: usize,
+    ego: &Vehicle,
+    vehicles: &[Vehicle],
+    edge_lane_vehicles: &HashMap<(EdgeIndex, u8), Vec<usize>>,
+    map: &MapData,
+) -> Option<u32> {
+    if ego.on_turn_connector {
+        return None;
+    }
+    let edge_idx = *ego.route.get(ego.route_pos)?;
+    let bucket = edge_lane_vehicles.get(&(edge_idx, ego.current_lane))?;
+    let lane_len = map
+        .lane_by_edge_lane
+        .get(&(edge_idx.index(), ego.current_lane))
+        .and_then(|lid| map.lanes.get(lid))
+        .map(|lane| lane.path.length_m)
+        .unwrap_or(0.0);
+    if lane_len <= 0.01 {
+        return None;
+    }
+    let ego_progress = (ego.edge_progress * lane_len).clamp(0.0, lane_len);
+    let mut best: Option<(f32, u32)> = None;
+    for &leader_idx in bucket {
+        if leader_idx == ego_idx {
+            continue;
+        }
+        let leader = vehicles.get(leader_idx)?;
+        if leader.despawned
+            || leader.route_pos >= leader.route.len()
+            || leader.route[leader.route_pos] != edge_idx
+        {
+            continue;
+        }
+        let leader_progress = (leader.edge_progress * lane_len).clamp(0.0, lane_len);
+        let center_dist_m = leader_progress - ego_progress;
+        if center_dist_m <= 0.0 {
+            continue;
+        }
+        let gap = bumper_gap(center_dist_m, ego, leader).max(MIN_IDM_GAP_M);
+        if best.map_or(true, |(g, _)| gap < g) {
+            best = Some((gap, leader.id));
+        }
+    }
+    best.map(|(_, id)| id)
+}
+
 /// Find the dominant same-lane / look-ahead leader as an IDM obstacle.
 ///
 /// Gap is bumper-to-bumper arc length (`MIN_IDM_GAP_M` clamped).
@@ -1577,32 +1684,6 @@ fn emergency_decel_mps2(vehicle: &Vehicle) -> f32 {
         .max(3.0)
 }
 
-fn has_exit_space_after_intersection(
-    vehicle: &Vehicle,
-    map: &MapData,
-    vehicles: &[Vehicle],
-) -> bool {
-    if vehicle.route_pos + 1 >= vehicle.route.len() {
-        return true;
-    }
-    let out_edge = vehicle.route[vehicle.route_pos + 1];
-    let Some(out_w) = map.graph.edge_weight(out_edge) else {
-        return true;
-    };
-    let need_len = vehicle.vehicle_type.params().length_m + 2.0;
-    let need_progress = (need_len / out_w.length_m.max(1.0)).clamp(0.0, 1.0);
-    let target_lane = vehicle.target_lane;
-
-    !vehicles.iter().any(|o| {
-        o.id != vehicle.id
-            && o.route_pos < o.route.len()
-            && !o.despawned
-            && o.route[o.route_pos] == out_edge
-            && o.current_lane == target_lane
-            && o.edge_progress <= need_progress
-    })
-}
-
 fn vehicle_obb_isometry_and_shape(vehicle: &Vehicle) -> (Isometry2<f32>, Cuboid) {
     let (x_m, y_m) = geo_to_m_xy(vehicle.lat, vehicle.lng);
     // Convert our heading convention to standard angle from +X axis.
@@ -1793,17 +1874,6 @@ fn apply_intersection_effect(
                     point_lng_lat: Some(pt),
                     leader_vehicle_id: None,
                     conflict_reserver_id: Some(owner),
-                };
-                best = min_obstacle(best, threat);
-            }
-            if !has_exit_space_after_intersection(vehicle, map, vehicles) {
-                let threat = ClosestObstacle {
-                    kind: ObstacleKind::ReservationStopLine,
-                    gap_m: dist_to_stop_line.max(MIN_IDM_GAP_M),
-                    delta_v: vehicle.speed,
-                    point_lng_lat: Some([conn.p1_lng, conn.p1_lat]),
-                    leader_vehicle_id: None,
-                    conflict_reserver_id: None,
                 };
                 best = min_obstacle(best, threat);
             }
@@ -2474,8 +2544,6 @@ fn apply_vehicle_physics(
                 movement,
                 deadlock_first,
             ) {
-                can_enter_connector = false;
-            } else if !has_exit_space_after_intersection(vehicle, map, vehicles) {
                 can_enter_connector = false;
             } else if conflict_system
                 .try_reserve_all_for_vehicle(vehicle.id, lane_key, tgt_idx, now_game_s)
@@ -3378,6 +3446,13 @@ impl ConflictSystem {
                         p.reserved_last_motion_s = None;
                         continue;
                     };
+                    if owner_vehicle.despawned {
+                        p.reserved_by = None;
+                        p.reserved_at_game_s = None;
+                        p.reserved_last_progress_m = None;
+                        p.reserved_last_motion_s = None;
+                        continue;
+                    }
                     let age_s = p.reserved_at_game_s.map(|t| now_game_s - t).unwrap_or(0.0);
                     if age_s < CONFLICT_TTL_STALLED_S {
                         continue;

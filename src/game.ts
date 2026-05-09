@@ -23,6 +23,7 @@ import {
   listenCongestionUpdates,
   listenLightStateChanges,
   listenGameOver,
+  listenLeaderDebug,
   listenIdmDebug,
 } from './bridge/events';
 import type {
@@ -31,6 +32,7 @@ import type {
   LightStateUpdate,
   GameOverPayload,
   IdmDebugPayload,
+  LeaderDebugEntry,
 } from './bridge/events';
 import { PixiOverlay } from './rendering/PixiOverlay';
 import { CameraManager } from './rendering/CameraManager';
@@ -194,6 +196,7 @@ export class Game {
   private unlistenLights: (() => void) | null = null;
   private unlistenGameOver: (() => void) | null = null;
   private unlistenIdmDebug: (() => void) | null = null;
+  private unlistenLeaderDebug: (() => void) | null = null;
   private selectedVehicleId: number | null = null;
   private selectedRoutePoints: [number, number][] = [];
   private selectedThreatPoint: [number, number] | null = null;
@@ -221,6 +224,9 @@ export class Game {
   // ── Traffic Motion Debug layer ─────────────────────────────────────────────
   private trafficDebugGfx: PIXI.Graphics | null = null;
   private trafficDebugLabels: PIXI.Container | null = null;
+  /** «Tryb Debugowania Ruchu» — leader ID labels + future motion vectors. */
+  private trafficMotionDebugEnabled = false;
+  private latestLeaderDebug: LeaderDebugEntry[] = [];
   /** Fast O(1) lane lookup rebuilt whenever map data changes. */
   private laneById: Map<number, MapData['lanes'][0]> = new Map();
 
@@ -375,6 +381,9 @@ export class Game {
         this.trafficLightRenderer.rebuildOnCameraChange();
         this.redrawSelectedRoute();
         this.redrawPickDebugHud();
+        if (this.trafficMotionDebugEnabled) {
+          this.redrawTrafficLeaderDebug();
+        }
         this.redrawTurnConnectors();
         this.redrawLaneLines();
         this.redrawConflictAreas();
@@ -755,6 +764,9 @@ export class Game {
     this.unlistenIdmDebug = await listenIdmDebug((data) =>
       this.onIdmDebug(data),
     );
+    this.unlistenLeaderDebug = await listenLeaderDebug((data) => {
+      this.latestLeaderDebug = data.entries;
+    });
   }
 
   // ─── Simulation start ──────────────────────────────────────────────────────
@@ -891,11 +903,45 @@ export class Game {
 
   /** Enable/disable the "Tryb Debugowania Ruchu" traffic motion debug overlay. */
   private setTrafficDebugMode(enabled: boolean): void {
+    this.trafficMotionDebugEnabled = enabled;
     if (this.trafficDebugGfx) this.trafficDebugGfx.visible = enabled;
     if (this.trafficDebugLabels) this.trafficDebugLabels.visible = enabled;
     if (!enabled) {
       this.trafficDebugGfx?.clear();
       this.trafficDebugLabels?.removeChildren();
+      this.latestLeaderDebug = [];
+    }
+  }
+
+  /** Floating labels: IDM vehicle leader vs same-edge lane predecessor (queued / slow vehicles). */
+  private redrawTrafficLeaderDebug(): void {
+    const layer = this.trafficDebugLabels;
+    if (!layer || !this.trafficMotionDebugEnabled) return;
+    layer.removeChildren();
+    const z = this.map.getZoom();
+    const fontSize = Math.max(9, Math.min(13, 9 + (15 - z) * 0.35));
+    for (const e of this.latestLeaderDebug) {
+      const v = this.vehicles.get(e.vehicleId);
+      if (!v) continue;
+      const px = this.map.project([v.lng, v.lat]);
+      const idm = e.idmLeaderVehicleId != null ? `#${e.idmLeaderVehicleId}` : '—';
+      const lane = e.laneLeaderVehicleId != null ? `#${e.laneLeaderVehicleId}` : '—';
+      const lines = [`IDM→${idm}`, `pas ${lane}`];
+      if (e.sensorMismatch) {
+        lines.push('SENSOR');
+      }
+      const text = lines.join('\n');
+      const baseStyle = {
+        fontFamily: 'Inter, Segoe UI, sans-serif',
+        fontSize,
+        fill: e.sensorMismatch ? 0xff4444 : 0xf8fafc,
+        stroke: { color: 0x0f172a, width: Math.max(3, fontSize * 0.22) },
+      } as const;
+      const t = new PIXI.Text({ text, style: baseStyle });
+      t.anchor.set(0.5, 1);
+      t.x = px.x;
+      t.y = px.y - 18;
+      layer.addChild(t);
     }
   }
 
@@ -2019,6 +2065,9 @@ export class Game {
       this.redrawSelectedRoute();
       this.redrawPickDebugHud();
     }
+    if (this.trafficMotionDebugEnabled) {
+      this.redrawTrafficLeaderDebug();
+    }
     // Keep the dedicated pick-debug canvas in lockstep with moving vehicles.
     this.overlay.renderPickDebug();
 
@@ -2103,6 +2152,7 @@ export class Game {
     this.unlistenGameOver?.();
     this.bboxPicker?.destroy();
     this.unlistenIdmDebug?.();
+    this.unlistenLeaderDebug?.();
     this.sandboxUI?.destroy();
     this.overlay.destroyPickDebugApp();
     this.debugRouteGfx = null;

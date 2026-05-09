@@ -202,6 +202,21 @@ export interface IdmDebugPayload {
   comfortBrakingDistanceM?: number;
 }
 
+/** Per-vehicle leader comparison for traffic-debug overlay (slow / queued vehicles). */
+export interface LeaderDebugEntry {
+  vehicleId: number;
+  /** Same-lane vehicle leader when IDM dominant obstacle kind is `vehicle`. */
+  idmLeaderVehicleId: number | null;
+  /** Immediate predecessor on same edge+lane bucket (physical queue). */
+  laneLeaderVehicleId: number | null;
+  /** IDM vehicle leader differs from immediate lane predecessor — lane-route vs bucket mismatch. */
+  sensorMismatch: boolean;
+}
+
+export interface LeaderDebugPayload {
+  entries: LeaderDebugEntry[];
+}
+
 /**
  * Subscribe to the one-shot game_over event.
  * Returns an unsubscribe function.
@@ -223,6 +238,16 @@ export async function listenIdmDebug(
   cb: (data: IdmDebugPayload) => void,
 ): Promise<() => void> {
   const unlisten = await listen<IdmDebugPayload>('idm_debug', (event) => {
+    cb(event.payload);
+  });
+  return unlisten;
+}
+
+/** Leader vs lane-queue debug (~5 Hz), used when «Tryb Debugowania Ruchu» is on. */
+export async function listenLeaderDebug(
+  cb: (data: LeaderDebugPayload) => void,
+): Promise<() => void> {
+  const unlisten = await listen<LeaderDebugPayload>('leader_debug', (event) => {
     cb(event.payload);
   });
   return unlisten;
