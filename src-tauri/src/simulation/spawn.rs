@@ -1,18 +1,18 @@
-use rand::Rng;
-use rand::rngs::StdRng;
-use rand::{SeedableRng};
-use rand_distr::{Normal, Distribution};
 use petgraph::graph::NodeIndex;
+use rand::rngs::StdRng;
+use rand::Rng;
+use rand::SeedableRng;
+use rand_distr::{Distribution, Normal};
 
+use crate::map::road_network::LaneId;
 use crate::map::road_network::MapData;
+use crate::simulation::lane_change::compute_vehicle_target_lane;
 use crate::simulation::od_model::{OdModel, TripKind};
 use crate::simulation::pathfinding::{find_path, REF_SPEED_MS};
 use crate::simulation::speed_config::SpeedConfig;
-use crate::simulation::lane_change::compute_vehicle_target_lane;
-use crate::vehicles::vehicle::Vehicle;
-use crate::vehicles::types::VehicleType;
 use crate::vehicles::driver::DriverProfile;
-use crate::map::road_network::LaneId;
+use crate::vehicles::types::VehicleType;
+use crate::vehicles::vehicle::Vehicle;
 
 /// Default hard cap on total non-tram vehicles in the simulation.
 /// A conservative start value; the frontend sends SetMaxVehicles to override.
@@ -98,11 +98,12 @@ impl SpawnSystem {
 
     fn spawn_one(&mut self, map: &MapData, od_model: &OdModel) -> Option<Vehicle> {
         let driver_profile = self.random_driver_profile();
-        let vehicle_type   = self.random_vehicle_type();
+        let vehicle_type = self.random_vehicle_type();
 
         // Sample personal_compliance and route_alpha from speed_config
-        let personal_compliance = sample_compliance(driver_profile, &self.speed_config, &mut self.rng);
-        let route_alpha         = sample_route_alpha(driver_profile, &self.speed_config, &mut self.rng);
+        let personal_compliance =
+            sample_compliance(driver_profile, &self.speed_config, &mut self.rng);
+        let route_alpha = sample_route_alpha(driver_profile, &self.speed_config, &mut self.rng);
 
         // Decide spawn strategy
         let roll: f32 = self.rng.gen();
@@ -119,7 +120,8 @@ impl SpawnSystem {
                 self.random_od(map)?
             } else {
                 let game_hour = 8.0f32; // Will be overridden by caller; default to morning rush
-                od_model.generate_od_pair(game_hour, &mut self.rng)
+                od_model
+                    .generate_od_pair(game_hour, &mut self.rng)
                     .or_else(|| self.random_od(map))?
             }
         };
@@ -133,8 +135,8 @@ impl SpawnSystem {
             return None;
         }
 
-        let node  = &map.graph[from];
-        let id    = self.next_id;
+        let node = &map.graph[from];
+        let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
 
         let mut vehicle = Vehicle::new(
@@ -150,10 +152,10 @@ impl SpawnSystem {
         );
         // Set the initial target lane based on the first planned turn.
         let initial_target = compute_vehicle_target_lane(&vehicle, map);
-        vehicle.target_lane  = initial_target;
+        vehicle.target_lane = initial_target;
         vehicle.current_lane = initial_target;
         vehicle.current_lateral_offset = initial_target as f32;
-        vehicle.target_lateral_offset  = initial_target as f32;
+        vehicle.target_lateral_offset = initial_target as f32;
         let lane_route = build_lane_route_from_edge_route(map, &vehicle.route, initial_target);
         vehicle.current_lane_id = lane_route.first().copied();
         vehicle.lane_route = lane_route;
@@ -206,10 +208,11 @@ impl SpawnSystem {
         od_model: &OdModel,
         game_hour: f32,
     ) -> Option<Vehicle> {
-        let driver_profile     = self.random_driver_profile();
-        let vehicle_type       = self.random_vehicle_type();
-        let personal_compliance = sample_compliance(driver_profile, &self.speed_config, &mut self.rng);
-        let route_alpha         = sample_route_alpha(driver_profile, &self.speed_config, &mut self.rng);
+        let driver_profile = self.random_driver_profile();
+        let vehicle_type = self.random_vehicle_type();
+        let personal_compliance =
+            sample_compliance(driver_profile, &self.speed_config, &mut self.rng);
+        let route_alpha = sample_route_alpha(driver_profile, &self.speed_config, &mut self.rng);
 
         let roll: f32 = self.rng.gen();
         let (from, to, trip_kind) = if roll < TRANSIT_FRACTION {
@@ -234,7 +237,7 @@ impl SpawnSystem {
         }
 
         let node = &map.graph[from];
-        let id   = self.next_id;
+        let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
 
         let mut vehicle = Vehicle::new(
@@ -249,10 +252,10 @@ impl SpawnSystem {
             trip_kind as u8,
         );
         let initial_target = compute_vehicle_target_lane(&vehicle, map);
-        vehicle.target_lane  = initial_target;
+        vehicle.target_lane = initial_target;
         vehicle.current_lane = initial_target;
         vehicle.current_lateral_offset = initial_target as f32;
-        vehicle.target_lateral_offset  = initial_target as f32;
+        vehicle.target_lateral_offset = initial_target as f32;
         let lane_route = build_lane_route_from_edge_route(map, &vehicle.route, initial_target);
         vehicle.current_lane_id = lane_route.first().copied();
         vehicle.lane_route = lane_route;
@@ -267,13 +270,21 @@ impl SpawnSystem {
 
     fn transit_od(&mut self, map: &MapData) -> Option<(NodeIndex, NodeIndex, TripKind)> {
         if self.boundary_nodes.len() < 2 {
-            return self.random_od(map).map(|(f, t, _)| (f, t, TripKind::Transit));
+            return self
+                .random_od(map)
+                .map(|(f, t, _)| (f, t, TripKind::Transit));
         }
         let n = self.boundary_nodes.len();
         let fi = self.rng.gen_range(0..n);
         let mut ti = self.rng.gen_range(0..n);
-        if ti == fi { ti = (ti + 1) % n; }
-        Some((self.boundary_nodes[fi], self.boundary_nodes[ti], TripKind::Transit))
+        if ti == fi {
+            ti = (ti + 1) % n;
+        }
+        Some((
+            self.boundary_nodes[fi],
+            self.boundary_nodes[ti],
+            TripKind::Transit,
+        ))
     }
 
     fn external_od(
@@ -282,7 +293,9 @@ impl SpawnSystem {
         od_model: &OdModel,
     ) -> Option<(NodeIndex, NodeIndex, TripKind)> {
         if self.boundary_nodes.is_empty() {
-            return self.random_od(map).map(|(f, t, _)| (f, t, TripKind::ExternalInbound));
+            return self
+                .random_od(map)
+                .map(|(f, t, _)| (f, t, TripKind::ExternalInbound));
         }
         let boundary_idx = self.boundary_nodes[self.rng.gen_range(0..self.boundary_nodes.len())];
 
@@ -307,7 +320,9 @@ impl SpawnSystem {
                     .unwrap_or(boundary_idx)
             } else {
                 let n = self.boundary_nodes.len();
-                if n == 0 { return None; }
+                if n == 0 {
+                    return None;
+                }
                 self.boundary_nodes[self.rng.gen_range(0..n)]
             };
             Some((origin, boundary_idx, TripKind::ExternalOutbound))
@@ -321,7 +336,9 @@ impl SpawnSystem {
         let n = self.boundary_nodes.len();
         let fi = self.rng.gen_range(0..n);
         let mut ti = self.rng.gen_range(0..n);
-        if ti == fi { ti = (ti + 1) % n; }
+        if ti == fi {
+            ti = (ti + 1) % n;
+        }
         let from = self.boundary_nodes[fi];
         let to = self.boundary_nodes[ti];
         if map.graph.node_weight(from).is_none() || map.graph.node_weight(to).is_none() {
@@ -337,22 +354,36 @@ impl SpawnSystem {
             return VehicleType::Car;
         }
         let roll: f32 = self.rng.gen();
-        if roll < 0.70      { VehicleType::Car   }
-        else if roll < 0.85 { VehicleType::Van   }
-        else if roll < 0.95 { VehicleType::Bus   }
-        else                { VehicleType::Truck }
+        if roll < 0.70 {
+            VehicleType::Car
+        } else if roll < 0.85 {
+            VehicleType::Van
+        } else if roll < 0.95 {
+            VehicleType::Bus
+        } else {
+            VehicleType::Truck
+        }
     }
 
     fn random_driver_profile(&mut self) -> DriverProfile {
         let roll: f32 = self.rng.gen();
-        if roll < 0.70      { DriverProfile::Normal   }
-        else if roll < 0.85 { DriverProfile::Sunday   }
-        else if roll < 0.95 { DriverProfile::Pirat    }
-        else                { DriverProfile::Cautious }
+        if roll < 0.70 {
+            DriverProfile::Normal
+        } else if roll < 0.85 {
+            DriverProfile::Sunday
+        } else if roll < 0.95 {
+            DriverProfile::Pirat
+        } else {
+            DriverProfile::Cautious
+        }
     }
 }
 
-fn build_lane_route_from_edge_route(map: &MapData, route: &[petgraph::graph::EdgeIndex], lane_idx: u8) -> Vec<LaneId> {
+fn build_lane_route_from_edge_route(
+    map: &MapData,
+    route: &[petgraph::graph::EdgeIndex],
+    lane_idx: u8,
+) -> Vec<LaneId> {
     let mut out = Vec::new();
     for edge in route {
         let mut candidates: Vec<&crate::map::road_network::Lane> = map
@@ -370,17 +401,28 @@ fn build_lane_route_from_edge_route(map: &MapData, route: &[petgraph::graph::Edg
         if let Some(chosen) = candidates.into_iter().min_by_key(|l| l.lane_index) {
             if let Some(prev) = out.last().copied() {
                 // If a connector exists from previous lane to this lane, include it.
-                if let Some(conn) = map
-                    .lanes
-                    .get(&prev)
-                    .and_then(|l| l.connections.iter().copied().find(|c| {
+                let connector = map.lanes.get(&prev).and_then(|l| {
+                    l.connections.iter().copied().find(|c| {
                         map.lanes
                             .get(c)
                             .map(|cl| cl.connections.contains(&chosen.id))
                             .unwrap_or(false)
-                    }))
-                {
+                    })
+                });
+                if let Some(conn) = connector {
                     out.push(conn);
+                } else if map
+                    .lanes
+                    .get(&prev)
+                    .is_some_and(|l| l.edge_id != chosen.edge_id)
+                {
+                    log::warn!(
+                        "Lane route gap: missing connector lane {} -> {} (edge {} -> {})",
+                        prev,
+                        chosen.id,
+                        map.lanes.get(&prev).map(|l| l.edge_id).unwrap_or(u64::MAX),
+                        chosen.edge_id
+                    );
                 }
             }
             out.push(chosen.id);
@@ -392,26 +434,20 @@ fn build_lane_route_from_edge_route(map: &MapData, route: &[petgraph::graph::Edg
 // ── Sampling helpers ─────────────────────────────────────────────────────────
 
 /// Sample a personal compliance multiplier for `profile` from `SpeedConfig`.
-pub fn sample_compliance(
-    profile: DriverProfile,
-    config: &SpeedConfig,
-    rng: &mut impl Rng,
-) -> f32 {
-    let range  = config.compliance_for(profile);
-    let normal = Normal::new(0.0f32, config.noise_sigma).unwrap_or(Normal::new(0.0, 0.001).unwrap());
+pub fn sample_compliance(profile: DriverProfile, config: &SpeedConfig, rng: &mut impl Rng) -> f32 {
+    let range = config.compliance_for(profile);
+    let normal =
+        Normal::new(0.0f32, config.noise_sigma).unwrap_or(Normal::new(0.0, 0.001).unwrap());
     let noise: f32 = normal.sample(rng);
     (range.base + noise).clamp(range.min, range.max)
 }
 
 /// Sample a route-alpha value for `profile` from `SpeedConfig`.
-pub fn sample_route_alpha(
-    profile: DriverProfile,
-    config: &SpeedConfig,
-    rng: &mut impl Rng,
-) -> f32 {
+pub fn sample_route_alpha(profile: DriverProfile, config: &SpeedConfig, rng: &mut impl Rng) -> f32 {
     let (lo, hi) = config.route_alpha_range(profile);
     let base: f32 = rng.gen_range(lo..=hi);
-    let normal = Normal::new(0.0f32, config.route.noise_sigma).unwrap_or(Normal::new(0.0, 0.001).unwrap());
+    let normal =
+        Normal::new(0.0f32, config.route.noise_sigma).unwrap_or(Normal::new(0.0, 0.001).unwrap());
     let noise: f32 = normal.sample(rng);
     (base + noise).clamp(0.0, 1.0)
 }
