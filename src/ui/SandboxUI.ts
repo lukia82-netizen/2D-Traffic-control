@@ -30,6 +30,7 @@ export type TurnConnectorsToggleCb = (visible: boolean) => void;
 export type TurnConnectorsActiveOnlyToggleCb = (activeOnly: boolean) => void;
 export type DebugVisualizationToggleCb = (enabled: boolean) => void;
 export type LaneLinesToggleCb = (enabled: boolean) => void;
+export type TrafficDebugToggleCb = (enabled: boolean) => void;
 /** center = [lng, lat], sizeM = metres per side */
 export type ReloadMapCb        = (center: [number, number], sizeM: number) => void;
 export type MaxVehiclesCb      = (count: number) => void;
@@ -115,6 +116,7 @@ export class SandboxUI {
   onTurnConnectorsActiveOnlyToggle: TurnConnectorsActiveOnlyToggleCb = () => undefined;
   onDebugVisualizationToggle: DebugVisualizationToggleCb = () => undefined;
   onLaneLinesToggle: LaneLinesToggleCb = () => undefined;
+  onTrafficDebugToggle: TrafficDebugToggleCb = () => undefined;
   onReloadMap:         ReloadMapCb      = () => undefined;
   onMaxVehiclesChange: MaxVehiclesCb    = () => undefined;
   onLaneWidthChange:   LaneWidthCb      = () => undefined;
@@ -493,6 +495,10 @@ export class SandboxUI {
     sec.appendChild(this.buildCheckRow(
       'lane-lines', 'Linie pasów (debug)', '#facc15', true,
       (checked) => this.onLaneLinesToggle(checked),
+    ));
+    sec.appendChild(this.buildCheckRow(
+      'traffic-debug', 'Tryb Debugowania Ruchu', '#a855f7', false,
+      (checked) => this.onTrafficDebugToggle(checked),
     ));
 
     return sec;

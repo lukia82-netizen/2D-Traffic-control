@@ -217,6 +217,12 @@ export class Game {
   private showTurnConnectorsActiveOnly = false;
   private showLaneLines = true;
 
+  // ── Traffic Motion Debug layer ─────────────────────────────────────────────
+  private trafficDebugGfx: PIXI.Graphics | null = null;
+  private trafficDebugLabels: PIXI.Container | null = null;
+  /** Fast O(1) lane lookup rebuilt whenever map data changes. */
+  private laneById: Map<number, MapData['lanes'][0]> = new Map();
+
   // Scoring
   private score = 0;
   private gameOver = false;
@@ -292,6 +298,14 @@ export class Game {
     this.overlay.congestionLayer.addChild(this.laneLinesGfx);
     this.debugRouteGfx.visible = this.pickedVehicleDebugOverlayVisible;
     this.pickDebugHud.visible = this.pickedVehicleDebugOverlayVisible;
+
+    // Traffic motion debug — lives in the topmost layer so it renders above all roads/vehicles
+    this.trafficDebugGfx = new PIXI.Graphics();
+    this.trafficDebugLabels = new PIXI.Container();
+    this.trafficDebugGfx.visible = false;
+    this.trafficDebugLabels.visible = false;
+    this.overlay.trafficDebugLayer.addChild(this.trafficDebugGfx);
+    this.overlay.trafficDebugLayer.addChild(this.trafficDebugLabels);
 
     window.addEventListener('keydown', (ev) => {
       const t = ev.target as HTMLElement | null;
@@ -515,6 +529,9 @@ export class Game {
       this.redrawTurnConnectors();
       this.redrawConflictAreas();
     };
+    ui.onTrafficDebugToggle = (enabled) => {
+      void this.setTrafficDebugMode(enabled);
+    };
     ui.setChecked('turn-connectors', this.showTurnConnectors);
     ui.setChecked('turn-connectors-active-only', this.showTurnConnectorsActiveOnly);
     ui.applyPersistedSettings();
@@ -568,6 +585,7 @@ export class Game {
     this.trafficLightUI.init(this.mapData.nodes);
     this.trafficLightRenderer.init(this.mapData.nodes, this.mapData.edges);
     this.rebuildTurnConnectorPaths();
+    this.rebuildLaneById();
     this.redrawTurnConnectors();
     this.redrawLaneLines();
     this.redrawConflictAreas();
@@ -621,6 +639,7 @@ export class Game {
     this.trafficLightUI.init(this.mapData.nodes);
     this.trafficLightRenderer.init(this.mapData.nodes, this.mapData.edges);
     this.rebuildTurnConnectorPaths();
+    this.rebuildLaneById();
     this.redrawTurnConnectors();
     this.redrawLaneLines();
     this.redrawConflictAreas();
@@ -666,6 +685,7 @@ export class Game {
     this.trafficLightUI.init(mapData.nodes);
     this.trafficLightRenderer.init(mapData.nodes, mapData.edges);
     this.rebuildTurnConnectorPaths();
+    this.rebuildLaneById();
     this.redrawTurnConnectors();
     this.redrawLaneLines();
     this.redrawConflictAreas();
@@ -679,6 +699,17 @@ export class Game {
     this.gameClockUI.setTimeScaleValue(scenario.timeScale);
     if (this.tauriAvailable) {
       setMaxVehicles(scenario.maxVehicles).catch(console.error);
+    }
+  }
+
+  // ─── Lane lookup cache ─────────────────────────────────────────────────────
+
+  /** Rebuild O(1) lane lookup table from the current map data. */
+  private rebuildLaneById(): void {
+    this.laneById.clear();
+    if (!this.mapData) return;
+    for (const lane of this.mapData.lanes) {
+      this.laneById.set(lane.id, lane);
     }
   }
 
@@ -847,6 +878,16 @@ export class Game {
     } else {
       this.redrawSelectedRoute();
       this.redrawPickDebugHud();
+    }
+  }
+
+  /** Enable/disable the "Tryb Debugowania Ruchu" traffic motion debug overlay. */
+  private setTrafficDebugMode(enabled: boolean): void {
+    if (this.trafficDebugGfx) this.trafficDebugGfx.visible = enabled;
+    if (this.trafficDebugLabels) this.trafficDebugLabels.visible = enabled;
+    if (!enabled) {
+      this.trafficDebugGfx?.clear();
+      this.trafficDebugLabels?.removeChildren();
     }
   }
 
@@ -1870,6 +1911,8 @@ export class Game {
     this.laneLinesGfx?.destroy();
     this.turnConnectorGfx?.destroy();
     this.conflictGfx?.destroy();
+    this.trafficDebugGfx?.destroy();
+    this.trafficDebugLabels?.destroy();
     this.mapScenarioEditorUI?.destroy();
     this.edgeEditorPanel?.remove();
     this.toolSwitchPanel?.remove();

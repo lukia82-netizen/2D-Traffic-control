@@ -15,7 +15,8 @@ import * as PIXI from 'pixi.js';
  *   8 – frustrationLayer Frustration bubble indicators above vehicles
  *   9 – trafficLights    Traffic light state sprites
  *  10 – congestionLayer  Congestion heat overlay
- *  11 – editorOverlay    Node/edge handles in editor mode
+ *  11 – editorOverlay    Map editor handles
+ *  12 – trafficDebugLayer Traffic motion debug (leader lines, paths, labels) — always on top
  *
  * Click-inspect graphics live on a **separate** `pickDebugApp` canvas (`#pixi-pick-debug`, high CSS z-index)
  * so routes are not hidden under the sandbox panel.
@@ -39,6 +40,7 @@ export class PixiOverlay {
   editorOverlay!: PIXI.Container;
   /** Route polyline, threat rays, floating brake HUD for picked vehicle. */
   pickDebugLayer!: PIXI.Container;
+  trafficDebugLayer!: PIXI.Container;
 
   private readonly containerId: string;
 
@@ -80,6 +82,7 @@ export class PixiOverlay {
     this.trafficLights   = new PIXI.Container();
     this.congestionLayer = new PIXI.Container();
     this.editorOverlay = new PIXI.Container();
+    this.trafficDebugLayer = new PIXI.Container();
 
     this.app.stage.addChild(this.buildings);
     this.app.stage.addChild(this.roads);
@@ -93,6 +96,7 @@ export class PixiOverlay {
     this.app.stage.addChild(this.trafficLights);
     this.app.stage.addChild(this.congestionLayer);
     this.app.stage.addChild(this.editorOverlay);
+    this.app.stage.addChild(this.trafficDebugLayer);
 
     this.pickDebugApp = new PIXI.Application();
     await this.pickDebugApp.init({
