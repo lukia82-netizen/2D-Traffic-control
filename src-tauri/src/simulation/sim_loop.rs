@@ -1,38 +1,38 @@
-use std::sync::mpsc::Receiver;
-use std::time::{Duration, Instant};
-use std::collections::HashMap;
-use std::cmp::Ordering;
-use parking_lot::RwLock;
-use std::sync::Arc;
-use rayon::prelude::*;
-use tauri::ipc::Channel;
-use tauri::{AppHandle, Emitter};
 use base64::Engine;
-use serde::Serialize;
+use parking_lot::RwLock;
 use petgraph::graph::{EdgeIndex, NodeIndex};
 use petgraph::visit::EdgeRef;
+use rayon::prelude::*;
+use serde::Serialize;
+use std::cmp::Ordering;
+use std::collections::HashMap;
+use std::sync::mpsc::Receiver;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tauri::ipc::Channel;
+use tauri::{AppHandle, Emitter};
 
-use kurbo::{ParamCurve, ParamCurveArclen, ParamCurveDeriv};
 use crate::map::road_network::{
-    lane_connector_cubic, Lane, LaneId, MapData, IntersectionType, CONNECTOR_ARCLEN_ACC,
+    lane_connector_cubic, IntersectionType, Lane, LaneId, MapData, CONNECTOR_ARCLEN_ACC,
 };
-use crate::state::SimCommand;
-use crate::time::game_clock::GameClock;
-use crate::time::day_cycle::DayCycle;
-use crate::traffic::intersection::IntersectionManager;
-use crate::vehicles::vehicle::Vehicle;
-use crate::simulation::idm::idm_acceleration;
-use crate::simulation::spawn::SpawnSystem;
-use crate::simulation::lane_change::{decide_lane_change, compute_vehicle_target_lane};
+use crate::simulation::bezier_smooth::BezierPath;
 use crate::simulation::congestion::compute_congestion;
+use crate::simulation::idm::idm_acceleration;
+use crate::simulation::lane_change::{compute_vehicle_target_lane, decide_lane_change};
 use crate::simulation::od_model::OdModel;
+use crate::simulation::spawn::SpawnSystem;
 use crate::simulation::speed_config::SpeedConfig;
 use crate::simulation::tram_sim::TramSim;
-use crate::simulation::bezier_smooth::BezierPath;
+use crate::state::SimCommand;
+use crate::time::day_cycle::DayCycle;
+use crate::time::game_clock::GameClock;
+use crate::traffic::intersection::IntersectionManager;
+use crate::vehicles::vehicle::Vehicle;
 use glam::DVec2;
-use parry2d::shape::{Segment, Cuboid, Ball};
-use parry2d::query::intersection_test;
+use kurbo::{ParamCurve, ParamCurveArclen, ParamCurveDeriv};
 use parry2d::na::{Isometry2, Vector2};
+use parry2d::query::intersection_test;
+use parry2d::shape::{Ball, Cuboid, Segment};
 
 const TARGET_TICK_S: f32 = 1.0 / 60.0;
 const CONGESTION_INTERVAL_S: f32 = 0.5;
@@ -193,7 +193,9 @@ pub fn run_simulation(
     // ── Build subsystems from map ────────────────────────────────────────────
     let (mut intersections, mut spawn_system, mut od_model, mut tram_sim, mut conflict_system) = {
         let guard = graph_lock.read();
-        let map   = guard.as_ref().expect("map must be loaded before starting simulation");
+        let map = guard
+            .as_ref()
+            .expect("map must be loaded before starting simulation");
 
         (
             IntersectionManager::from_graph(&map.graph, map.sandbox_simple_cross_tl),
@@ -229,14 +231,17 @@ pub fn run_simulation(
     let mut physics_accumulator = 0.0f32;
 
     let mut last_tick = Instant::now();
-    log::info!("Simulation loop started (fixed-step dt = {:.4} s)", PHYSICS_DT);
+    log::info!(
+        "Simulation loop started (fixed-step dt = {:.4} s)",
+        PHYSICS_DT
+    );
 
     loop {
         // ── Wall-clock time measurement ──────────────────────────────────────
-        let now          = Instant::now();
+        let now = Instant::now();
         // Cap at 250 ms to prevent "spiral of death" on very slow machines
         let real_elapsed = now.duration_since(last_tick).as_secs_f32().min(0.25);
-        last_tick        = now;
+        last_tick = now;
 
         // ── Commands ─────────────────────────────────────────────────────────
         loop {
@@ -262,7 +267,8 @@ pub fn run_simulation(
         if latest_signature != map_signature {
             let guard = graph_lock.read();
             if let Some(map) = guard.as_ref() {
-                intersections = IntersectionManager::from_graph(&map.graph, map.sandbox_simple_cross_tl);
+                intersections =
+                    IntersectionManager::from_graph(&map.graph, map.sandbox_simple_cross_tl);
                 let mut refreshed_spawn = SpawnSystem::new(
                     map.spawn_points.clone(),
                     map.boundary_nodes.clone(),
@@ -301,8 +307,8 @@ pub fn run_simulation(
         while physics_accumulator >= PHYSICS_DT {
             physics_accumulator -= PHYSICS_DT;
 
-            let game_dt_s       = clock.tick(PHYSICS_DT);
-            let game_hour       = clock.game_hour();
+            let game_dt_s = clock.tick(PHYSICS_DT);
+            let game_hour = clock.game_hour();
             let spawn_multiplier = DayCycle::spawn_multiplier(game_hour);
             idm_overlay_timer += PHYSICS_DT;
 
@@ -338,22 +344,25 @@ pub fn run_simulation(
                     );
                     for nv in new_vehicles {
                         if let Some(&first_edge) = nv.route.first() {
-                            let edge_len = map.graph.edge_weight(first_edge)
+                            let edge_len = map
+                                .graph
+                                .edge_weight(first_edge)
                                 .map(|e| e.length_m)
                                 .unwrap_or(100.0);
                             let blocked = vehicles.iter().any(|v| {
                                 let new_len = nv.vehicle_type.params().length_m;
                                 let existing_len = v.vehicle_type.params().length_m;
                                 let center_dist_m = v.edge_progress * edge_len;
-                                let bumper_gap_m =
-                                    center_dist_m - 0.5 * (new_len + existing_len);
+                                let bumper_gap_m = center_dist_m - 0.5 * (new_len + existing_len);
                                 let min_spawn_gap_m = new_len.max(existing_len) + SPAWN_BUFFER_M;
                                 v.route_pos < v.route.len()
                                     && v.route[v.route_pos] == first_edge
                                     && v.current_lane == nv.current_lane
                                     && bumper_gap_m < min_spawn_gap_m
                             });
-                            if blocked { continue; } // no room, skip this tick
+                            if blocked {
+                                continue;
+                            } // no room, skip this tick
                         }
                         vehicles.push(nv);
                     }
@@ -372,7 +381,8 @@ pub fn run_simulation(
             for bucket in edge_lane_vehicles.values_mut() {
                 // Sort ascending by edge_progress; tiebreak by ID (lower = older = ahead).
                 bucket.sort_unstable_by(|&a, &b| {
-                    vehicles[a].edge_progress
+                    vehicles[a]
+                        .edge_progress
                         .partial_cmp(&vehicles[b].edge_progress)
                         .unwrap_or(std::cmp::Ordering::Equal)
                         .then_with(|| vehicles[a].id.cmp(&vehicles[b].id))
@@ -400,7 +410,9 @@ pub fn run_simulation(
             }
 
             // Parallel IDM / closest-obstacle computation (read-only parallel part)
-            let tram_snapshot: Vec<(f64, f64, f32)> = tram_sim.trams.iter()
+            let tram_snapshot: Vec<(f64, f64, f32)> = tram_sim
+                .trams
+                .iter()
                 .map(|t| (t.lat, t.lng, t.speed))
                 .collect();
 
@@ -465,14 +477,15 @@ pub fn run_simulation(
                     let changes: Vec<(u32, u8)> = vehicles
                         .iter()
                         .filter_map(|v| {
-                            if v.route_pos >= v.route.len() { return None; }
+                            if v.route_pos >= v.route.len() {
+                                return None;
+                            }
                             let edge_idx = v.route[v.route_pos];
                             let edge = map.graph.edge_weight(edge_idx)?;
                             let same_edge: Vec<&Vehicle> = snapshot
                                 .iter()
                                 .filter(|o| {
-                                    o.route_pos < o.route.len()
-                                        && o.route[o.route_pos] == edge_idx
+                                    o.route_pos < o.route.len() && o.route[o.route_pos] == edge_idx
                                 })
                                 .copied()
                                 .collect();
@@ -508,13 +521,17 @@ pub fn run_simulation(
                     if high_frustration_timer >= cfg.global_loss_duration_s {
                         log::warn!(
                             "GAME OVER: avg frustration {:.1} held for {:.0}s",
-                            avg_frustration, high_frustration_timer
+                            avg_frustration,
+                            high_frustration_timer
                         );
-                        let _ = app_handle.emit("game_over", GameOverPayload {
-                            reason: "avg_frustration".to_string(),
-                            value: avg_frustration,
-                            timestamp_game: clock.game_time_s as f32,
-                        });
+                        let _ = app_handle.emit(
+                            "game_over",
+                            GameOverPayload {
+                                reason: "avg_frustration".to_string(),
+                                value: avg_frustration,
+                                timestamp_game: clock.game_time_s as f32,
+                            },
+                        );
                         high_frustration_timer = 0.0;
                     }
                 } else if mass_rage_fraction >= cfg.mass_rage_fraction {
@@ -522,11 +539,14 @@ pub fn run_simulation(
                         "GAME OVER: mass rage – {:.0}% vehicles at 100 frustration",
                         mass_rage_fraction * 100.0
                     );
-                    let _ = app_handle.emit("game_over", GameOverPayload {
-                        reason: "mass_rage".to_string(),
-                        value: mass_rage_fraction * 100.0,
-                        timestamp_game: clock.game_time_s as f32,
-                    });
+                    let _ = app_handle.emit(
+                        "game_over",
+                        GameOverPayload {
+                            reason: "mass_rage".to_string(),
+                            value: mass_rage_fraction * 100.0,
+                            timestamp_game: clock.game_time_s as f32,
+                        },
+                    );
                 } else {
                     high_frustration_timer = 0.0;
                 }
@@ -553,7 +573,8 @@ pub fn run_simulation(
                             let step = idm_steps[i];
                             let obstacle = step.obstacle;
                             let (dist_to_stop_line, red_blocking) =
-                                stop_line_debug(ego, map, &intersections).unwrap_or((1000.0, false));
+                                stop_line_debug(ego, map, &intersections)
+                                    .unwrap_or((1000.0, false));
                             let vp = ego.vehicle_type.params();
                             let accel_i = accel_inputs.get(i).copied().unwrap_or(0.0);
                             let payload = IdmDebugPayload {
@@ -575,7 +596,8 @@ pub fn run_simulation(
                                 shape_width_m: vp.width_m,
                                 shape_radius_m: vehicle_path_radius_m(ego),
                                 threat_kind: obstacle_kind_label(obstacle.kind).to_string(),
-                                threat_line_style: threat_line_style_label(obstacle.kind).to_string(),
+                                threat_line_style: threat_line_style_label(obstacle.kind)
+                                    .to_string(),
                                 threat_point: obstacle.point_lng_lat,
                                 stop_line_point: stop_line_point(ego, map),
                                 turn_entry_point: vehicle_next_movement(ego, map)
@@ -583,7 +605,9 @@ pub fn run_simulation(
                                 hood_lng_lat: hood_lng_lat_m(ego),
                                 rear_bumper_lng_lat: rear_bumper_lng_lat_vehicle(ego),
                                 route_points: build_debug_target_path_points(ego, map),
-                                bezier_control_path_lng_lat: bezier_debug_control_polyline_lng_lat(ego),
+                                bezier_control_path_lng_lat: bezier_debug_control_polyline_lng_lat(
+                                    ego,
+                                ),
                                 lane_route_ids: ego.lane_route.clone(),
                                 brake_reason: idm_brake_caption(accel_i, &obstacle, ego),
                             };
@@ -598,7 +622,7 @@ pub fn run_simulation(
         // Decoupled from physics steps: the render fires at wall-clock rate
         // (~60 Hz target) even if physics ran 0 or 2 steps this iteration.
         if !vehicles.is_empty() || !tram_sim.is_empty() {
-            let frame   = serialize_vehicles(&vehicles, &tram_sim);
+            let frame = serialize_vehicles(&vehicles, &tram_sim);
             let encoded = base64::engine::general_purpose::STANDARD.encode(&frame);
             let _ = vehicle_channel.send(encoded);
         }
@@ -615,7 +639,7 @@ pub fn run_simulation(
         }
 
         // ── Sleep to target ~60 FPS outer loop ────────────────────────────────
-        let elapsed   = last_tick.elapsed().as_secs_f32();
+        let elapsed = last_tick.elapsed().as_secs_f32();
         let remaining = TARGET_TICK_S - elapsed;
         if remaining > 0.001 {
             std::thread::sleep(Duration::from_secs_f32(remaining));
@@ -637,14 +661,21 @@ fn stop_line_debug(
     let tgt_osm_id = map.graph[tgt].osm_id;
     let itype = &map.graph[tgt].intersection_type;
 
-    if !matches!(itype, IntersectionType::TrafficLight | IntersectionType::PedestrianCrossing) {
+    if !matches!(
+        itype,
+        IntersectionType::TrafficLight | IntersectionType::PedestrianCrossing
+    ) {
         return None;
     }
 
     let dist_to_end = edge.length_m * (1.0 - vehicle.edge_progress);
     let dist_to_stop_line = distance_to_stop_line_from_front_bumper(vehicle, dist_to_end);
-    let red_blocking =
-        !intersections.can_vehicle_proceed(tgt_osm_id, vehicle.has_stopped_at_stop_sign, vehicle, map);
+    let red_blocking = !intersections.can_vehicle_proceed(
+        tgt_osm_id,
+        vehicle.has_stopped_at_stop_sign,
+        vehicle,
+        map,
+    );
     Some((dist_to_stop_line, red_blocking))
 }
 
@@ -656,7 +687,11 @@ fn stop_line_point(vehicle: &Vehicle, map: &MapData) -> Option<[f64; 2]> {
     let edge = map.graph.edge_weight(edge_idx)?;
     let (_, tgt) = map.graph.edge_endpoints(edge_idx)?;
     let stop_t = (1.0 - STOP_LINE_OFFSET_M / edge.length_m.max(1.0)).clamp(0.0, 1.0) as f64;
-    let src = map.graph.edge_endpoints(edge_idx).map(|e| e.0).unwrap_or(tgt);
+    let src = map
+        .graph
+        .edge_endpoints(edge_idx)
+        .map(|e| e.0)
+        .unwrap_or(tgt);
     let src_n = &map.graph[src];
     let tgt_n = &map.graph[tgt];
     let stop_lat = src_n.lat + (tgt_n.lat - src_n.lat) * stop_t;
@@ -664,7 +699,9 @@ fn stop_line_point(vehicle: &Vehicle, map: &MapData) -> Option<[f64; 2]> {
     Some([stop_lng, stop_lat])
 }
 
-fn current_map_signature(graph_lock: &Arc<RwLock<Option<MapData>>>) -> Option<(usize, usize, usize, usize)> {
+fn current_map_signature(
+    graph_lock: &Arc<RwLock<Option<MapData>>>,
+) -> Option<(usize, usize, usize, usize)> {
     let guard = graph_lock.read();
     guard.as_ref().map(|map| {
         (
@@ -686,18 +723,28 @@ fn handle_command(
     selected_debug_vehicle: &mut Option<u32>,
 ) {
     match cmd {
-        SimCommand::Pause                  => clock.pause(),
-        SimCommand::Resume                 => clock.resume(),
-        SimCommand::SetTimeScale(s)        => clock.set_time_scale(s),
-        SimCommand::SetSpeedConfig(cfg)    => spawn_system.set_speed_config(cfg),
-        SimCommand::SetMaxVehicles(n)      => spawn_system.max_vehicles = n,
-        SimCommand::SetLightMode { intersection_id, mode } => {
+        SimCommand::Pause => clock.pause(),
+        SimCommand::Resume => clock.resume(),
+        SimCommand::SetTimeScale(s) => clock.set_time_scale(s),
+        SimCommand::SetSpeedConfig(cfg) => spawn_system.set_speed_config(cfg),
+        SimCommand::SetMaxVehicles(n) => spawn_system.max_vehicles = n,
+        SimCommand::SetLightMode {
+            intersection_id,
+            mode,
+        } => {
             intersections.set_mode(intersection_id, mode);
         }
-        SimCommand::SetLightPhase { intersection_id, phase } => {
+        SimCommand::SetLightPhase {
+            intersection_id,
+            phase,
+        } => {
             intersections.set_phase(intersection_id, phase);
         }
-        SimCommand::SetLightDurations { intersection_id, green_s, red_s } => {
+        SimCommand::SetLightDurations {
+            intersection_id,
+            green_s,
+            red_s,
+        } => {
             intersections.set_durations(intersection_id, green_s, red_s);
         }
         SimCommand::SetDebugVehicle(id) => {
@@ -709,11 +756,7 @@ fn handle_command(
 
 /// Lane polyline as \[lng, lat\] samples (same order as frontend `lane.points`).
 fn lane_centerline_lng_lat(lane: &crate::map::road_network::Lane) -> Vec<[f64; 2]> {
-    lane.path
-        .points
-        .iter()
-        .map(|p| [p[1], p[0]])
-        .collect()
+    lane.path.points.iter().map(|p| [p[1], p[0]]).collect()
 }
 
 /// Index into `lane_route` to begin the purple debug polyline (handles post-connector frame lag).
@@ -721,7 +764,11 @@ fn lane_route_polyline_start_index(vehicle: &Vehicle, map: &MapData) -> usize {
     if vehicle.lane_route.is_empty() {
         return 0;
     }
-    let fallback = || vehicle.lane_route_pos.min(vehicle.lane_route.len().saturating_sub(1));
+    let fallback = || {
+        vehicle
+            .lane_route_pos
+            .min(vehicle.lane_route.len().saturating_sub(1))
+    };
 
     if vehicle.on_turn_connector {
         return vehicle
@@ -741,16 +788,46 @@ fn lane_route_polyline_start_index(vehicle: &Vehicle, map: &MapData) -> usize {
 
     let from_edge = vehicle.route.get(vehicle.route_pos).and_then(|edge_idx| {
         let eid = edge_idx.index() as u64;
+        vehicle
+            .lane_route
+            .iter()
+            .position(|&lid| map.lanes.get(&lid).is_some_and(|l| l.edge_id == eid))
+    });
+
+    from_lane_id.or(from_edge).unwrap_or_else(fallback)
+}
+
+fn sync_vehicle_lane_route_state(vehicle: &mut Vehicle, map: &MapData) -> bool {
+    if vehicle.lane_route.is_empty() {
+        return false;
+    }
+
+    let route_edge = vehicle
+        .route
+        .get(vehicle.route_pos)
+        .map(|e| e.index() as u64);
+    let preferred = vehicle
+        .current_lane_id
+        .and_then(|cid| vehicle.lane_route.iter().position(|&id| id == cid));
+    let fallback = route_edge.and_then(|eid| {
         vehicle.lane_route.iter().position(|&lid| {
             map.lanes
                 .get(&lid)
-                .is_some_and(|l| l.edge_id == eid)
+                .is_some_and(|lane| lane.edge_id == eid && lane.edge_id != u64::MAX)
         })
     });
-
-    from_lane_id
-        .or(from_edge)
-        .unwrap_or_else(fallback)
+    let Some(idx) = preferred.or(fallback) else {
+        return false;
+    };
+    vehicle.lane_route_pos = idx;
+    let lane_id = vehicle.lane_route[idx];
+    vehicle.current_lane_id = Some(lane_id);
+    if let Some(lane) = map.lanes.get(&lane_id) {
+        if lane.edge_id != u64::MAX {
+            vehicle.current_lane = lane.lane_index;
+        }
+    }
+    true
 }
 
 /// Full remaining **lane graph** path (current lane → connectors → …), else graph-node fallback.
@@ -843,9 +920,9 @@ fn idm_brake_caption(accel: f32, obstacle: &ClosestObstacle, ego: &Vehicle) -> O
                 .map(|id| format!("Conflict patch — reserver #{id}"))
                 .unwrap_or_else(|| "Conflict geometry".to_string()),
         ),
-        ObstacleKind::ReservationStopLine => obstacle.conflict_reserver_id.map(|id| {
-            format!("Waiting for reservation (#{id})")
-        }),
+        ObstacleKind::ReservationStopLine => obstacle
+            .conflict_reserver_id
+            .map(|id| format!("Waiting for reservation (#{id})")),
         ObstacleKind::PriorityStopLine => {
             if let Some(id) = obstacle.leader_vehicle_id {
                 Some(format!("Yield / priority (vehicle #{id})"))
@@ -869,75 +946,131 @@ fn find_leader_obstacle_arc(
     ego_idx: usize,
     ego: &Vehicle,
     vehicles: &[Vehicle],
-    edge_lane_vehicles: &HashMap<(EdgeIndex, u8), Vec<usize>>,
+    _edge_lane_vehicles: &HashMap<(EdgeIndex, u8), Vec<usize>>,
     map: &MapData,
 ) -> ClosestObstacle {
-    if ego.route_pos >= ego.route.len() {
+    if ego.route_pos >= ego.route.len() || ego.lane_route.is_empty() {
         return free_leader_obstacle();
     }
 
-    let ego_edge = ego.route[ego.route_pos];
-    let ego_lane = ego.current_lane;
-    let ego_edge_len = map.graph.edge_weight(ego_edge).map(|e| e.length_m).unwrap_or(50.0);
+    let ego_lane_id = ego
+        .connector_lane_id
+        .filter(|_| ego.on_turn_connector)
+        .or(ego.current_lane_id)
+        .or_else(|| {
+            ego.route.get(ego.route_pos).and_then(|edge| {
+                map.lane_by_edge_lane
+                    .get(&(edge.index(), ego.current_lane))
+                    .copied()
+            })
+        });
+    let Some(ego_lane_id) = ego_lane_id else {
+        return free_leader_obstacle();
+    };
+    let Some(start_idx) = ego.lane_route.iter().position(|&lid| lid == ego_lane_id) else {
+        if ego.route_pos + 1 < ego.route.len() {
+            log::warn!(
+                "AUTO {}: brak ciaglosci lane_route (active_lane={} route_pos={})",
+                ego.id,
+                ego_lane_id,
+                ego.route_pos
+            );
+        }
+        return free_leader_obstacle();
+    };
+    if start_idx + 1 >= ego.lane_route.len()
+        && ego.route_pos + 1 < ego.route.len()
+        && ego.edge_progress >= 0.60
+    {
+        log::warn!(
+            "AUTO {}: IDM brak kontynuacji lane_route przed skrzyzowaniem (route_pos={})",
+            ego.id,
+            ego.route_pos
+        );
+    }
 
-    if let Some(bucket) = edge_lane_vehicles.get(&(ego_edge, ego_lane)) {
-        if let Some(pos) = bucket.iter().position(|&idx| idx == ego_idx) {
-            if let Some(&leader_idx) = bucket.get(pos + 1) {
-                let leader = &vehicles[leader_idx];
-                let center_dist_m = (leader.edge_progress - ego.edge_progress) * ego_edge_len;
-                let gap = bumper_gap(center_dist_m, ego, leader).max(MIN_IDM_GAP_M);
-                let rear_ll = rear_bumper_lng_lat_vehicle(leader);
-                return ClosestObstacle {
-                    kind: ObstacleKind::Vehicle,
-                    gap_m: gap,
-                    delta_v: ego.speed - leader.speed,
-                    point_lng_lat: Some(rear_ll),
-                    leader_vehicle_id: Some(leader.id),
-                    conflict_reserver_id: None,
-                };
-            }
+    let lane_segment: Vec<LaneId> = ego.lane_route.iter().skip(start_idx).copied().collect();
+    if lane_segment.is_empty() {
+        return free_leader_obstacle();
+    }
+    let mut segment_offsets = Vec::with_capacity(lane_segment.len());
+    let mut acc_len = 0.0f32;
+    for lane_id in &lane_segment {
+        segment_offsets.push(acc_len);
+        if let Some(lane) = map.lanes.get(lane_id) {
+            acc_len += lane.path.length_m.max(0.0);
+        }
+        if acc_len >= 220.0 {
+            break;
+        }
+    }
+    let lane_segment = &lane_segment[..segment_offsets.len()];
+    let ego_lane_len = map
+        .lanes
+        .get(&ego_lane_id)
+        .map(|l| l.path.length_m)
+        .unwrap_or(0.0);
+    let ego_progress = ego
+        .lane_progress_m
+        .clamp(0.0, ego_lane_len.max(0.0))
+        .max((ego.edge_progress * ego_lane_len).clamp(0.0, ego_lane_len.max(0.0)));
+
+    let mut best: Option<(f32, f32, u32, [f64; 2])> = None;
+    for (idx, leader) in vehicles.iter().enumerate() {
+        if idx == ego_idx || leader.despawned {
+            continue;
+        }
+        let leader_lane_id = leader
+            .connector_lane_id
+            .filter(|_| leader.on_turn_connector)
+            .or(leader.current_lane_id)
+            .or_else(|| {
+                leader.route.get(leader.route_pos).and_then(|edge| {
+                    map.lane_by_edge_lane
+                        .get(&(edge.index(), leader.current_lane))
+                        .copied()
+                })
+            });
+        let Some(leader_lane_id) = leader_lane_id else {
+            continue;
+        };
+        let Some(seg_idx) = lane_segment.iter().position(|&lid| lid == leader_lane_id) else {
+            continue;
+        };
+        let lane_len = map
+            .lanes
+            .get(&leader_lane_id)
+            .map(|l| l.path.length_m)
+            .unwrap_or(0.0);
+        let leader_progress = if leader.on_turn_connector {
+            (leader.turn_dist_m as f32).clamp(0.0, lane_len.max(0.0))
+        } else {
+            leader
+                .lane_progress_m
+                .clamp(0.0, lane_len.max(0.0))
+                .max((leader.edge_progress * lane_len).clamp(0.0, lane_len.max(0.0)))
+        };
+        let center_dist_m = segment_offsets[seg_idx] + leader_progress - ego_progress;
+        if center_dist_m <= 0.0 {
+            continue;
+        }
+        let gap = bumper_gap(center_dist_m, ego, leader).max(MIN_IDM_GAP_M);
+        if best.map_or(true, |(g, _, _, _)| gap < g) {
+            let rear_ll = rear_bumper_lng_lat_vehicle(leader);
+            best = Some((gap, ego.speed - leader.speed, leader.id, rear_ll));
         }
     }
 
-    if ego.edge_progress >= 0.60 && ego.route_pos + 1 < ego.route.len() {
-        let next_edge = ego.route[ego.route_pos + 1];
-        let next_edge_len = map.graph.edge_weight(next_edge).map(|e| e.length_m).unwrap_or(50.0);
-        let dist_to_end = (1.0 - ego.edge_progress) * ego_edge_len;
-
-        let lanes_to_check: [u8; 3] = [
-            ego_lane,
-            ego_lane.saturating_sub(1),
-            ego_lane.saturating_add(1),
-        ];
-        let mut best: Option<(f32, f32, u32, [f64; 2])> = None;
-
-        for &lane in &lanes_to_check {
-            if let Some(bucket) = edge_lane_vehicles.get(&(next_edge, lane)) {
-                if let Some(&leader_idx) = bucket.first() {
-                    let leader = &vehicles[leader_idx];
-                    let leader_from_start = leader.edge_progress * next_edge_len;
-                    let center_dist_m = dist_to_end + leader_from_start;
-                    let gap = bumper_gap(center_dist_m, ego, leader).max(MIN_IDM_GAP_M);
-                    if best.map_or(true, |(g, _, _, _)| gap < g) {
-                        let rear_ll = rear_bumper_lng_lat_vehicle(leader);
-                        best = Some((gap, ego.speed - leader.speed, leader.id, rear_ll));
-                    }
-                }
-            }
-        }
-
-        if let Some((gap, dv, lid, rear_ll)) = best {
-            return ClosestObstacle {
-                kind: ObstacleKind::Vehicle,
-                gap_m: gap,
-                delta_v: dv,
-                point_lng_lat: Some(rear_ll),
-                leader_vehicle_id: Some(lid),
-                conflict_reserver_id: None,
-            };
-        }
+    if let Some((gap, dv, lid, rear_ll)) = best {
+        return ClosestObstacle {
+            kind: ObstacleKind::Vehicle,
+            gap_m: gap,
+            delta_v: dv,
+            point_lng_lat: Some(rear_ll),
+            leader_vehicle_id: Some(lid),
+            conflict_reserver_id: None,
+        };
     }
-
     free_leader_obstacle()
 }
 
@@ -1026,7 +1159,10 @@ fn sample_lane_path_at(lane: &Lane, dist_m: f32) -> Option<(f64, f64, f32)> {
     }
     let last = pts[pts.len() - 1];
     let prev = pts[pts.len() - 2];
-    let (dx, dy) = normalize_xy((last[1] - prev[1]) * GEO_LNG_M, (last[0] - prev[0]) * GEO_LAT_M);
+    let (dx, dy) = normalize_xy(
+        (last[1] - prev[1]) * GEO_LNG_M,
+        (last[0] - prev[0]) * GEO_LAT_M,
+    );
     Some((last[0], last[1], (dx as f32).atan2(dy as f32)))
 }
 
@@ -1051,14 +1187,17 @@ fn sample_connector_kurbo_at(lane: &Lane, dist_m: f32) -> Option<(f64, f64, f32)
 /// The curve is constructed in local Cartesian metres (x = east, y = north).
 #[inline]
 fn bezier_path_from_geo(
-    p1_lat: f64, p1_lng: f64,
-    ctrl_lat: f64, ctrl_lng: f64,
-    p2_lat: f64, p2_lng: f64,
+    p1_lat: f64,
+    p1_lng: f64,
+    ctrl_lat: f64,
+    ctrl_lng: f64,
+    p2_lat: f64,
+    p2_lng: f64,
 ) -> BezierPath {
     BezierPath::new(
-        glam::DVec2::new(p1_lng  * GEO_LNG_M, p1_lat  * GEO_LAT_M),
+        glam::DVec2::new(p1_lng * GEO_LNG_M, p1_lat * GEO_LAT_M),
         glam::DVec2::new(ctrl_lng * GEO_LNG_M, ctrl_lat * GEO_LAT_M),
-        glam::DVec2::new(p2_lng  * GEO_LNG_M, p2_lat  * GEO_LAT_M),
+        glam::DVec2::new(p2_lng * GEO_LNG_M, p2_lat * GEO_LAT_M),
     )
 }
 
@@ -1116,7 +1255,7 @@ fn compute_desired_speed(vehicle: &Vehicle, map: &MapData) -> f32 {
         .map(|e| e.max_speed)
         .unwrap_or(14.0);
 
-    let v0_road  = road_max * vehicle.personal_compliance;
+    let v0_road = road_max * vehicle.personal_compliance;
     let vtype_max = vehicle.vehicle_type.params().max_speed;
     let mut desired = v0_road.min(vtype_max);
     if vehicle.on_turn_connector {
@@ -1188,7 +1327,9 @@ fn stopping_distance_m(speed: f32, decel: f32) -> f32 {
 fn emergency_decel_mps2(vehicle: &Vehicle) -> f32 {
     let params = vehicle.driver_profile.params();
     let vtype = vehicle.vehicle_type.params();
-    (params.comfort_decel * 1.8).max(vtype.max_decel * 1.25).max(3.0)
+    (params.comfort_decel * 1.8)
+        .max(vtype.max_decel * 1.25)
+        .max(3.0)
 }
 
 fn has_exit_space_after_intersection(
@@ -1222,13 +1363,19 @@ fn vehicle_obb_isometry_and_shape(vehicle: &Vehicle) -> (Isometry2<f32>, Cuboid)
     // Convert our heading convention to standard angle from +X axis.
     let theta = std::f32::consts::FRAC_PI_2 - vehicle.angle;
     let iso = Isometry2::new(Vector2::new(x_m as f32, y_m as f32), theta);
-    let cuboid = Cuboid::new(Vector2::new(vehicle.obb_half_length_m, vehicle.obb_half_width_m));
+    let cuboid = Cuboid::new(Vector2::new(
+        vehicle.obb_half_length_m,
+        vehicle.obb_half_width_m,
+    ));
     (iso, cuboid)
 }
 
 fn is_colliding_with_point(vehicle: &Vehicle, point_pos_m: DVec2, point_radius_m: f32) -> bool {
     let (veh_iso, veh_shape) = vehicle_obb_isometry_and_shape(vehicle);
-    let point_iso = Isometry2::new(Vector2::new(point_pos_m.x as f32, point_pos_m.y as f32), 0.0);
+    let point_iso = Isometry2::new(
+        Vector2::new(point_pos_m.x as f32, point_pos_m.y as f32),
+        0.0,
+    );
     let point_ball = Ball::new(point_radius_m.max(0.1));
     intersection_test(&veh_iso, &veh_shape, &point_iso, &point_ball).unwrap_or(false)
 }
@@ -1251,13 +1398,19 @@ enum IntersectionControl {
 #[inline]
 fn intersection_control_from_type(itype: &IntersectionType) -> IntersectionControl {
     match itype {
-        IntersectionType::TrafficLight | IntersectionType::PedestrianCrossing => IntersectionControl::Lights,
+        IntersectionType::TrafficLight | IntersectionType::PedestrianCrossing => {
+            IntersectionControl::Lights
+        }
         IntersectionType::Stop | IntersectionType::Yield => IntersectionControl::Signs,
         _ => IntersectionControl::Uncontrolled,
     }
 }
 
-fn movement_turn_intent(map: &MapData, movement: (EdgeIndex, EdgeIndex), node_idx: NodeIndex) -> TurnIntent {
+fn movement_turn_intent(
+    map: &MapData,
+    movement: (EdgeIndex, EdgeIndex),
+    node_idx: NodeIndex,
+) -> TurnIntent {
     let Some((in_src, in_tgt)) = map.graph.edge_endpoints(movement.0) else {
         return TurnIntent::Straight;
     };
@@ -1279,7 +1432,8 @@ fn movement_turn_intent(map: &MapData, movement: (EdgeIndex, EdgeIndex), node_id
     let out_y = (t.lat - n.lat) as f32;
     let in_len = (in_x * in_x + in_y * in_y).sqrt().max(1e-6);
     let out_len = (out_x * out_x + out_y * out_y).sqrt().max(1e-6);
-    let dot = ((in_x / in_len) * (out_x / out_len) + (in_y / in_len) * (out_y / out_len)).clamp(-1.0, 1.0);
+    let dot = ((in_x / in_len) * (out_x / out_len) + (in_y / in_len) * (out_y / out_len))
+        .clamp(-1.0, 1.0);
     let angle = dot.acos();
     if angle < 0.25 {
         return TurnIntent::Straight;
@@ -1305,13 +1459,17 @@ fn apply_intersection_effect(
     vehicles: &[Vehicle],
     map: &MapData,
 ) -> ClosestObstacle {
-    if vehicle.route_pos >= vehicle.route.len() { return base_obstacle; }
+    if vehicle.route_pos >= vehicle.route.len() {
+        return base_obstacle;
+    }
     // Vehicle already past the stop line — Bezier path owns its motion.
-    if vehicle.on_turn_connector { return base_obstacle; }
+    if vehicle.on_turn_connector {
+        return base_obstacle;
+    }
     let edge_idx = vehicle.route[vehicle.route_pos];
     let edge = match map.graph.edge_weight(edge_idx) {
         Some(e) => e,
-        None    => return base_obstacle,
+        None => return base_obstacle,
     };
     let dist_to_end = edge.length_m * (1.0 - vehicle.edge_progress);
     // IDM must see free space from the FRONT BUMPER to the stop line.
@@ -1319,7 +1477,7 @@ fn apply_intersection_effect(
 
     let (tgt_node_idx, tgt_osm_id) = match map.graph.edge_endpoints(edge_idx) {
         Some((_, tgt)) => (tgt, map.graph[tgt].osm_id),
-        None           => return base_obstacle,
+        None => return base_obstacle,
     };
     let intersection_type = &map.graph[tgt_node_idx].intersection_type;
     let mut best = base_obstacle;
@@ -1327,9 +1485,8 @@ fn apply_intersection_effect(
 
     if let Some((movement, conn)) = vehicle_next_movement(vehicle, map) {
         let lane_key = lane_movement_key_for_vehicle(vehicle, movement);
-        let dist_to_entry_center = ((conn.entry_progress - vehicle.edge_progress).max(0.0)
-            * edge.length_m)
-            .max(0.0);
+        let dist_to_entry_center =
+            ((conn.entry_progress - vehicle.edge_progress).max(0.0) * edge.length_m).max(0.0);
         let half_len = vehicle.vehicle_type.params().length_m * 0.5;
         let dist_to_entry = (dist_to_entry_center - half_len).max(MIN_IDM_GAP_M);
         if dist_to_entry <= scan_dist {
@@ -1370,7 +1527,10 @@ fn apply_intersection_effect(
                     let owner_far_or_missing = vehicles
                         .iter()
                         .find(|o| o.id == owner)
-                        .map(|o| geo_dist_approx(vehicle.lat, vehicle.lng, o.lat, o.lng) > CONFLICT_OWNER_GHOST_DIST_M)
+                        .map(|o| {
+                            geo_dist_approx(vehicle.lat, vehicle.lng, o.lat, o.lng)
+                                > CONFLICT_OWNER_GHOST_DIST_M
+                        })
                         .unwrap_or(true);
                     if owner_far_or_missing {
                         log::warn!(
@@ -1442,7 +1602,11 @@ fn apply_intersection_effect(
         {
             // Virtual leader: standing at stop line.
             let stop_t = (1.0 - STOP_LINE_OFFSET_M / edge.length_m.max(1.0)).clamp(0.0, 1.0) as f64;
-            let src = map.graph.edge_endpoints(edge_idx).map(|e| e.0).unwrap_or(tgt_node_idx);
+            let src = map
+                .graph
+                .edge_endpoints(edge_idx)
+                .map(|e| e.0)
+                .unwrap_or(tgt_node_idx);
             let src_n = &map.graph[src];
             let tgt_n = &map.graph[tgt_node_idx];
             let stop_lat = src_n.lat + (tgt_n.lat - src_n.lat) * stop_t;
@@ -1466,7 +1630,11 @@ fn apply_intersection_effect(
     if matches!(intersection_type, IntersectionType::Stop) {
         if dist_to_end <= 15.0 && !vehicle.has_stopped_at_stop_sign {
             let stop_t = (1.0 - STOP_LINE_OFFSET_M / edge.length_m.max(1.0)).clamp(0.0, 1.0) as f64;
-            let src = map.graph.edge_endpoints(edge_idx).map(|e| e.0).unwrap_or(tgt_node_idx);
+            let src = map
+                .graph
+                .edge_endpoints(edge_idx)
+                .map(|e| e.0)
+                .unwrap_or(tgt_node_idx);
             let src_n = &map.graph[src];
             let tgt_n = &map.graph[tgt_node_idx];
             let stop_lat = src_n.lat + (tgt_n.lat - src_n.lat) * stop_t;
@@ -1523,7 +1691,7 @@ fn apply_tram_leader_effect(
 ) -> (f32, f32) {
     const TRAM_LENGTH_M: f32 = 20.0;
     let mut best_gap = gap;
-    let mut best_dv  = delta_v;
+    let mut best_dv = delta_v;
 
     for &(tlat, tlng, tspeed) in trams {
         let dist = geo_dist_approx(vehicle.lat, vehicle.lng, tlat, tlng) - TRAM_LENGTH_M;
@@ -1534,7 +1702,7 @@ fn apply_tram_leader_effect(
             let dv = vehicle.speed - tspeed;
             if dv > 0.0 || dist < 20.0 {
                 best_gap = dist;
-                best_dv  = dv;
+                best_dv = dv;
             }
         }
     }
@@ -1544,7 +1712,10 @@ fn apply_tram_leader_effect(
 
 /// Index vehicles by the graph node at the **end** of their current edge
 /// (the intersection / lane-merge node they are driving toward).
-fn build_vehicles_by_target_node(vehicles: &[Vehicle], map: &MapData) -> HashMap<NodeIndex, Vec<usize>> {
+fn build_vehicles_by_target_node(
+    vehicles: &[Vehicle],
+    map: &MapData,
+) -> HashMap<NodeIndex, Vec<usize>> {
     let mut m: HashMap<NodeIndex, Vec<usize>> = HashMap::new();
     for (i, v) in vehicles.iter().enumerate() {
         if v.route_pos >= v.route.len() {
@@ -1623,7 +1794,9 @@ fn apply_cross_traffic_leader_effect(
         return (gap, delta_v);
     }
     // Already on the connector — cross-traffic braking not applicable.
-    if ego.on_turn_connector { return (gap, delta_v); }
+    if ego.on_turn_connector {
+        return (gap, delta_v);
+    }
     let ego_edge = ego.route[ego.route_pos];
     let ego_edge_len = match map.graph.edge_weight(ego_edge) {
         Some(e) => e.length_m,
@@ -1756,7 +1929,9 @@ fn apply_vehicle_physics(
 
         // Check for crawling (very slow movement)
         let crawl_speed = if vehicle.route_pos < vehicle.route.len() {
-            let road_max = map.graph.edge_weight(vehicle.route[vehicle.route_pos])
+            let road_max = map
+                .graph
+                .edge_weight(vehicle.route[vehicle.route_pos])
                 .map(|e| e.max_speed)
                 .unwrap_or(14.0);
             road_max * rage.crawl_fraction
@@ -1790,7 +1965,8 @@ fn apply_vehicle_physics(
             let edge_idx = vehicle.route[vehicle.route_pos];
             if let Some((_, tgt)) = map.graph.edge_endpoints(edge_idx) {
                 if matches!(map.graph[tgt].intersection_type, IntersectionType::Stop) {
-                    let dist_to_end = map.graph
+                    let dist_to_end = map
+                        .graph
                         .edge_weight(edge_idx)
                         .map(|e| e.length_m * (1.0 - vehicle.edge_progress))
                         .unwrap_or(f32::MAX);
@@ -1835,11 +2011,17 @@ fn apply_vehicle_physics(
     let (edge_len, src_idx, tgt_idx) = {
         let edge = match map.graph.edge_weight(edge_idx) {
             Some(e) => e,
-            None    => { vehicle.despawned = true; return; }
+            None => {
+                vehicle.despawned = true;
+                return;
+            }
         };
         let endpoints = match map.graph.edge_endpoints(edge_idx) {
             Some(e) => e,
-            None    => { vehicle.despawned = true; return; }
+            None => {
+                vehicle.despawned = true;
+                return;
+            }
         };
         (edge.length_m, endpoints.0, endpoints.1)
     };
@@ -1853,12 +2035,13 @@ fn apply_vehicle_physics(
                 let total = lane_connector_cubic(clane)
                     .map(|c| c.arclen(CONNECTOR_ARCLEN_ACC))
                     .unwrap_or(clane.path.length_m as f64);
-                let dist  = (vehicle.turn_dist_m + vehicle.speed as f64 * real_dt_s as f64).min(total);
+                let dist =
+                    (vehicle.turn_dist_m + vehicle.speed as f64 * real_dt_s as f64).min(total);
                 let pos = sample_connector_kurbo_at(clane, dist as f32)
                     .or_else(|| sample_lane_path_at(clane, dist as f32));
                 if let Some((lat, lng, angle)) = pos {
-                    vehicle.lat   = lat;
-                    vehicle.lng   = lng;
+                    vehicle.lat = lat;
+                    vehicle.lng = lng;
                     vehicle.angle = angle;
                 }
                 (total, dist)
@@ -1866,27 +2049,39 @@ fn apply_vehicle_physics(
                 // Lane was removed; fall back gracefully.
                 vehicle.connector_lane_id = None;
                 let path = bezier_path_from_geo(
-                    vehicle.turn_p1_lat, vehicle.turn_p1_lng,
-                    vehicle.turn_ctrl_lat, vehicle.turn_ctrl_lng,
-                    vehicle.turn_p2_lat, vehicle.turn_p2_lng,
+                    vehicle.turn_p1_lat,
+                    vehicle.turn_p1_lng,
+                    vehicle.turn_ctrl_lat,
+                    vehicle.turn_ctrl_lng,
+                    vehicle.turn_p2_lat,
+                    vehicle.turn_p2_lng,
                 );
-                let dist = (vehicle.turn_dist_m + vehicle.speed as f64 * real_dt_s as f64).min(path.total_length);
+                let dist = (vehicle.turn_dist_m + vehicle.speed as f64 * real_dt_s as f64)
+                    .min(path.total_length);
                 let state = path.get_state(dist);
                 let (lat, lng, angle) = bezier_state_to_geo(&state);
-                vehicle.lat = lat; vehicle.lng = lng; vehicle.angle = angle;
+                vehicle.lat = lat;
+                vehicle.lng = lng;
+                vehicle.angle = angle;
                 (path.total_length, dist)
             }
         } else {
             // No precomputed lane — use quadratic Bezier (legacy / straight-through).
             let path = bezier_path_from_geo(
-                vehicle.turn_p1_lat, vehicle.turn_p1_lng,
-                vehicle.turn_ctrl_lat, vehicle.turn_ctrl_lng,
-                vehicle.turn_p2_lat, vehicle.turn_p2_lng,
+                vehicle.turn_p1_lat,
+                vehicle.turn_p1_lng,
+                vehicle.turn_ctrl_lat,
+                vehicle.turn_ctrl_lng,
+                vehicle.turn_p2_lat,
+                vehicle.turn_p2_lng,
             );
-            let dist = (vehicle.turn_dist_m + vehicle.speed as f64 * real_dt_s as f64).min(path.total_length);
+            let dist = (vehicle.turn_dist_m + vehicle.speed as f64 * real_dt_s as f64)
+                .min(path.total_length);
             let state = path.get_state(dist);
             let (lat, lng, angle) = bezier_state_to_geo(&state);
-            vehicle.lat = lat; vehicle.lng = lng; vehicle.angle = angle;
+            vehicle.lat = lat;
+            vehicle.lng = lng;
+            vehicle.angle = angle;
             (path.total_length, dist)
         };
 
@@ -1912,9 +2107,9 @@ fn apply_vehicle_physics(
         );
 
         if vehicle.turn_dist_m >= total_len {
+            let finished_connector_id = vehicle.connector_lane_id;
             conflict_system.release_all_for_vehicle(vehicle.id);
             vehicle.on_turn_connector = false;
-            vehicle.connector_lane_id = None;
             vehicle.turn_dist_m = 0.0;
             vehicle.turn_from_edge = 0;
             vehicle.turn_to_edge = 0;
@@ -1928,14 +2123,33 @@ fn apply_vehicle_physics(
             }
 
             vehicle.target_lane = compute_vehicle_target_lane(vehicle, map);
-            if let Some(edge_idx) = vehicle.route.get(vehicle.route_pos) {
-                let eid = edge_idx.index() as u64;
-                if let Some(idx) = vehicle.lane_route.iter().position(|&lid| {
-                    map.lanes.get(&lid).is_some_and(|l| l.edge_id == eid)
-                }) {
-                    vehicle.lane_route_pos = idx;
+            if let Some(conn_id) = finished_connector_id {
+                if let Some(conn_lane) = map.lanes.get(&conn_id) {
+                    if let Some(&next_lane_id) = conn_lane.connections.first() {
+                        vehicle.current_lane_id = Some(next_lane_id);
+                        if let Some(next_lane) = map.lanes.get(&next_lane_id) {
+                            if next_lane.edge_id != u64::MAX {
+                                vehicle.current_lane = next_lane.lane_index;
+                            }
+                        }
+                    } else {
+                        log::warn!(
+                            "AUTO {} STRACILO CEL NA SKRZYZOWANIU: connector {} bez lane wyjazdowego",
+                            vehicle.id,
+                            conn_id
+                        );
+                    }
                 }
             }
+            if !sync_vehicle_lane_route_state(vehicle, map) {
+                log::warn!(
+                    "AUTO {} STRACILO CEL NA SKRZYZOWANIU: brak lane-route handover (route_pos={})",
+                    vehicle.id,
+                    vehicle.route_pos
+                );
+            }
+            vehicle.connector_lane_id = None;
+            vehicle.lane_progress_m = 0.0;
         }
         return;
     }
@@ -1948,24 +2162,25 @@ fn apply_vehicle_physics(
     // IDM does the smooth braking; this guard prevents rare frame-step overshoot.
     // Skip entirely when the vehicle is already on a turn connector (past the stop line).
     if !vehicle.on_turn_connector {
-    if let Some((_, tgt)) = map.graph.edge_endpoints(edge_idx) {
-        let tgt_osm_id = map.graph[tgt].osm_id;
-        let itype = &map.graph[tgt].intersection_type;
-        if matches!(itype, IntersectionType::TrafficLight | IntersectionType::PedestrianCrossing)
-            && !intersections.can_vehicle_proceed(
+        if let Some((_, tgt)) = map.graph.edge_endpoints(edge_idx) {
+            let tgt_osm_id = map.graph[tgt].osm_id;
+            let itype = &map.graph[tgt].intersection_type;
+            if matches!(
+                itype,
+                IntersectionType::TrafficLight | IntersectionType::PedestrianCrossing
+            ) && !intersections.can_vehicle_proceed(
                 tgt_osm_id,
                 vehicle.has_stopped_at_stop_sign,
                 vehicle,
                 map,
-            )
-        {
-            let stop_t = (1.0 - STOP_LINE_OFFSET_M / edge_len.max(1.0)).clamp(0.0, 1.0);
-            if vehicle.edge_progress >= stop_t {
-                vehicle.edge_progress = stop_t;
-                vehicle.speed = vehicle.speed.min(0.2);
+            ) {
+                let stop_t = (1.0 - STOP_LINE_OFFSET_M / edge_len.max(1.0)).clamp(0.0, 1.0);
+                if vehicle.edge_progress >= stop_t {
+                    vehicle.edge_progress = stop_t;
+                    vehicle.speed = vehicle.speed.min(0.2);
+                }
             }
         }
-    }
     } // end !on_turn_connector guard
 
     if let Some(conn) = planned_turn_connector(vehicle, map) {
@@ -2037,11 +2252,22 @@ fn apply_vehicle_physics(
             // Store the precomputed connector lane ID so traversal uses the same path.
             if vehicle.route_pos + 1 < vehicle.route.len() {
                 vehicle.connector_lane_id = find_connector_lane_id(
-                    map, edge_idx,
+                    map,
+                    edge_idx,
                     vehicle.current_lane,
                     vehicle.route[vehicle.route_pos + 1],
                     vehicle.target_lane,
                 );
+                if vehicle.connector_lane_id.is_none() {
+                    log::warn!(
+                        "AUTO {} STRACILO CEL NA SKRZYZOWANIU: brak connectora edge {} lane {} -> edge {} lane {}",
+                        vehicle.id,
+                        edge_idx.index(),
+                        vehicle.current_lane,
+                        vehicle.route[vehicle.route_pos + 1].index(),
+                        vehicle.target_lane
+                    );
+                }
             }
 
             // Snap lateral offset to target immediately so it doesn't drift
@@ -2051,11 +2277,14 @@ fn apply_vehicle_physics(
             // Immediately place vehicle at connector start so there is no 1-frame positional snap.
             // Use the polyline when we have a precomputed connector lane, else fall back to bezier.
             let placed = if let Some(cid) = vehicle.connector_lane_id {
-                map.lanes.get(&cid)
-                    .and_then(|cl| sample_connector_kurbo_at(cl, 0.0).or_else(|| sample_lane_path_at(cl, 0.0)))
+                map.lanes
+                    .get(&cid)
+                    .and_then(|cl| {
+                        sample_connector_kurbo_at(cl, 0.0).or_else(|| sample_lane_path_at(cl, 0.0))
+                    })
                     .map(|(lat0, lng0, angle0)| {
-                        vehicle.lat   = lat0;
-                        vehicle.lng   = lng0;
+                        vehicle.lat = lat0;
+                        vehicle.lng = lng0;
                         vehicle.angle = angle0;
                     })
                     .is_some()
@@ -2064,14 +2293,17 @@ fn apply_vehicle_physics(
             };
             if !placed {
                 let path0 = bezier_path_from_geo(
-                    conn.p1_lat, conn.p1_lng,
-                    conn.ctrl_lat, conn.ctrl_lng,
-                    conn.p2_lat, conn.p2_lng,
+                    conn.p1_lat,
+                    conn.p1_lng,
+                    conn.ctrl_lat,
+                    conn.ctrl_lng,
+                    conn.p2_lat,
+                    conn.p2_lng,
                 );
                 let state0 = path0.get_state(0.0);
                 let (lat0, lng0, angle0) = bezier_state_to_geo(&state0);
-                vehicle.lat   = lat0;
-                vehicle.lng   = lng0;
+                vehicle.lat = lat0;
+                vehicle.lng = lng0;
                 vehicle.angle = angle0;
             }
             // Do NOT fall through to linear interpolation — connector takes over next tick.
@@ -2080,8 +2312,8 @@ fn apply_vehicle_physics(
     }
 
     if vehicle.edge_progress >= 1.0 {
-        vehicle.route_pos             += 1;
-        vehicle.edge_progress          = 0.0;
+        vehicle.route_pos += 1;
+        vehicle.edge_progress = 0.0;
         vehicle.has_stopped_at_stop_sign = false; // reset for next edge
 
         if vehicle.route_pos >= vehicle.route.len() {
@@ -2091,6 +2323,8 @@ fn apply_vehicle_physics(
 
         // Recompute which lane to target based on the upcoming turn.
         vehicle.target_lane = compute_vehicle_target_lane(vehicle, map);
+        let _ = sync_vehicle_lane_route_state(vehicle, map);
+        vehicle.lane_progress_m = 0.0;
     }
 
     // Full lane graph path following: sample directly from physical lane path.
@@ -2103,7 +2337,8 @@ fn apply_vehicle_physics(
     if let Some(lid) = lane_id {
         if let Some(lane) = map.lanes.get(&lid) {
             vehicle.current_lane_id = Some(lid);
-            vehicle.lane_progress_m = (vehicle.edge_progress * lane.path.length_m).clamp(0.0, lane.path.length_m);
+            vehicle.lane_progress_m =
+                (vehicle.edge_progress * lane.path.length_m).clamp(0.0, lane.path.length_m);
             if let Some((lat, lng, angle)) = sample_lane_path_at(lane, vehicle.lane_progress_m) {
                 vehicle.lat = lat;
                 vehicle.lng = lng;
@@ -2115,10 +2350,13 @@ fn apply_vehicle_physics(
     // Fallback for malformed lane graph data.
     let src = &map.graph[src_idx];
     let tgt = &map.graph[tgt_idx];
-    let t   = vehicle.edge_progress as f64;
+    let t = vehicle.edge_progress as f64;
     vehicle.lat = src.lat + (tgt.lat - src.lat) * t;
     vehicle.lng = src.lng + (tgt.lng - src.lng) * t;
-    let (dx, dy) = normalize_xy((tgt.lng - src.lng) * GEO_LNG_M, (tgt.lat - src.lat) * GEO_LAT_M);
+    let (dx, dy) = normalize_xy(
+        (tgt.lng - src.lng) * GEO_LNG_M,
+        (tgt.lat - src.lat) * GEO_LAT_M,
+    );
     vehicle.angle = (dx as f32).atan2(dy as f32);
 }
 
@@ -2170,14 +2408,25 @@ fn threat_line_style_label(kind: ObstacleKind) -> &'static str {
 
 #[inline]
 fn min_obstacle(a: ClosestObstacle, b: ClosestObstacle) -> ClosestObstacle {
-    if b.gap_m < a.gap_m { b } else { a }
+    if b.gap_m < a.gap_m {
+        b
+    } else {
+        a
+    }
 }
 
 #[inline]
 fn compute_idm_accel_with_obstacle(vehicle: &Vehicle, desired: f32, obs: ClosestObstacle) -> f32 {
     let params = vehicle.driver_profile.params();
-    let vtype  = vehicle.vehicle_type.params();
-    let mut accel = idm_acceleration(vehicle.speed, desired, obs.gap_m, obs.delta_v, &params, &vtype);
+    let vtype = vehicle.vehicle_type.params();
+    let mut accel = idm_acceleration(
+        vehicle.speed,
+        desired,
+        obs.gap_m,
+        obs.delta_v,
+        &params,
+        &vtype,
+    );
     if emergency_braking_needed(vehicle, obs) {
         let emergency_b = emergency_decel_mps2(vehicle);
         accel = accel.min(-emergency_b);
@@ -2189,11 +2438,14 @@ fn compute_idm_accel_with_obstacle(vehicle: &Vehicle, desired: f32, obs: Closest
 fn emergency_braking_needed(vehicle: &Vehicle, obs: ClosestObstacle) -> bool {
     if !matches!(
         obs.kind,
-        ObstacleKind::ConflictPoint | ObstacleKind::ReservationStopLine | ObstacleKind::PriorityStopLine
+        ObstacleKind::ConflictPoint
+            | ObstacleKind::ReservationStopLine
+            | ObstacleKind::PriorityStopLine
     ) {
         return false;
     }
-    let comfort_stop = stopping_distance_m(vehicle.speed, vehicle.driver_profile.params().comfort_decel);
+    let comfort_stop =
+        stopping_distance_m(vehicle.speed, vehicle.driver_profile.params().comfort_decel);
     obs.gap_m < comfort_stop + 1.0
 }
 
@@ -2212,12 +2464,10 @@ fn compute_vehicle_idm_step(
 
     if ego.on_turn_connector {
         let mut base = free_leader_obstacle();
-        let (gap, dv) =
-            apply_tram_leader_effect(ego, base.gap_m, base.delta_v, tram_snapshot);
+        let (gap, dv) = apply_tram_leader_effect(ego, base.gap_m, base.delta_v, tram_snapshot);
         base.gap_m = gap;
         base.delta_v = dv;
-        let obstacle =
-            apply_connector_conflict_obstacle(ego, base, conflict_system, map);
+        let obstacle = apply_connector_conflict_obstacle(ego, base, conflict_system, map);
         let accel = compute_idm_accel_with_obstacle(ego, desired, obstacle);
         return IdmStepResult {
             accel,
@@ -2267,7 +2517,10 @@ fn compute_vehicle_idm_step(
 }
 
 #[inline]
-fn vehicle_next_movement(vehicle: &Vehicle, map: &MapData) -> Option<((EdgeIndex, EdgeIndex), PlannedTurnConnector)> {
+fn vehicle_next_movement(
+    vehicle: &Vehicle,
+    map: &MapData,
+) -> Option<((EdgeIndex, EdgeIndex), PlannedTurnConnector)> {
     if vehicle.route_pos + 1 >= vehicle.route.len() {
         return None;
     }
@@ -2278,7 +2531,10 @@ fn vehicle_next_movement(vehicle: &Vehicle, map: &MapData) -> Option<((EdgeIndex
 }
 
 #[inline]
-fn lane_movement_key_for_vehicle(vehicle: &Vehicle, movement: (EdgeIndex, EdgeIndex)) -> LaneMovementKey {
+fn lane_movement_key_for_vehicle(
+    vehicle: &Vehicle,
+    movement: (EdgeIndex, EdgeIndex),
+) -> LaneMovementKey {
     LaneMovementKey {
         in_edge: movement.0,
         out_edge: movement.1,
@@ -2368,7 +2624,11 @@ impl ConflictSystem {
             if !self.movements_conflict(movement, movement_o, node_idx) {
                 continue;
             }
-            let o_edge_len = map.graph.edge_weight(in_edge).map(|e| e.length_m).unwrap_or(100.0);
+            let o_edge_len = map
+                .graph
+                .edge_weight(in_edge)
+                .map(|e| e.length_m)
+                .unwrap_or(100.0);
             let d_other = (1.0 - other.edge_progress) * o_edge_len;
             if d_other > scan_dist_m {
                 continue;
@@ -2384,7 +2644,8 @@ impl ConflictSystem {
             let o_src_nx = (n.lng - o_src_n.lng) as f32;
             let o_src_ny = (n.lat - o_src_n.lat) as f32;
             let o_len = (o_src_nx * o_src_nx + o_src_ny * o_src_ny).sqrt().max(1e-6);
-            let dot_opp = (ego_in_ux * (o_src_nx / o_len) + ego_in_uy * (o_src_ny / o_len)).clamp(-1.0, 1.0);
+            let dot_opp =
+                (ego_in_ux * (o_src_nx / o_len) + ego_in_uy * (o_src_ny / o_len)).clamp(-1.0, 1.0);
             let opposite_approach = dot_opp < -0.8;
             let other_intent = movement_turn_intent(map, movement_o, node_idx);
             if my_intent == TurnIntent::Straight
@@ -2449,7 +2710,11 @@ impl ConflictSystem {
             if other_intent != TurnIntent::Straight {
                 continue;
             }
-            let o_edge_len = map.graph.edge_weight(in_edge).map(|e| e.length_m).unwrap_or(100.0);
+            let o_edge_len = map
+                .graph
+                .edge_weight(in_edge)
+                .map(|e| e.length_m)
+                .unwrap_or(100.0);
             let d_other = (1.0 - other.edge_progress) * o_edge_len;
             if d_other > scan_dist_m {
                 continue;
@@ -2458,7 +2723,8 @@ impl ConflictSystem {
             let o_src_nx = (n.lng - o_src_n.lng) as f32;
             let o_src_ny = (n.lat - o_src_n.lat) as f32;
             let o_len = (o_src_nx * o_src_nx + o_src_ny * o_src_ny).sqrt().max(1e-6);
-            let dot_opp = (ego_in_ux * (o_src_nx / o_len) + ego_in_uy * (o_src_ny / o_len)).clamp(-1.0, 1.0);
+            let dot_opp =
+                (ego_in_ux * (o_src_nx / o_len) + ego_in_uy * (o_src_ny / o_len)).clamp(-1.0, 1.0);
             let opposite_approach = dot_opp < -0.8;
             if !opposite_approach {
                 continue;
@@ -2495,14 +2761,9 @@ impl ConflictSystem {
         let control = intersection_control_from_type(intersection_type);
         let look = scan_dist_m.max(CONFLICT_LOOKAHEAD_M);
         match control {
-            IntersectionControl::Uncontrolled => self.is_yielding_to_right(
-                vehicle,
-                vehicles,
-                map,
-                node_idx,
-                movement,
-                look,
-            ),
+            IntersectionControl::Uncontrolled => {
+                self.is_yielding_to_right(vehicle, vehicles, map, node_idx, movement, look)
+            }
             IntersectionControl::Lights => {
                 if movement_turn_intent(map, movement, node_idx) != TurnIntent::Left {
                     return None;
@@ -2517,12 +2778,7 @@ impl ConflictSystem {
                     return None;
                 }
                 self.is_yielding_to_opposite_straight(
-                    vehicle,
-                    vehicles,
-                    map,
-                    node_idx,
-                    movement,
-                    look,
+                    vehicle, vehicles, map, node_idx, movement, look,
                 )
             }
             IntersectionControl::Signs => None,
@@ -2612,7 +2868,10 @@ impl ConflictSystem {
     ) {
         let node_indices: Vec<NodeIndex> = self.nodes.keys().copied().collect();
         for node_idx in node_indices {
-            let forced_first = self.nodes.get(&node_idx).and_then(|d| d.deadlock_first_move);
+            let forced_first = self
+                .nodes
+                .get(&node_idx)
+                .and_then(|d| d.deadlock_first_move);
             let Some(candidates) = by_target_node.get(&node_idx) else {
                 if let Some(data) = self.nodes.get_mut(&node_idx) {
                     data.deadlock_timer_s = 0.0;
@@ -2631,8 +2890,7 @@ impl ConflictSystem {
                     let in_edge = movement.0;
                     let edge = map.graph.edge_weight(in_edge)?;
                     let dist_to_end = edge.length_m * (1.0 - v.edge_progress);
-                    let dist_to_stop_line =
-                        distance_to_stop_line_from_front_bumper(v, dist_to_end);
+                    let dist_to_stop_line = distance_to_stop_line_from_front_bumper(v, dist_to_end);
                     let waiting_on_stop_line = v.speed < 0.35 && dist_to_stop_line <= 2.0;
                     let waits_yield = self.waiting_on_cross_traffic_yield(
                         v,
@@ -2694,7 +2952,9 @@ impl ConflictSystem {
                 if is_colliding_with_point(vehicle, p.pos, p.radius_m) {
                     d = MIN_IDM_GAP_M;
                 }
-                if d > look_ahead { return None; }
+                if d > look_ahead {
+                    return None;
+                }
                 let lng = p.pos.x / GEO_LNG_M;
                 let lat = p.pos.y / GEO_LAT_M;
                 Some((d, [lng, lat], owner))
@@ -2758,7 +3018,9 @@ impl ConflictSystem {
                 for p in &mut path.points {
                     if p.reserved_by == Some(vehicle_id)
                         && current_dist_on_path
-                            > p.distance_on_path + vehicle_half_length_m + CONFLICT_RELEASE_CENTER_PAST_M
+                            > p.distance_on_path
+                                + vehicle_half_length_m
+                                + CONFLICT_RELEASE_CENTER_PAST_M
                     {
                         p.reserved_by = None;
                         p.reserved_at_game_s = None;
@@ -2821,7 +3083,9 @@ impl ConflictSystem {
         for node in self.nodes.values_mut() {
             for path in node.by_movement.values_mut() {
                 for p in &mut path.points {
-                    let Some(owner) = p.reserved_by else { continue; };
+                    let Some(owner) = p.reserved_by else {
+                        continue;
+                    };
                     let Some(owner_vehicle) = vehicles.iter().find(|v| v.id == owner) else {
                         p.reserved_by = None;
                         p.reserved_at_game_s = None;
@@ -2833,7 +3097,9 @@ impl ConflictSystem {
                     if age_s < CONFLICT_TTL_STALLED_S {
                         continue;
                     }
-                    let last_motion = p.reserved_last_motion_s.unwrap_or_else(|| p.reserved_at_game_s.unwrap_or(now_game_s));
+                    let last_motion = p
+                        .reserved_last_motion_s
+                        .unwrap_or_else(|| p.reserved_at_game_s.unwrap_or(now_game_s));
                     let stalled_too_long = now_game_s - last_motion >= CONFLICT_TTL_STALLED_S;
                     if owner_vehicle.on_turn_connector && stalled_too_long {
                         p.reserved_by = None;
@@ -2856,9 +3122,30 @@ fn find_connector_lane_id(
     out_edge: EdgeIndex,
     out_lane: u8,
 ) -> Option<LaneId> {
-    let in_lane_id  = *map.lane_by_edge_lane.get(&(in_edge.index(),  in_lane))?;
-    let out_lane_id = *map.lane_by_edge_lane.get(&(out_edge.index(), out_lane))?;
+    let in_lane_id = match map.lane_by_edge_lane.get(&(in_edge.index(), in_lane)) {
+        Some(id) => *id,
+        None => {
+            log::warn!(
+                "Brak lane_by_edge_lane dla in_edge={} in_lane={}",
+                in_edge.index(),
+                in_lane
+            );
+            return None;
+        }
+    };
+    let out_lane_id = match map.lane_by_edge_lane.get(&(out_edge.index(), out_lane)) {
+        Some(id) => *id,
+        None => {
+            log::warn!(
+                "Brak lane_by_edge_lane dla out_edge={} out_lane={}",
+                out_edge.index(),
+                out_lane
+            );
+            return None;
+        }
+    };
     let in_lane_obj = map.lanes.get(&in_lane_id)?;
+    let mut fallback_same_edge: Option<LaneId> = None;
     for &conn_id in &in_lane_obj.connections {
         // Use if-let so a missing lane doesn't abort the entire search.
         if let Some(conn) = map.lanes.get(&conn_id) {
@@ -2866,7 +3153,26 @@ fn find_connector_lane_id(
             if conn.edge_id == u64::MAX && conn.connections.first() == Some(&out_lane_id) {
                 return Some(conn_id);
             }
+            if conn.edge_id == u64::MAX
+                && conn
+                    .connections
+                    .first()
+                    .and_then(|next_id| map.lanes.get(next_id))
+                    .is_some_and(|next_lane| next_lane.edge_id == out_edge.index() as u64)
+            {
+                fallback_same_edge = Some(conn_id);
+            }
         }
+    }
+    if let Some(conn_id) = fallback_same_edge {
+        log::warn!(
+            "Connector fallback: in_edge={} in_lane={} -> out_edge={} requested lane {} unavailable",
+            in_edge.index(),
+            in_lane,
+            out_edge.index(),
+            out_lane
+        );
+        return Some(conn_id);
     }
     None
 }
@@ -2875,16 +3181,22 @@ fn planned_turn_connector(vehicle: &Vehicle, map: &MapData) -> Option<PlannedTur
     if vehicle.route_pos + 1 >= vehicle.route.len() {
         return None;
     }
-    let in_edge  = vehicle.route[vehicle.route_pos];
+    let in_edge = vehicle.route[vehicle.route_pos];
     let out_edge = vehicle.route[vehicle.route_pos + 1];
 
     // Prefer the precomputed connector lane so vehicles follow the same path as the visuals.
-    if let Some(cid) = find_connector_lane_id(map, in_edge, vehicle.current_lane, out_edge, vehicle.target_lane) {
+    if let Some(cid) = find_connector_lane_id(
+        map,
+        in_edge,
+        vehicle.current_lane,
+        out_edge,
+        vehicle.target_lane,
+    ) {
         if let Some(clane) = map.lanes.get(&cid) {
             let pts = &clane.path.points;
             if pts.len() >= 2 {
-                let p1  = pts[0];
-                let p2  = *pts.last().unwrap();
+                let p1 = pts[0];
+                let p2 = *pts.last().unwrap();
                 let mid = pts[pts.len() / 2];
                 let length_m = lane_connector_cubic(clane)
                     .map(|c| c.arclen(CONNECTOR_ARCLEN_ACC) as f32)
@@ -2892,26 +3204,30 @@ fn planned_turn_connector(vehicle: &Vehicle, map: &MapData) -> Option<PlannedTur
                 return Some(PlannedTurnConnector {
                     // Connector starts exactly at the end of the incoming lane (junction node).
                     entry_progress: 1.0,
-                    exit_progress:  0.0,
+                    exit_progress: 0.0,
                     length_m,
-                    p1_lat:   p1[0],  p1_lng:   p1[1],
-                    ctrl_lat: mid[0], ctrl_lng: mid[1],
-                    p2_lat:   p2[0],  p2_lng:   p2[1],
+                    p1_lat: p1[0],
+                    p1_lng: p1[1],
+                    ctrl_lat: mid[0],
+                    ctrl_lng: mid[1],
+                    p2_lat: p2[0],
+                    p2_lng: p2[1],
                 });
             }
         }
     }
 
     // Fallback: dynamic computation for routes without a precomputed connector.
-    connector_for_movement_lane(map, in_edge, out_edge, vehicle.current_lane, vehicle.target_lane)
+    connector_for_movement_lane(
+        map,
+        in_edge,
+        out_edge,
+        vehicle.current_lane,
+        vehicle.target_lane,
+    )
 }
 
-fn lane_center_offset_m(
-    lane: u8,
-    lanes_total: u8,
-    oneway: bool,
-    lane_width_m: f64,
-) -> f64 {
+fn lane_center_offset_m(lane: u8, lanes_total: u8, oneway: bool, lane_width_m: f64) -> f64 {
     // Must stay in sync with road_network::lane_center_offset_m.
     // No direction_sign: the perpendicular normal already flips for the reverse edge.
     let centered = ((lane as f64) - ((lanes_total as f64 - 1.0) * 0.5)) * lane_width_m;
@@ -2947,7 +3263,8 @@ fn connector_for_movement_lane(
     let out_y = (tgt_n.lat - jn.lat) as f32;
     let in_len = (in_x * in_x + in_y * in_y).sqrt().max(1e-6);
     let out_len = (out_x * out_x + out_y * out_y).sqrt().max(1e-6);
-    let dot = ((in_x / in_len) * (out_x / out_len) + (in_y / in_len) * (out_y / out_len)).clamp(-1.0, 1.0);
+    let dot = ((in_x / in_len) * (out_x / out_len) + (in_y / in_len) * (out_y / out_len))
+        .clamp(-1.0, 1.0);
     let angle = dot.acos();
     if angle < TURN_CONNECTOR_MIN_ANGLE_RAD {
         return None;
@@ -2958,8 +3275,14 @@ fn connector_for_movement_lane(
     let p1_lng = src_n.lng + (jn.lng - src_n.lng) * entry_progress as f64;
     let p2_lat = jn.lat + (tgt_n.lat - jn.lat) * exit_progress as f64;
     let p2_lng = jn.lng + (tgt_n.lng - jn.lng) * exit_progress as f64;
-    let (in_fx, in_fy) = normalize_xy((jn.lng - src_n.lng) * GEO_LNG_M, (jn.lat - src_n.lat) * GEO_LAT_M);
-    let (out_fx, out_fy) = normalize_xy((tgt_n.lng - jn.lng) * GEO_LNG_M, (tgt_n.lat - jn.lat) * GEO_LAT_M);
+    let (in_fx, in_fy) = normalize_xy(
+        (jn.lng - src_n.lng) * GEO_LNG_M,
+        (jn.lat - src_n.lat) * GEO_LAT_M,
+    );
+    let (out_fx, out_fy) = normalize_xy(
+        (tgt_n.lng - jn.lng) * GEO_LNG_M,
+        (tgt_n.lat - jn.lat) * GEO_LAT_M,
+    );
     // Build per-lane physical entry/exit anchors once (lane-based geometry).
     let right_in_x = in_fy;
     let right_in_y = -in_fx;
@@ -3009,25 +3332,35 @@ fn valid_lane_pairs_for_movement(
     out_edge: EdgeIndex,
     node: NodeIndex,
 ) -> Vec<(u8, u8)> {
-    let in_lanes  = map.graph.edge_weight(in_edge) .map(|e| e.lanes.max(1)).unwrap_or(1);
-    let out_lanes = map.graph.edge_weight(out_edge).map(|e| e.lanes.max(1)).unwrap_or(1);
+    let in_lanes = map
+        .graph
+        .edge_weight(in_edge)
+        .map(|e| e.lanes.max(1))
+        .unwrap_or(1);
+    let out_lanes = map
+        .graph
+        .edge_weight(out_edge)
+        .map(|e| e.lanes.max(1))
+        .unwrap_or(1);
     let intent = movement_turn_intent(map, (in_edge, out_edge), node);
     match intent {
-        TurnIntent::Right    => vec![(in_lanes - 1, out_lanes - 1)],
+        TurnIntent::Right => vec![(in_lanes - 1, out_lanes - 1)],
         TurnIntent::Straight => (0..in_lanes).map(|i| (i, i.min(out_lanes - 1))).collect(),
-        TurnIntent::Left     => vec![(0, 0)],
-        TurnIntent::UTurn    => vec![],   // u-turns disabled at intersections
+        TurnIntent::Left => vec![(0, 0)],
+        TurnIntent::UTurn => vec![], // u-turns disabled at intersections
     }
 }
 
 fn build_conflict_system(map: &MapData) -> ConflictSystem {
     let mut nodes: HashMap<NodeIndex, IntersectionConflictData> = HashMap::new();
     for node in map.graph.node_indices() {
-        let incoming: Vec<EdgeIndex> = map.graph
+        let incoming: Vec<EdgeIndex> = map
+            .graph
             .edges_directed(node, petgraph::Direction::Incoming)
             .map(|e| e.id())
             .collect();
-        let outgoing: Vec<EdgeIndex> = map.graph
+        let outgoing: Vec<EdgeIndex> = map
+            .graph
             .edges_directed(node, petgraph::Direction::Outgoing)
             .map(|e| e.id())
             .collect();
@@ -3039,32 +3372,45 @@ fn build_conflict_system(map: &MapData) -> ConflictSystem {
         for &in_edge in &incoming {
             for &out_edge in &outgoing {
                 // Only generate connectors for valid lane pairs (turn-rule filtered).
-                for (in_lane, out_lane) in valid_lane_pairs_for_movement(map, in_edge, out_edge, node) {
-                    if let Some(c) = connector_for_movement_lane(map, in_edge, out_edge, in_lane, out_lane) {
-                        by_movement.insert(LaneMovementKey {
-                            in_edge,
-                            out_edge,
-                            in_lane,
-                            out_lane,
-                        }, ConflictPath {
-                            bezier: c,
-                            points: Vec::new(),
-                        });
+                for (in_lane, out_lane) in
+                    valid_lane_pairs_for_movement(map, in_edge, out_edge, node)
+                {
+                    if let Some(c) =
+                        connector_for_movement_lane(map, in_edge, out_edge, in_lane, out_lane)
+                    {
+                        by_movement.insert(
+                            LaneMovementKey {
+                                in_edge,
+                                out_edge,
+                                in_lane,
+                                out_lane,
+                            },
+                            ConflictPath {
+                                bezier: c,
+                                points: Vec::new(),
+                            },
+                        );
                     }
                 }
             }
         }
         build_conflicts_for_node(&mut by_movement, &mut next_cp_id);
-        nodes.insert(node, IntersectionConflictData {
-            by_movement,
-            deadlock_timer_s: 0.0,
-            deadlock_first_move: None,
-        });
+        nodes.insert(
+            node,
+            IntersectionConflictData {
+                by_movement,
+                deadlock_timer_s: 0.0,
+                deadlock_first_move: None,
+            },
+        );
     }
     ConflictSystem { nodes }
 }
 
-fn build_conflicts_for_node(by_movement: &mut HashMap<LaneMovementKey, ConflictPath>, next_cp_id: &mut u64) {
+fn build_conflicts_for_node(
+    by_movement: &mut HashMap<LaneMovementKey, ConflictPath>,
+    next_cp_id: &mut u64,
+) {
     let keys: Vec<LaneMovementKey> = by_movement.keys().copied().collect();
     for i in 0..keys.len() {
         for j in (i + 1)..keys.len() {
@@ -3075,8 +3421,14 @@ fn build_conflicts_for_node(by_movement: &mut HashMap<LaneMovementKey, ConflictP
             for a in 0..(poly1.len().saturating_sub(1)) {
                 for b in 0..(poly2.len().saturating_sub(1)) {
                     if let Some((p, da, db)) = polyline_segment_intersection(
-                        poly1[a], poly1[a + 1], dist1[a], dist1[a + 1],
-                        poly2[b], poly2[b + 1], dist2[b], dist2[b + 1],
+                        poly1[a],
+                        poly1[a + 1],
+                        dist1[a],
+                        dist1[a + 1],
+                        poly2[b],
+                        poly2[b + 1],
+                        dist2[b],
+                        dist2[b + 1],
                     ) {
                         if let Some(path) = by_movement.get_mut(&k1) {
                             path.points.push(ConflictPoint {
@@ -3110,7 +3462,11 @@ fn build_conflicts_for_node(by_movement: &mut HashMap<LaneMovementKey, ConflictP
         }
     }
     for path in by_movement.values_mut() {
-        path.points.sort_by(|a, b| a.distance_on_path.partial_cmp(&b.distance_on_path).unwrap_or(Ordering::Equal));
+        path.points.sort_by(|a, b| {
+            a.distance_on_path
+                .partial_cmp(&b.distance_on_path)
+                .unwrap_or(Ordering::Equal)
+        });
         path.points.dedup_by(|a, b| {
             (a.distance_on_path - b.distance_on_path).abs() < 0.5
                 && (a.pos - b.pos).length_squared() < 1.0
@@ -3118,14 +3474,20 @@ fn build_conflicts_for_node(by_movement: &mut HashMap<LaneMovementKey, ConflictP
     }
 }
 
-fn sample_connector_polyline(conn: &PlannedTurnConnector, samples: usize) -> (Vec<DVec2>, Vec<f32>) {
+fn sample_connector_polyline(
+    conn: &PlannedTurnConnector,
+    samples: usize,
+) -> (Vec<DVec2>, Vec<f32>) {
     let n = samples.max(8);
     let mut pts = Vec::with_capacity(n + 1);
     let mut dists = Vec::with_capacity(n + 1);
     let path = bezier_path_from_geo(
-        conn.p1_lat, conn.p1_lng,
-        conn.ctrl_lat, conn.ctrl_lng,
-        conn.p2_lat, conn.p2_lng,
+        conn.p1_lat,
+        conn.p1_lng,
+        conn.ctrl_lat,
+        conn.ctrl_lng,
+        conn.p2_lat,
+        conn.p2_lng,
     );
     let total = path.total_length.max(0.1) as f32;
     for i in 0..=n {
@@ -3139,12 +3501,31 @@ fn sample_connector_polyline(conn: &PlannedTurnConnector, samples: usize) -> (Ve
 }
 
 fn polyline_segment_intersection(
-    a0: DVec2, a1: DVec2, da0: f32, da1: f32,
-    b0: DVec2, b1: DVec2, db0: f32, db1: f32,
+    a0: DVec2,
+    a1: DVec2,
+    da0: f32,
+    da1: f32,
+    b0: DVec2,
+    b1: DVec2,
+    db0: f32,
+    db1: f32,
 ) -> Option<(DVec2, f32, f32)> {
-    let sa = Segment::new(parry2d::na::Point2::new(a0.x as f32, a0.y as f32), parry2d::na::Point2::new(a1.x as f32, a1.y as f32));
-    let sb = Segment::new(parry2d::na::Point2::new(b0.x as f32, b0.y as f32), parry2d::na::Point2::new(b1.x as f32, b1.y as f32));
-    if !intersection_test(&parry2d::na::Isometry2::identity(), &sa, &parry2d::na::Isometry2::identity(), &sb).ok()? {
+    let sa = Segment::new(
+        parry2d::na::Point2::new(a0.x as f32, a0.y as f32),
+        parry2d::na::Point2::new(a1.x as f32, a1.y as f32),
+    );
+    let sb = Segment::new(
+        parry2d::na::Point2::new(b0.x as f32, b0.y as f32),
+        parry2d::na::Point2::new(b1.x as f32, b1.y as f32),
+    );
+    if !intersection_test(
+        &parry2d::na::Isometry2::identity(),
+        &sa,
+        &parry2d::na::Isometry2::identity(),
+        &sb,
+    )
+    .ok()?
+    {
         return None;
     }
     let ad = a1 - a0;
@@ -3296,16 +3677,16 @@ fn push_vehicle_packet(
     lateral_offset: f32,
     current_lane_id: u64,
 ) {
-    buf.extend_from_slice(&id.to_le_bytes());          // [0..3]
-    buf.extend_from_slice(&lat.to_le_bytes());         // [4..11]  f64
-    buf.extend_from_slice(&lng.to_le_bytes());         // [12..19] f64
-    buf.extend_from_slice(&angle.to_le_bytes());       // [20..23]
-    buf.extend_from_slice(&speed.to_le_bytes());       // [24..27]
-    buf.push(vtype);                                   // [28]
-    buf.push(profile);                                 // [29]
-    buf.push(trip_kind);                               // [30]
+    buf.extend_from_slice(&id.to_le_bytes()); // [0..3]
+    buf.extend_from_slice(&lat.to_le_bytes()); // [4..11]  f64
+    buf.extend_from_slice(&lng.to_le_bytes()); // [12..19] f64
+    buf.extend_from_slice(&angle.to_le_bytes()); // [20..23]
+    buf.extend_from_slice(&speed.to_le_bytes()); // [24..27]
+    buf.push(vtype); // [28]
+    buf.push(profile); // [29]
+    buf.push(trip_kind); // [30]
     let lane_flags = (current_lane & 0x7f) | if on_turn_connector { 0x80 } else { 0 };
-    buf.push(lane_flags);                              // [31]
+    buf.push(lane_flags); // [31]
     buf.extend_from_slice(&frustration.to_le_bytes()); // [32..35]
     buf.extend_from_slice(&lateral_offset.to_le_bytes()); // [36..39]
     buf.extend_from_slice(&current_lane_id.to_le_bytes()); // [40..47]
