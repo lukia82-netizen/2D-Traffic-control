@@ -1,11 +1,11 @@
 use petgraph::graph::NodeIndex;
+use petgraph::visit::EdgeRef;
 use rand::rngs::StdRng;
 use rand::Rng;
 use rand::SeedableRng;
 use rand_distr::{Distribution, Normal};
 
-use crate::map::road_network::LaneId;
-use crate::map::road_network::MapData;
+use crate::map::road_network::{IntersectionType, LaneId, MapData};
 use crate::simulation::lane_change::compute_vehicle_target_lane;
 use crate::simulation::od_model::{OdModel, TripKind};
 use crate::simulation::pathfinding::{find_path, REF_SPEED_MS};
@@ -107,7 +107,7 @@ impl SpawnSystem {
 
         // Decide spawn strategy
         let roll: f32 = self.rng.gen();
-        let (from, to, trip_kind) = if roll < TRANSIT_FRACTION {
+        let (from_raw, to_raw, trip_kind) = if roll < TRANSIT_FRACTION {
             // Pure transit: boundary → boundary
             self.transit_od(map)?
         } else if roll < TRANSIT_FRACTION + EXTERNAL_FRACTION {
@@ -126,7 +126,9 @@ impl SpawnSystem {
             }
         };
 
-        if from == to {
+        let from = remap_endpoint_off_intersection(map, from_raw, false, &mut self.rng);
+        let to = remap_endpoint_off_intersection(map, to_raw, true, &mut self.rng);
+        if from == to || is_intersection_like_node(map, to) {
             return None;
         }
 
@@ -150,6 +152,7 @@ impl SpawnSystem {
             route_alpha,
             trip_kind as u8,
         );
+        vehicle.final_edge_exit_progress = compute_final_edge_exit_progress(map, &vehicle.route, &mut self.rng);
         // Set the initial target lane based on the first planned turn.
         let initial_target = compute_vehicle_target_lane(&vehicle, map);
         vehicle.target_lane = initial_target;
@@ -215,7 +218,7 @@ impl SpawnSystem {
         let route_alpha = sample_route_alpha(driver_profile, &self.speed_config, &mut self.rng);
 
         let roll: f32 = self.rng.gen();
-        let (from, to, trip_kind) = if roll < TRANSIT_FRACTION {
+        let (from_raw, to_raw, trip_kind) = if roll < TRANSIT_FRACTION {
             self.transit_od(map)?
         } else if roll < TRANSIT_FRACTION + EXTERNAL_FRACTION {
             self.external_od(map, od_model)?
@@ -227,7 +230,9 @@ impl SpawnSystem {
             self.random_od(map)?
         };
 
-        if from == to {
+        let from = remap_endpoint_off_intersection(map, from_raw, false, &mut self.rng);
+        let to = remap_endpoint_off_intersection(map, to_raw, true, &mut self.rng);
+        if from == to || is_intersection_like_node(map, to) {
             return None;
         }
 
@@ -251,6 +256,7 @@ impl SpawnSystem {
             route_alpha,
             trip_kind as u8,
         );
+        vehicle.final_edge_exit_progress = compute_final_edge_exit_progress(map, &vehicle.route, &mut self.rng);
         let initial_target = compute_vehicle_target_lane(&vehicle, map);
         vehicle.target_lane = initial_target;
         vehicle.current_lane = initial_target;
@@ -377,6 +383,85 @@ impl SpawnSystem {
             DriverProfile::Cautious
         }
     }
+}
+
+#[inline]
+fn is_intersection_like_node(map: &MapData, node: NodeIndex) -> bool {
+    let deg = map.graph.edges(node).count()
+        + map
+            .graph
+            .edges_directed(node, petgraph::Direction::Incoming)
+            .count();
+    !matches!(map.graph[node].intersection_type, IntersectionType::Plain) || deg >= 4
+}
+
+/// Keep trip endpoints off junction centers where possible.
+/// For destination we prefer an incoming approach-road node; for origin an outgoing one.
+fn remap_endpoint_off_intersection(
+    map: &MapData,
+    node: NodeIndex,
+    as_destination: bool,
+    rng: &mut impl Rng,
+) -> NodeIndex {
+    if !is_intersection_like_node(map, node) {
+        return node;
+    }
+    let mut preferred: Vec<NodeIndex> = Vec::new();
+    let mut fallback: Vec<NodeIndex> = Vec::new();
+    if as_destination {
+        for e in map.graph.edges_directed(node, petgraph::Direction::Incoming) {
+            let cand = e.source();
+            if is_intersection_like_node(map, cand) {
+                fallback.push(cand);
+            } else {
+                preferred.push(cand);
+            }
+        }
+    } else {
+        for e in map.graph.edges(node) {
+            let cand = e.target();
+            if is_intersection_like_node(map, cand) {
+                fallback.push(cand);
+            } else {
+                preferred.push(cand);
+            }
+        }
+    }
+    let pool = if !preferred.is_empty() {
+        &preferred
+    } else if !fallback.is_empty() {
+        &fallback
+    } else {
+        return node;
+    };
+    pool[rng.gen_range(0..pool.len())]
+}
+
+fn compute_final_edge_exit_progress(
+    map: &MapData,
+    route: &[petgraph::graph::EdgeIndex],
+    rng: &mut impl Rng,
+) -> f32 {
+    let Some(&last_edge) = route.last() else {
+        return 1.0;
+    };
+    let Some((_, tgt)) = map.graph.edge_endpoints(last_edge) else {
+        return 1.0;
+    };
+    if !is_intersection_like_node(map, tgt) {
+        return 1.0;
+    }
+    let edge_len = map
+        .graph
+        .edge_weight(last_edge)
+        .map(|e| e.length_m)
+        .unwrap_or(0.0);
+    if edge_len <= 1.0 {
+        return 0.75;
+    }
+    // Place the virtual exit on the approach segment (never in the node center).
+    let exit_offset_m = rng.gen_range(10.0_f32..=18.0_f32);
+    (1.0 - exit_offset_m / edge_len.max(1.0)).clamp(0.55, 0.95)
 }
 
 fn build_lane_route_from_edge_route(

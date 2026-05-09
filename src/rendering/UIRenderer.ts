@@ -19,6 +19,7 @@ export class UIRenderer {
   private readonly vehicleCountEl: HTMLElement;
   private readonly notificationArea: HTMLElement;
   private readonly scoreValueEl: HTMLElement;
+  private readonly idmStatusBadge: HTMLElement;
   private readonly idmDebugLine: HTMLElement;
   private readonly idmDebugLine2: HTMLElement;
   private readonly idmDebugLine3: HTMLElement;
@@ -27,6 +28,8 @@ export class UIRenderer {
   private readonly telemetryDesired: HTMLElement;
   private readonly telemetryAccel: HTMLElement;
   private readonly telemetryDistance: HTMLElement;
+  private readonly telemetryIdmMetrics: HTMLElement;
+  private readonly telemetryIdmStatus: HTMLElement;
   private readonly telemetryTurnT: HTMLElement;
   private readonly telemetryLaneRoute: HTMLElement;
   private readonly telemetryBrake: HTMLElement;
@@ -48,6 +51,7 @@ export class UIRenderer {
     this.vehicleCountEl = this.require('vehicle-count');
     this.notificationArea = this.require('notification-area');
     this.scoreValueEl = this.require('score-value');
+    this.idmStatusBadge = this.require('idm-status-badge');
     this.idmDebugLine = this.require('idm-debug-line');
     this.idmDebugLine2 = this.require('idm-debug-line2');
     this.idmDebugLine3 = this.require('idm-debug-line3');
@@ -57,6 +61,8 @@ export class UIRenderer {
     this.telemetryDesired = this.require('telemetry-desired');
     this.telemetryAccel = this.require('telemetry-accel');
     this.telemetryDistance = this.require('telemetry-distance');
+    this.telemetryIdmMetrics = this.require('telemetry-idm-metrics');
+    this.telemetryIdmStatus = this.require('telemetry-idm-status');
     this.telemetryTurnT = this.require('telemetry-turn-t');
     this.telemetryLaneRoute = this.require('telemetry-lane-route');
     this.telemetryBrake = this.require('telemetry-brake');
@@ -134,10 +140,24 @@ export class UIRenderer {
     threatLineStyle: string;
     brakeReason?: string | null;
     laneRouteIds?: number[];
+    idmDecision?: string;
+    ttcSeconds?: number | null;
+    comfortBrakingDistanceM?: number;
   }): void {
     this.idmDebugLine.textContent = `vehicle: ${data.vehicleId}`;
+    this.applyIdmStatusBadge(this.idmStatusBadge, data.idmDecision);
+    const ttcStr =
+      data.ttcSeconds != null && Number.isFinite(data.ttcSeconds)
+        ? `${data.ttcSeconds.toFixed(1)} s`
+        : '—';
+    const dBrake =
+      data.comfortBrakingDistanceM != null && Number.isFinite(data.comfortBrakingDistanceM)
+        ? data.comfortBrakingDistanceM.toFixed(1)
+        : '—';
     this.idmDebugLine2.textContent =
-      `v: ${data.speed.toFixed(1)} m/s | gap: ${data.gap.toFixed(1)} m | v₀: ${data.desiredSpeed.toFixed(1)}`;
+      `v: ${data.speed.toFixed(1)} m/s | v₀: ${data.desiredSpeed.toFixed(1)} | gap ${data.gap.toFixed(
+        1,
+      )} m · TTC ${ttcStr} · d_stop ${dBrake} m`;
     this.idmDebugLine3.textContent =
       `accel: ${data.acceleration.toFixed(2)} m/s² | dv: ${data.deltaV.toFixed(1)} | stop: ${data.distToStopLine.toFixed(1)} m`;
     const telem = `dist leader: ${data.distanceToLeader.toFixed(1)} m | style: ${data.threatLineStyle}`;
@@ -157,10 +177,15 @@ export class UIRenderer {
     desiredSpeed: number;
     acceleration: number;
     distanceToLeader: number;
+    gap?: number;
+    deltaV?: number;
     turnT?: number;
     onCurve?: boolean;
     laneRouteIds?: number[];
     brakeReason?: string | null;
+    idmDecision?: string;
+    ttcSeconds?: number | null;
+    comfortBrakingDistanceM?: number;
   }): void {
     if (data.vehicleId === null) {
       this.telemetryHint.textContent =
@@ -169,6 +194,8 @@ export class UIRenderer {
       this.telemetryDesired.textContent = 'Desired Speed: -- m/s';
       this.telemetryAccel.textContent = 'Acceleration: -- m/s²';
       this.telemetryDistance.textContent = 'Distance to Leader: -- m';
+      this.telemetryIdmMetrics.textContent = 'gap • TTC • d_brake: --';
+      this.applyIdmStatusBadge(this.telemetryIdmStatus, undefined);
       this.telemetryTurnT.textContent = 'Bezier t (connector): --';
       this.telemetryLaneRoute.textContent = 'Lane route ids: --';
       this.telemetryBrake.textContent = 'Brake: —';
@@ -180,6 +207,20 @@ export class UIRenderer {
     this.telemetryAccel.textContent = `Acceleration: ${data.acceleration.toFixed(2)} m/s²`;
     this.telemetryDistance.textContent =
       `Distance to Leader: ${data.distanceToLeader.toFixed(2)} m (along path / IDM gap)`;
+    const gapM = data.gap ?? data.distanceToLeader;
+    const ttcStr =
+      data.ttcSeconds != null && Number.isFinite(data.ttcSeconds)
+        ? `${data.ttcSeconds.toFixed(1)} s`
+        : '—';
+    const dBrake =
+      data.comfortBrakingDistanceM != null && Number.isFinite(data.comfortBrakingDistanceM)
+        ? `${data.comfortBrakingDistanceM.toFixed(1)} m`
+        : '—';
+    const dvNote =
+      data.deltaV !== undefined ? ` Δv=${data.deltaV.toFixed(1)}` : '';
+    this.telemetryIdmMetrics.textContent =
+      `gap ${gapM.toFixed(1)} m · TTC ${ttcStr} · d_stop ${dBrake}${dvNote}`;
+    this.applyIdmStatusBadge(this.telemetryIdmStatus, data.idmDecision);
     const tt = data.turnT;
     const oc = data.onCurve;
     this.telemetryTurnT.textContent =
@@ -247,5 +288,33 @@ export class UIRenderer {
     const el = document.getElementById(id);
     if (!el) throw new Error(`UIRenderer: element #${id} not found`);
     return el;
+  }
+
+  /** Sets label + colour class for GO / COAST / BRAKE / YIELD / STOP badges. */
+  private applyIdmStatusBadge(el: HTMLElement, decision: string | undefined): void {
+    const raw = (decision ?? 'GO').toUpperCase().trim();
+    const label =
+      raw === 'GO' || raw === 'COAST' || raw === 'BRAKE' || raw === 'YIELD' || raw === 'STOP'
+        ? raw
+        : 'GO';
+    el.textContent = label;
+    el.classList.remove(
+      'idm-status--go',
+      'idm-status--coast',
+      'idm-status--brake',
+      'idm-status--yield',
+      'idm-status--stop',
+    );
+    const cls =
+      label === 'COAST'
+        ? 'idm-status--coast'
+        : label === 'BRAKE'
+          ? 'idm-status--brake'
+          : label === 'YIELD'
+            ? 'idm-status--yield'
+            : label === 'STOP'
+              ? 'idm-status--stop'
+              : 'idm-status--go';
+    el.classList.add(cls);
   }
 }

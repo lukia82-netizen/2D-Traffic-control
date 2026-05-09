@@ -181,6 +181,12 @@ export interface IdmDebugPayload {
   turnEntryPoint: [number, number] | null;
   hoodLngLat: [number, number];
   rearBumperLngLat: [number, number];
+  lookAheadPoint?: [number, number] | null;
+  lookAheadDistanceM?: number;
+  currentLaneId?: number | null;
+  targetLane?: number;
+  nextTurnIntent?: string;
+  idmFocus?: string;
   routePoints: [number, number][];
   /** P1 → control → P2 in [lng, lat] while on a turn connector (Bezier debug). */
   bezierControlPathLngLat?: [number, number][];
@@ -188,6 +194,12 @@ export interface IdmDebugPayload {
   laneRouteIds?: number[];
   /** When IDM is braking hard, short cause string for HUD. */
   brakeReason?: string | null;
+  /** GO | COAST | BRAKE | YIELD | STOP */
+  idmDecision?: string;
+  /** Seconds; undefined when not closing on the dominant obstacle */
+  ttcSeconds?: number | null;
+  /** v²/(2b) comfortable stop distance (m) */
+  comfortBrakingDistanceM?: number;
 }
 
 /**

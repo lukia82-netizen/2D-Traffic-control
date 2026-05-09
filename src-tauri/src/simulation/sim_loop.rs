@@ -53,6 +53,14 @@ const TURN_CONNECTOR_ENTRY_M: f32 = 12.0;
 const TURN_CONNECTOR_EXIT_M: f32 = 30.0;
 const TURN_CONNECTOR_MIN_ANGLE_RAD: f32 = 0.35;
 const TURN_CONNECTOR_TARGET_SPEED_MPS: f32 = 25.0 / 3.6; // 6.94 m/s = 25 km/h on arc
+const STEERING_LOOKAHEAD_M: f32 = 7.0;
+/// Comfortable deceleration for UI “required braking distance” (m/s²).
+const IDM_UI_COMFORT_DECEL_MPS2: f32 = 3.5;
+/// Speed below which we label the manoeuvre STOP in the HUD.
+const IDM_UI_STOP_SPEED_MPS: f32 = 0.2;
+const IDM_UI_BRAKE_ACCEL_THRESHOLD: f32 = -0.45;
+const IDM_UI_COAST_ACCEL_THRESHOLD: f32 = -0.12;
+const IDM_UI_TTC_MIN_CLOSING_MPS: f32 = 0.08;
 const GEO_LAT_M: f64 = 111_320.0;
 const GEO_LNG_M: f64 = 71_700.0;
 const CONFLICT_LOOKAHEAD_M: f32 = 45.0;
@@ -100,6 +108,12 @@ struct IdmDebugPayload {
     turn_entry_point: Option<[f64; 2]>,
     hood_lng_lat: [f64; 2],
     rear_bumper_lng_lat: [f64; 2],
+    look_ahead_point: Option<[f64; 2]>,
+    look_ahead_distance_m: f32,
+    current_lane_id: Option<u64>,
+    target_lane: u8,
+    next_turn_intent: String,
+    idm_focus: String,
     route_points: Vec<[f64; 2]>,
     /// Quadratic Bezier P1 → control → P2 in \[lng, lat\] while `on_curve` (for debug arrows).
     bezier_control_path_lng_lat: Vec<[f64; 2]>,
@@ -107,6 +121,12 @@ struct IdmDebugPayload {
     lane_route_ids: Vec<u64>,
     /// Short human-readable braking cause when acceleration is strongly negative.
     brake_reason: Option<String>,
+    /// Discrete IDM/UI mode: GO / COAST / BRAKE / YIELD / STOP.
+    idm_decision: String,
+    /// Time-to-collision style metric: gap / closing speed when closing; None if not closing.
+    ttc_seconds: Option<f32>,
+    /// Comfortable stop distance v² / (2 b) using [`IDM_UI_COMFORT_DECEL_MPS2`].
+    comfort_braking_distance_m: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -577,6 +597,14 @@ pub fn run_simulation(
                                     .unwrap_or((1000.0, false));
                             let vp = ego.vehicle_type.params();
                             let accel_i = accel_inputs.get(i).copied().unwrap_or(0.0);
+                            let look_ahead_distance_m = STEERING_LOOKAHEAD_M;
+                            let look_ahead_point = vehicle_lookahead_point_lng_lat(ego, map);
+                            let brake_reason = idm_brake_caption(accel_i, &obstacle, ego);
+                            let comfort_stop_m = comfort_braking_distance_m(ego.speed);
+                            let ttc_seconds = idm_ttc_seconds(&obstacle, ego.speed);
+                            let idm_decision =
+                                idm_ui_decision(ego.speed, accel_i, &obstacle, red_blocking)
+                                    .to_string();
                             let payload = IdmDebugPayload {
                                 vehicle_id: ego.id,
                                 speed: ego.speed,
@@ -604,12 +632,21 @@ pub fn run_simulation(
                                     .map(|(_, conn)| [conn.p1_lng, conn.p1_lat]),
                                 hood_lng_lat: hood_lng_lat_m(ego),
                                 rear_bumper_lng_lat: rear_bumper_lng_lat_vehicle(ego),
+                                look_ahead_point,
+                                look_ahead_distance_m,
+                                current_lane_id: ego.current_lane_id,
+                                target_lane: ego.target_lane,
+                                next_turn_intent: next_turn_intent_label_for_vehicle(ego, map),
+                                idm_focus: idm_focus_caption(&obstacle),
                                 route_points: build_debug_target_path_points(ego, map),
                                 bezier_control_path_lng_lat: bezier_debug_control_polyline_lng_lat(
                                     ego,
                                 ),
                                 lane_route_ids: ego.lane_route.clone(),
-                                brake_reason: idm_brake_caption(accel_i, &obstacle, ego),
+                                brake_reason,
+                                idm_decision,
+                                ttc_seconds,
+                                comfort_braking_distance_m: comfort_stop_m,
                             };
                             let _ = app_handle.emit("idm_debug", payload);
                         }
@@ -888,6 +925,53 @@ fn build_debug_target_path_points(vehicle: &Vehicle, map: &MapData) -> Vec<[f64;
     points
 }
 
+fn vehicle_lookahead_point_lng_lat(vehicle: &Vehicle, map: &MapData) -> Option<[f64; 2]> {
+    if vehicle.on_turn_connector {
+        if let Some(cid) = vehicle.connector_lane_id {
+            if let Some(lane) = map.lanes.get(&cid) {
+                let dist = vehicle.turn_dist_m as f32 + STEERING_LOOKAHEAD_M;
+                if let Some((lat, lng, _)) =
+                    sample_connector_kurbo_at(lane, dist).or_else(|| sample_lane_path_at(lane, dist))
+                {
+                    return Some([lng, lat]);
+                }
+            }
+        }
+    }
+    if let Some(lid) = vehicle.current_lane_id {
+        if let Some(lane) = map.lanes.get(&lid) {
+            let dist = vehicle.lane_progress_m + STEERING_LOOKAHEAD_M;
+            if let Some((lat, lng, _)) = sample_lane_path_at(lane, dist) {
+                return Some([lng, lat]);
+            }
+            if let Some(last) = lane.path.points.last() {
+                return Some([last[1], last[0]]);
+            }
+        }
+    }
+    None
+}
+
+#[inline]
+fn turn_intent_label(intent: TurnIntent) -> &'static str {
+    match intent {
+        TurnIntent::Straight => "straight",
+        TurnIntent::Left => "left",
+        TurnIntent::Right => "right",
+        TurnIntent::UTurn => "uturn",
+    }
+}
+
+fn next_turn_intent_label_for_vehicle(vehicle: &Vehicle, map: &MapData) -> String {
+    let Some((in_edge, out_edge)) = vehicle_next_movement(vehicle, map).map(|(m, _)| m) else {
+        return "end_of_route".to_string();
+    };
+    let Some((_, node_idx)) = map.graph.edge_endpoints(in_edge) else {
+        return "unknown".to_string();
+    };
+    turn_intent_label(movement_turn_intent(map, (in_edge, out_edge), node_idx)).to_string()
+}
+
 fn bezier_debug_control_polyline_lng_lat(vehicle: &Vehicle) -> Vec<[f64; 2]> {
     if !vehicle.on_turn_connector {
         return Vec::new();
@@ -936,7 +1020,165 @@ fn idm_brake_caption(accel: f32, obstacle: &ClosestObstacle, ego: &Vehicle) -> O
     }
 }
 
+fn idm_focus_caption(obstacle: &ClosestObstacle) -> String {
+    match obstacle.kind {
+        ObstacleKind::Vehicle => obstacle
+            .leader_vehicle_id
+            .map(|id| format!("follow_vehicle#{id}"))
+            .unwrap_or_else(|| "follow_vehicle".to_string()),
+        ObstacleKind::ConflictPoint => obstacle
+            .conflict_reserver_id
+            .map(|id| format!("yield_conflict#{id}"))
+            .unwrap_or_else(|| "yield_conflict".to_string()),
+        ObstacleKind::ReservationStopLine => obstacle
+            .conflict_reserver_id
+            .map(|id| format!("wait_reservation#{id}"))
+            .unwrap_or_else(|| "wait_reservation".to_string()),
+        ObstacleKind::PriorityStopLine => obstacle
+            .leader_vehicle_id
+            .map(|id| format!("yield_priority#{id}"))
+            .unwrap_or_else(|| "yield_priority".to_string()),
+        ObstacleKind::TrafficSignalStopLine => "obey_signal".to_string(),
+        ObstacleKind::StopSignStopLine => "obey_stop_sign".to_string(),
+        ObstacleKind::YieldTarget => "obey_yield_sign".to_string(),
+    }
+}
+
+#[inline]
+fn comfort_braking_distance_m(speed: f32) -> f32 {
+    let b = IDM_UI_COMFORT_DECEL_MPS2.max(0.15);
+    speed * speed / (2.0 * b)
+}
+
+fn idm_yield_context(kind: ObstacleKind, red_blocking: bool) -> bool {
+    match kind {
+        ObstacleKind::Vehicle => false,
+        ObstacleKind::TrafficSignalStopLine => red_blocking,
+        ObstacleKind::ConflictPoint
+        | ObstacleKind::ReservationStopLine
+        | ObstacleKind::PriorityStopLine
+        | ObstacleKind::YieldTarget
+        | ObstacleKind::StopSignStopLine => true,
+    }
+}
+
+/// HUD TTC: gap / positive closing speed — vehicle leader uses `delta_v` (= v_ego − v_leader);
+/// non-vehicle threats use `ego_speed` as closing on a stationary constraint.
+fn idm_ttc_seconds(obstacle: &ClosestObstacle, ego_speed: f32) -> Option<f32> {
+    let closing = match obstacle.kind {
+        ObstacleKind::Vehicle => obstacle.delta_v.max(0.0),
+        _ => ego_speed.max(0.0),
+    };
+    if closing <= IDM_UI_TTC_MIN_CLOSING_MPS {
+        return None;
+    }
+    let t = obstacle.gap_m / closing;
+    if t.is_finite() && t > 0.0 && t < 600.0 {
+        Some(t)
+    } else {
+        None
+    }
+}
+
+fn idm_ui_decision(
+    ego_speed: f32,
+    accel: f32,
+    obstacle: &ClosestObstacle,
+    red_blocking: bool,
+) -> &'static str {
+    if ego_speed < IDM_UI_STOP_SPEED_MPS {
+        return "STOP";
+    }
+    if accel < IDM_UI_BRAKE_ACCEL_THRESHOLD {
+        return "BRAKE";
+    }
+    if idm_yield_context(obstacle.kind, red_blocking) {
+        return "YIELD";
+    }
+    if accel < IDM_UI_COAST_ACCEL_THRESHOLD {
+        return "COAST";
+    }
+    "GO"
+}
+
+#[inline]
+fn node_is_intersection_like(map: &MapData, node: NodeIndex) -> bool {
+    let deg = map.graph.edges(node).count()
+        + map
+            .graph
+            .edges_directed(node, petgraph::Direction::Incoming)
+            .count();
+    !matches!(map.graph[node].intersection_type, IntersectionType::Plain) || deg >= 4
+}
+
 // ── Physics helpers ────────────────────────────────────────────────────────────
+
+/// Find the dominant same-lane / look-ahead leader as an IDM obstacle.
+///
+/// Gap is bumper-to-bumper arc length (`MIN_IDM_GAP_M` clamped).
+/// Uses the leader's **rear bumper** as the visualised threat anchor.
+fn find_leader_obstacle_same_edge_lane(
+    ego_idx: usize,
+    ego: &Vehicle,
+    vehicles: &[Vehicle],
+    edge_lane_vehicles: &HashMap<(EdgeIndex, u8), Vec<usize>>,
+    map: &MapData,
+) -> ClosestObstacle {
+    let Some(&edge_idx) = ego.route.get(ego.route_pos) else {
+        return free_leader_obstacle();
+    };
+    let Some(bucket) = edge_lane_vehicles.get(&(edge_idx, ego.current_lane)) else {
+        return free_leader_obstacle();
+    };
+    let lane_len = map
+        .lane_by_edge_lane
+        .get(&(edge_idx.index(), ego.current_lane))
+        .and_then(|lid| map.lanes.get(lid))
+        .map(|lane| lane.path.length_m)
+        .unwrap_or(0.0);
+    if lane_len <= 0.01 {
+        return free_leader_obstacle();
+    }
+    let ego_progress = (ego.edge_progress * lane_len).clamp(0.0, lane_len);
+    let mut best: Option<(f32, f32, u32, [f64; 2])> = None;
+    for &leader_idx in bucket {
+        if leader_idx == ego_idx {
+            continue;
+        }
+        let Some(leader) = vehicles.get(leader_idx) else {
+            continue;
+        };
+        if leader.despawned || leader.route_pos >= leader.route.len() || leader.route[leader.route_pos] != edge_idx
+        {
+            continue;
+        }
+        let leader_progress = (leader.edge_progress * lane_len).clamp(0.0, lane_len);
+        let center_dist_m = leader_progress - ego_progress;
+        if center_dist_m <= 0.0 {
+            continue;
+        }
+        let gap = bumper_gap(center_dist_m, ego, leader).max(MIN_IDM_GAP_M);
+        if best.map_or(true, |(g, _, _, _)| gap < g) {
+            best = Some((
+                gap,
+                ego.speed - leader.speed,
+                leader.id,
+                rear_bumper_lng_lat_vehicle(leader),
+            ));
+        }
+    }
+    if let Some((gap, dv, leader_id, rear_ll)) = best {
+        return ClosestObstacle {
+            kind: ObstacleKind::Vehicle,
+            gap_m: gap,
+            delta_v: dv,
+            point_lng_lat: Some(rear_ll),
+            leader_vehicle_id: Some(leader_id),
+            conflict_reserver_id: None,
+        };
+    }
+    free_leader_obstacle()
+}
 
 /// Find the dominant same-lane / look-ahead leader as an IDM obstacle.
 ///
@@ -946,11 +1188,14 @@ fn find_leader_obstacle_arc(
     ego_idx: usize,
     ego: &Vehicle,
     vehicles: &[Vehicle],
-    _edge_lane_vehicles: &HashMap<(EdgeIndex, u8), Vec<usize>>,
+    edge_lane_vehicles: &HashMap<(EdgeIndex, u8), Vec<usize>>,
     map: &MapData,
 ) -> ClosestObstacle {
-    if ego.route_pos >= ego.route.len() || ego.lane_route.is_empty() {
+    if ego.route_pos >= ego.route.len() {
         return free_leader_obstacle();
+    }
+    if ego.lane_route.is_empty() {
+        return find_leader_obstacle_same_edge_lane(ego_idx, ego, vehicles, edge_lane_vehicles, map);
     }
 
     let ego_lane_id = ego
@@ -965,7 +1210,7 @@ fn find_leader_obstacle_arc(
             })
         });
     let Some(ego_lane_id) = ego_lane_id else {
-        return free_leader_obstacle();
+        return find_leader_obstacle_same_edge_lane(ego_idx, ego, vehicles, edge_lane_vehicles, map);
     };
     let Some(start_idx) = ego.lane_route.iter().position(|&lid| lid == ego_lane_id) else {
         if ego.route_pos + 1 < ego.route.len() {
@@ -976,7 +1221,7 @@ fn find_leader_obstacle_arc(
                 ego.route_pos
             );
         }
-        return free_leader_obstacle();
+        return find_leader_obstacle_same_edge_lane(ego_idx, ego, vehicles, edge_lane_vehicles, map);
     };
     if start_idx + 1 >= ego.lane_route.len()
         && ego.route_pos + 1 < ego.route.len()
@@ -991,7 +1236,7 @@ fn find_leader_obstacle_arc(
 
     let lane_segment: Vec<LaneId> = ego.lane_route.iter().skip(start_idx).copied().collect();
     if lane_segment.is_empty() {
-        return free_leader_obstacle();
+        return find_leader_obstacle_same_edge_lane(ego_idx, ego, vehicles, edge_lane_vehicles, map);
     }
     let mut segment_offsets = Vec::with_capacity(lane_segment.len());
     let mut acc_len = 0.0f32;
@@ -1071,7 +1316,7 @@ fn find_leader_obstacle_arc(
             conflict_reserver_id: None,
         };
     }
-    free_leader_obstacle()
+    find_leader_obstacle_same_edge_lane(ego_idx, ego, vehicles, edge_lane_vehicles, map)
 }
 
 #[inline]
@@ -2160,6 +2405,17 @@ fn apply_vehicle_physics(
 
     if edge_len > 0.0 {
         vehicle.edge_progress += vehicle.speed * real_dt_s / edge_len;
+    }
+
+    // Final edge destination handling: use per-vehicle virtual exit point on approach.
+    let is_last_edge = vehicle.route_pos + 1 >= vehicle.route.len();
+    if is_last_edge && node_is_intersection_like(map, tgt_idx) {
+        let exit_t = vehicle.final_edge_exit_progress.clamp(0.0, 1.0);
+        if vehicle.edge_progress >= exit_t {
+            vehicle.edge_progress = exit_t;
+            vehicle.despawned = true;
+            return;
+        }
     }
 
     // Hard red-line guard: never let a vehicle cross the stop line on red/yellow.

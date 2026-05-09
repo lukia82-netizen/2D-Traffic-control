@@ -24,7 +24,10 @@
 
       <!-- Top-left (below clock): IDM debug overlay -->
       <div id="idm-debug-panel">
-        <div id="idm-debug-title">IDM Debug</div>
+        <div id="idm-debug-heading">
+          <div id="idm-debug-title">IDM Debug</div>
+          <span id="idm-status-badge" class="idm-status-badge idm-status--go" title="Decyzja IDM">GO</span>
+        </div>
         <div id="idm-debug-line">vehicle: --</div>
         <div id="idm-debug-line2">v: -- m/s | gap: -- m</div>
         <div id="idm-debug-line3">dv: -- m/s | stop: -- m</div>
@@ -39,6 +42,8 @@
         <div id="telemetry-desired">Desired Speed: -- m/s</div>
         <div id="telemetry-accel">Acceleration: -- m/s²</div>
         <div id="telemetry-distance">Distance to Leader: -- m</div>
+        <div id="telemetry-idm-metrics">gap • TTC • d_brake: --</div>
+        <div id="telemetry-idm-badge-row"><span id="telemetry-idm-status" class="idm-status-badge idm-status--go">GO</span></div>
         <div id="telemetry-turn-t">Bezier t (connector): --</div>
         <div id="telemetry-lane-route">Lane route ids: --</div>
         <div id="telemetry-brake">Brake: —</div>

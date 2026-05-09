@@ -197,6 +197,7 @@ export class Game {
   private selectedVehicleId: number | null = null;
   private selectedRoutePoints: [number, number][] = [];
   private selectedThreatPoint: [number, number] | null = null;
+  private selectedLookAheadPoint: [number, number] | null = null;
   private selectedStopLinePoint: [number, number] | null = null;
   private selectedTurnEntryPoint: [number, number] | null = null;
   private selectedThreatShapeLengthM = 0;
@@ -790,6 +791,7 @@ export class Game {
       this.latestIdmDebugSelection = null;
       this.selectedRoutePoints = [];
       this.selectedThreatPoint = null;
+      this.selectedLookAheadPoint = null;
       this.selectedStopLinePoint = null;
       this.selectedTurnEntryPoint = null;
       this.selectedThreatShapeLengthM = 0;
@@ -851,13 +853,19 @@ export class Game {
         desiredSpeed: data.desiredSpeed,
         acceleration: data.acceleration,
         distanceToLeader: data.distanceToLeader,
+        gap: data.gap,
+        deltaV: data.deltaV,
         turnT: data.turnT,
         onCurve: data.onCurve,
         laneRouteIds: data.laneRouteIds ?? [],
         brakeReason: data.brakeReason ?? null,
+        idmDecision: data.idmDecision,
+        ttcSeconds: data.ttcSeconds ?? null,
+        comfortBrakingDistanceM: data.comfortBrakingDistanceM,
       });
       this.selectedRoutePoints = data.routePoints ?? [];
       this.selectedThreatPoint = data.threatPoint ?? null;
+      this.selectedLookAheadPoint = data.lookAheadPoint ?? null;
       this.selectedStopLinePoint = data.stopLinePoint ?? null;
       this.selectedTurnEntryPoint = data.turnEntryPoint ?? null;
       this.selectedThreatShapeLengthM = data.shapeLengthM ?? 0;
@@ -922,6 +930,7 @@ export class Game {
       // vehicle can briefly render the old vehicle's route/markers.
       this.selectedRoutePoints = [];
       this.selectedThreatPoint = null;
+      this.selectedLookAheadPoint = null;
       this.selectedStopLinePoint = null;
       this.selectedTurnEntryPoint = null;
       this.selectedThreatShapeLengthM = 0;
@@ -935,6 +944,7 @@ export class Game {
       this.latestIdmDebugSelection = null;
       this.selectedRoutePoints = [];
       this.selectedThreatPoint = null;
+      this.selectedLookAheadPoint = null;
       this.selectedStopLinePoint = null;
       this.selectedTurnEntryPoint = null;
       this.selectedThreatShapeLengthM = 0;
@@ -1073,6 +1083,78 @@ export class Game {
       }
     }
 
+    // Purple vector: steering look-ahead target from current hood position.
+    if (this.selectedLookAheadPoint && this.selectedVehicleId !== null) {
+      const v = this.vehicles.get(this.selectedVehicleId);
+      if (v) {
+        const hood = this.selectedHudHoodLngLat
+          ?? this.computeVehicleHoodLngLat(v, this.selectedThreatShapeLengthM);
+        const p0 = this.projectForPickDebugOverlay(hood[0], hood[1]);
+        const p1 = this.projectForPickDebugOverlay(
+          this.selectedLookAheadPoint[0],
+          this.selectedLookAheadPoint[1],
+        );
+        this.debugRouteGfx.moveTo(p0.x, p0.y);
+        this.debugRouteGfx.lineTo(p1.x, p1.y);
+        this.debugRouteGfx.stroke({ color: 0xa78bfa, alpha: 1.0, width: 2.8 * s });
+        this.drawArrowHeadOnSegment(this.debugRouteGfx, p0.x, p0.y, p1.x, p1.y, 0.9, 0xc084fc, 2.0 * s);
+      }
+    }
+    // Explicit red leader line: ego -> IDM leader vehicle (who the car follows).
+    const dbg = this.latestIdmDebugSelection;
+    if (dbg && dbg.vehicleId === this.selectedVehicleId && this.selectedVehicleId !== null) {
+      const ego = this.vehicles.get(this.selectedVehicleId);
+      if (ego) {
+        const leaderId = dbg.leaderVehicleId;
+        if (leaderId != null && leaderId !== this.selectedVehicleId) {
+          const leader = this.vehicles.get(leaderId);
+          if (leader) {
+            const p0 = this.projectForPickDebugOverlay(ego.lng, ego.lat);
+            const p1 = this.projectForPickDebugOverlay(leader.lng, leader.lat);
+            this.debugRouteGfx.moveTo(p0.x, p0.y);
+            this.debugRouteGfx.lineTo(p1.x, p1.y);
+            this.debugRouteGfx.stroke({ color: 0xff2d2d, alpha: 0.95, width: 3.4 * s });
+            this.drawArrowHeadOnSegment(this.debugRouteGfx, p0.x, p0.y, p1.x, p1.y, 0.9, 0xff3b3b, 2.6 * s);
+            this.debugRouteGfx.circle(p1.x, p1.y, 5.8 * Math.min(1.35, 0.85 + s * 0.1));
+            this.debugRouteGfx.fill({ color: 0xff2d2d, alpha: 0.98 });
+            this.debugRouteGfx.stroke({ color: 0x3f0b0b, alpha: 0.95, width: 1.8 * s });
+          }
+        }
+      }
+    }
+
+    // Perception arrows: additional relations (conflict reserver, etc).
+    if (dbg && dbg.vehicleId === this.selectedVehicleId && this.selectedVehicleId !== null) {
+      const ego = this.vehicles.get(this.selectedVehicleId);
+      if (ego) {
+        const egoPx = this.projectForPickDebugOverlay(ego.lng, ego.lat);
+        const drawTargetArrow = (targetId: number | null | undefined, color: number, dashed: boolean) => {
+          if (targetId == null || targetId === this.selectedVehicleId) return;
+          const target = this.vehicles.get(targetId);
+          if (!target) return;
+          const tp = this.projectForPickDebugOverlay(target.lng, target.lat);
+          if (dashed) {
+            this.drawDashedSegment(this.debugRouteGfx!, egoPx.x, egoPx.y, tp.x, tp.y, 9 * s, 7 * s, color, 2.0 * s);
+          } else {
+            this.debugRouteGfx!.moveTo(egoPx.x, egoPx.y);
+            this.debugRouteGfx!.lineTo(tp.x, tp.y);
+            this.debugRouteGfx!.stroke({ color, alpha: 0.9, width: 2.4 * s });
+          }
+          this.drawArrowHeadOnSegment(this.debugRouteGfx!, egoPx.x, egoPx.y, tp.x, tp.y, 0.9, color, 2.0 * s);
+        };
+        drawTargetArrow(dbg.conflictReserverId, 0xf59e0b, true);
+      }
+    }
+
+    // Turn intent arrow near selected vehicle (straight / left / right).
+    if (dbg && dbg.vehicleId === this.selectedVehicleId && this.selectedVehicleId !== null) {
+      const picked = this.vehicles.get(this.selectedVehicleId);
+      if (picked) {
+        const p = this.projectForPickDebugOverlay(picked.lng, picked.lat);
+        this.drawTurnIntentArrow(this.debugRouteGfx!, p.x, p.y, picked.angle, dbg.nextTurnIntent ?? 'straight', 0x34d399, s);
+      }
+    }
+
     if (this.selectedStopLinePoint) {
       const ps = this.projectForPickDebugOverlay(
         this.selectedStopLinePoint[0],
@@ -1150,6 +1232,71 @@ export class Game {
     gfx.moveTo(mx + ux * 3, my + uy * 3);
     gfx.lineTo(mx - ux * back - (-uy) * wing, my - uy * back - ux * wing);
     gfx.stroke({ color, alpha: 0.96, width: lineWidth });
+  }
+
+  private drawDashedSegment(
+    gfx: PIXI.Graphics,
+    ax: number,
+    ay: number,
+    bx: number,
+    by: number,
+    dashPx: number,
+    gapPx: number,
+    color: number,
+    width: number,
+  ): void {
+    const dx = bx - ax;
+    const dy = by - ay;
+    const len = Math.hypot(dx, dy);
+    if (len < 1) return;
+    const ux = dx / len;
+    const uy = dy / len;
+    let t = 0;
+    while (t < len) {
+      const s0 = t;
+      const s1 = Math.min(len, t + dashPx);
+      gfx.moveTo(ax + ux * s0, ay + uy * s0);
+      gfx.lineTo(ax + ux * s1, ay + uy * s1);
+      t += dashPx + gapPx;
+    }
+    gfx.stroke({ color, alpha: 0.92, width });
+  }
+
+  private drawTurnIntentArrow(
+    gfx: PIXI.Graphics,
+    cx: number,
+    cy: number,
+    headingRad: number,
+    intentRaw: string,
+    color: number,
+    scale: number,
+  ): void {
+    const intent = intentRaw.toLowerCase();
+    const len = 34 * Math.min(1.5, 0.9 + scale * 0.1);
+    const dirx = Math.sin(headingRad);
+    const diry = -Math.cos(headingRad);
+    const nx = -diry;
+    const ny = dirx;
+    const ox = cx + dirx * 20;
+    const oy = cy + diry * 20;
+    if (intent === 'left' || intent === 'right') {
+      const sign = intent === 'left' ? -1 : 1;
+      const mx = ox + dirx * (len * 0.45) + nx * sign * (len * 0.35);
+      const ex = ox + dirx * (len * 0.2) + nx * sign * (len * 0.9);
+      const my = oy + diry * (len * 0.45) + ny * sign * (len * 0.35);
+      const ey = oy + diry * (len * 0.2) + ny * sign * (len * 0.9);
+      gfx.moveTo(ox, oy);
+      gfx.quadraticCurveTo(mx, my, ex, ey);
+      gfx.stroke({ color, alpha: 0.96, width: 3 * scale });
+      this.drawArrowHeadOnSegment(gfx, mx, my, ex, ey, 0.96, color, 2.3 * scale);
+      return;
+    }
+    const ex = ox + dirx * len;
+    const ey = oy + diry * len;
+    gfx.moveTo(ox, oy);
+    gfx.lineTo(ex, ey);
+    gfx.stroke({ color, alpha: 0.96, width: 3 * scale });
+    this.drawArrowHeadOnSegment(gfx, ox, oy, ex, ey, 0.92, color, 2.3 * scale);
   }
 
   /** Floating brake caption above picked vehicle (PIXIES, map-aligned). */

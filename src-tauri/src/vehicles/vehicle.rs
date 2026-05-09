@@ -56,6 +56,9 @@ pub struct Vehicle {
     pub route_pos: usize,
     /// Progress along the current edge: 0.0 = start, 1.0 = end.
     pub edge_progress: f32,
+    /// Virtual exit point on the final edge (0..1). Vehicles despawn when this
+    /// threshold is reached instead of always driving to edge end at a junction.
+    pub final_edge_exit_progress: f32,
 
     /// Lane-centric route (full cutover target). When populated, simulation
     /// should prefer this over edge-based fields.
@@ -150,6 +153,7 @@ impl Vehicle {
             route,
             route_pos: 0,
             edge_progress: 0.0,
+            final_edge_exit_progress: 1.0,
             lane_route: Vec::new(),
             lane_route_pos: 0,
             lane_progress_m: 0.0,
