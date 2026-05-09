@@ -14,7 +14,9 @@ import * as PIXI from 'pixi.js';
  *   7 – bridgeVehicles   Vehicles on bridges
  *   8 – frustrationLayer Frustration bubble indicators above vehicles
  *   9 – trafficLights    Traffic light state sprites
- *  10 – congestionLayer  Congestion heat overlay
+ *  10 – congestionLayer  Congestion heat overlay + static debug graphics
+ *  11 – editorOverlay    Map editor handles
+ *  12 – trafficDebugLayer Traffic motion debug (leader lines, paths, labels) — always on top
  */
 export class PixiOverlay {
   app!: PIXI.Application;
@@ -31,6 +33,7 @@ export class PixiOverlay {
   trafficLights!: PIXI.Container;
   congestionLayer!: PIXI.Container;
   editorOverlay!: PIXI.Container;
+  trafficDebugLayer!: PIXI.Container;
 
   private readonly containerId: string;
 
@@ -72,6 +75,7 @@ export class PixiOverlay {
     this.trafficLights   = new PIXI.Container();
     this.congestionLayer = new PIXI.Container();
     this.editorOverlay = new PIXI.Container();
+    this.trafficDebugLayer = new PIXI.Container();
 
     this.app.stage.addChild(this.buildings);
     this.app.stage.addChild(this.roads);
@@ -85,6 +89,7 @@ export class PixiOverlay {
     this.app.stage.addChild(this.trafficLights);
     this.app.stage.addChild(this.congestionLayer);
     this.app.stage.addChild(this.editorOverlay);
+    this.app.stage.addChild(this.trafficDebugLayer);
 
     window.addEventListener('resize', () => this.resize());
   }
