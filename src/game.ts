@@ -910,8 +910,22 @@ export class Game {
       }
     }
     if (bestId !== null && bestDist <= MAX_PICK_PX) {
+      // Auto-enable picked-vehicle overlay on successful click so users
+      // immediately see route/circle/arrow markers without toggling panel state.
+      if (!this.pickedVehicleDebugOverlayVisible) {
+        this.setPickedVehicleDebugOverlayVisible(true);
+        this.sandboxUI?.setChecked('debug-visualization', true);
+      }
       this.selectedVehicleId = bestId;
       this.latestIdmDebugSelection = null;
+      // Clear previous selection debug data immediately; otherwise a newly picked
+      // vehicle can briefly render the old vehicle's route/markers.
+      this.selectedRoutePoints = [];
+      this.selectedThreatPoint = null;
+      this.selectedStopLinePoint = null;
+      this.selectedTurnEntryPoint = null;
+      this.selectedThreatShapeLengthM = 0;
+      this.selectedHudHoodLngLat = null;
       await setDebugVehicle(bestId).catch(console.error);
       this.uiRenderer.showNotification(`Debug: pojazd #${bestId} (trasa + sensory)`, 'info');
       this.redrawSelectedRoute();
@@ -960,8 +974,38 @@ export class Game {
     const PATH_PURPLE_INNER = 0xf0abfc;
     const s = this.debugStrokeScale();
 
+    const fallbackRouteFromLaneIds = (): [number, number][] => {
+      const d = this.latestIdmDebugSelection;
+      if (!d || d.vehicleId !== this.selectedVehicleId) return [];
+      const laneIds = d.laneRouteIds ?? [];
+      if (laneIds.length === 0) return [];
+      const out: [number, number][] = [];
+      for (const laneId of laneIds) {
+        const lane = this.laneById.get(laneId);
+        if (!lane || lane.points.length === 0) continue;
+        for (const [lat, lng] of lane.points) {
+          const prev = out[out.length - 1];
+          if (prev && Math.abs(prev[0] - lng) < 1e-10 && Math.abs(prev[1] - lat) < 1e-10) continue;
+          out.push([lng, lat]);
+        }
+      }
+      return out;
+    };
+
+    let routeLngLat: [number, number][] = [];
     if (this.selectedRoutePoints.length >= 2) {
-      const pts = this.selectedRoutePoints.map(([lng, lat]) => this.projectForPickDebugOverlay(lng, lat));
+      routeLngLat = this.selectedRoutePoints;
+    } else {
+      const fromIds = fallbackRouteFromLaneIds();
+      if (fromIds.length >= 2) {
+        routeLngLat = fromIds;
+      } else {
+        routeLngLat = [];
+      }
+    }
+
+    if (routeLngLat.length >= 2) {
+      const pts = routeLngLat.map(([lng, lat]) => this.projectForPickDebugOverlay(lng, lat));
       this.debugRouteGfx.moveTo(pts[0].x, pts[0].y);
       for (let i = 1; i < pts.length; i++) {
         this.debugRouteGfx.lineTo(pts[i].x, pts[i].y);
@@ -1822,6 +1866,14 @@ export class Game {
   private gameLoop(ticker: PIXI.Ticker): void {
     // Animate oneway arrows regardless of pause state
     this.infraRenderer.update(ticker.deltaMS);
+    // Rebuild picked-vehicle debug geometry every frame to avoid stale markers
+    // that otherwise only refresh on map interactions (zoom/pan).
+    if (this.pickedVehicleDebugOverlayVisible) {
+      this.redrawSelectedRoute();
+      this.redrawPickDebugHud();
+    }
+    // Keep the dedicated pick-debug canvas in lockstep with moving vehicles.
+    this.overlay.renderPickDebug();
 
     if (this.gameClockUI.paused || this.gameOver) return;
 
