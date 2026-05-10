@@ -124,6 +124,15 @@ const CONFLICT_EUCLIDEAN_CLEAR_EXTRA_M: f32 = 3.25;
 /// Trams behind ego must not shorten IDM gaps (false “Vehicle ahead”) — require forward metres along ego heading ≥ this.
 const TRAM_LEADER_FORWARD_MIN_PROJ_M: f32 = 2.0;
 const DEADLOCK_BREAK_S: f32 = 3.0;
+/// Front-bumper-to-stop-line threshold (m) below which a stopped vehicle counts as "waiting at the
+/// stop line" for deadlock detection.  Now that stop-line obstacles use STOP_LINE_IDM_MIN_GAP_M
+/// (1.5 m), vehicles stop ~1.5 m from the stop line.  Keep this at 4 m for a comfortable margin.
+const DEADLOCK_STOP_LINE_WAIT_M: f32 = 4.0;
+/// Minimum IDM gap (s0) used specifically for stop-line and conflict-point obstacles.
+/// Driver profiles use large min_gap (10–16 m) for comfortable car-following, but those values
+/// make vehicles stop 15 m before the stop line.  For line-type obstacles the vehicle should
+/// pull all the way to the line and wait there, so we use a much tighter s0.
+const STOP_LINE_IDM_MIN_GAP_M: f32 = 1.5;
 /// Physical lane half-width in metres used to offset Bezier P1/P2 from the
 
 #[derive(Debug, Clone, Serialize)]
@@ -1266,6 +1275,29 @@ fn trim_lng_lat_polyline_outbound_spike_after_connector(
     }
 }
 
+/// Remove points from the **tail** of a road lane segment that overshoot past the connector's inset
+/// entry point (which sits `CONNECTOR_ENDPOINT_INSET_M` ≈ 7 m before the junction node centre).
+///
+/// Without this, the road lane's last point (the junction node centre) is added to `route_points`
+/// and the connector then starts 7 m behind it, producing a backward zig-zag in the purple path.
+fn trim_road_lane_tail_past_connector_entry(seg: &mut Vec<[f64; 2]>, connector_first_ll: [f64; 2]) {
+    while seg.len() > 1 {
+        let last = seg[seg.len() - 1];
+        let prev = seg[seg.len() - 2];
+        let dir = lng_lat_metre_delta(prev, last);
+        let to_conn = lng_lat_metre_delta(last, connector_first_ll);
+        let Some(dir_n) = normalize_metre_vec(dir) else { break; };
+        let Some(to_conn_n) = normalize_metre_vec(to_conn) else { break; };
+        // If the connector's first point is behind the current tail point (dot < 0), the tail
+        // has overshot the connector entry — remove it.
+        if dir_n.0 * to_conn_n.0 + dir_n.1 * to_conn_n.1 < -0.15 {
+            seg.pop();
+        } else {
+            break;
+        }
+    }
+}
+
 /// Index into `lane_route` to begin the purple debug polyline (handles post-connector frame lag).
 fn lane_route_polyline_start_index(vehicle: &Vehicle, map: &MapData) -> usize {
     if vehicle.lane_route.is_empty() {
@@ -1348,7 +1380,8 @@ fn build_debug_target_path_points(vehicle: &Vehicle, map: &MapData) -> Vec<[f64;
         let mut ref_en = Some(vehicle_forward_metres_en(vehicle));
         let mut prev_lane_was_connector = false;
 
-        for &lane_id in vehicle.lane_route.iter().skip(start_i) {
+        let route_tail = &vehicle.lane_route[start_i..];
+        for (seg_idx, &lane_id) in route_tail.iter().enumerate() {
             let Some(lane) = map.lanes.get(&lane_id) else {
                 continue;
             };
@@ -1374,6 +1407,20 @@ fn build_debug_target_path_points(vehicle: &Vehicle, map: &MapData) -> Vec<[f64;
                                 &mut seg, join_ll, re, 64,
                             );
                         }
+                    }
+                    // If the next lane is a connector, trim this road lane's tail so it does not
+                    // overshoot past the connector's inset starting point. Without this, the road
+                    // lane's junction-centre endpoint creates a ~7 m backward zig-zag into the
+                    // connector entry (CONNECTOR_ENDPOINT_INSET_M = 7 m).
+                    let next_conn_start = route_tail
+                        .get(seg_idx + 1)
+                        .and_then(|&nid| map.lanes.get(&nid))
+                        .filter(|nl| nl.edge_id == u64::MAX)
+                        .and_then(|nl| nl.path.points.first().copied());
+                    if let Some(conn_first_lat_lng) = next_conn_start {
+                        // Lane points are stored as [lat, lng]; route helpers use [lng, lat].
+                        let conn_first_ll = [conn_first_lat_lng[1], conn_first_lat_lng[0]];
+                        trim_road_lane_tail_past_connector_entry(&mut seg, conn_first_ll);
                     }
                 }
                 // Connectors: keep full Kubro samples for purple line / debug — no trim (avoids zig-zag).
@@ -2959,6 +3006,12 @@ fn apply_cross_traffic_leader_effect(
             continue;
         }
         let other = &vehicles[other_idx];
+        // Skip vehicles already committed to a connector — their `edge_progress` approaches 1.0
+        // along the connector arc, making `d_other` appear near-zero and falsely blocking every
+        // new approach.  Consistent with `is_yielding_to_right` / `is_yielding_to_opposite_straight`.
+        if other.on_turn_connector {
+            continue;
+        }
         if other.route_pos >= other.route.len() {
             continue;
         }
@@ -3789,8 +3842,27 @@ fn idm_conflict_brake_diagnostic_log(accel: f32, ego: &Vehicle, obs: &ClosestObs
 
 #[inline]
 fn compute_idm_accel_with_obstacle(vehicle: &Vehicle, desired: f32, obs: ClosestObstacle) -> f32 {
-    let params = vehicle.driver_profile.params();
+    let mut params = vehicle.driver_profile.params();
     let vtype = vehicle.vehicle_type.params();
+    // Stop-line and conflict-point obstacles represent a physical line the vehicle must not
+    // cross until the path is clear.  Driver profiles use large min_gap (10–16 m) and time_headway
+    // (1.5–2.5 s) for comfortable car-following, but those values make vehicles stop 15–45 m before
+    // the stop line (s* = s0 + v·T + braking_term).  For static lines, the vehicle should pull up
+    // to the line and wait there:
+    //   • s0 → 1.5 m  (stop 1.5 m from the line, not 15 m)
+    //   • T  → 0      (no time-headway for a static obstacle; braking_term = v²/(2√(a·b))
+    //                  still ensures comfortable physical deceleration)
+    if matches!(
+        obs.kind,
+        ObstacleKind::PriorityStopLine
+            | ObstacleKind::TrafficSignalStopLine
+            | ObstacleKind::StopSignStopLine
+            | ObstacleKind::YieldTarget
+            | ObstacleKind::ConflictPoint
+    ) {
+        params.min_gap = STOP_LINE_IDM_MIN_GAP_M;
+        params.time_headway = 0.0;
+    }
     let mut accel = idm_acceleration(
         vehicle.speed,
         desired,
@@ -4050,6 +4122,7 @@ impl ConflictSystem {
         ego: &Vehicle,
         vehicles: &[Vehicle],
         map: &MapData,
+        intersections: &IntersectionManager,
         node_idx: NodeIndex,
         movement: (EdgeIndex, EdgeIndex),
         scan_dist_m: f32,
@@ -4058,6 +4131,7 @@ impl ConflictSystem {
         if ego_tgt != node_idx {
             return None;
         }
+        let tgt_osm_id = map.graph[node_idx].osm_id;
         let n = &map.graph[node_idx];
         let e_src = &map.graph[ego_src];
         let ego_in_x = (n.lng - e_src.lng) as f32;
@@ -4072,6 +4146,16 @@ impl ConflictSystem {
                 continue;
             }
             if other.route_pos + 1 >= other.route.len() {
+                continue;
+            }
+            // Do not yield to cross-traffic that cannot itself proceed (e.g. held at red).
+            // A left-turner on green should not be blocked by an opposite vehicle sitting at red.
+            if !intersections.can_vehicle_proceed(
+                tgt_osm_id,
+                other.has_stopped_at_stop_sign,
+                other,
+                map,
+            ) {
                 continue;
             }
             let in_edge = other.route[other.route_pos];
@@ -4158,7 +4242,7 @@ impl ConflictSystem {
                     return None;
                 }
                 self.is_yielding_to_opposite_straight(
-                    vehicle, vehicles, map, node_idx, movement, look,
+                    vehicle, vehicles, map, intersections, node_idx, movement, look,
                 )
             }
             IntersectionControl::Signs => None,
@@ -4345,7 +4429,7 @@ impl ConflictSystem {
                     let edge = map.graph.edge_weight(in_edge)?;
                     let dist_to_end = edge.length_m * (1.0 - v.edge_progress);
                     let dist_to_stop_line = distance_to_stop_line_from_front_bumper(v, dist_to_end);
-                    let waiting_on_stop_line = v.speed < 0.35 && dist_to_stop_line <= 2.0;
+                    let waiting_on_stop_line = v.speed < 0.35 && dist_to_stop_line <= DEADLOCK_STOP_LINE_WAIT_M;
                     let waits_yield = self.waiting_on_cross_traffic_yield(
                         v,
                         map,

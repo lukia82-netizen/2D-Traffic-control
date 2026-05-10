@@ -206,6 +206,32 @@ function trimLeadingBacktrackTowardJoin(
   return seg;
 }
 
+/**
+ * Remove points from the **tail** of a road lane segment that overshoot past the connector's inset
+ * entry point (CONNECTOR_ENDPOINT_INSET_M ≈ 7 m before the junction centre).
+ * Without this, the road lane ends at the junction node centre while the connector starts 7 m
+ * behind it, producing a backward zig-zag in the purple route path.
+ */
+function trimRoadLaneTailPastConnectorEntry(
+  segIn: readonly [number, number][],
+  connectorFirstLngLat: readonly [number, number],
+): [number, number][] {
+  const seg = [...segIn];
+  while (seg.length > 1) {
+    const last = seg[seg.length - 1]!;
+    const prev = seg[seg.length - 2]!;
+    const dir = routeHintNormalize(routeHintMetreDelta(prev, last));
+    const toConn = routeHintNormalize(routeHintMetreDelta(last, connectorFirstLngLat));
+    if (!dir || !toConn) break;
+    if (dir.ex * toConn.ex + dir.ny * toConn.ny < -0.15) {
+      seg.pop();
+    } else {
+      break;
+    }
+  }
+  return seg;
+}
+
 /** After a connector, drop outbound road vertices that sit behind `joinLl` along `refEn` (junction-node spike). */
 function trimLeadingOutboundSpikeAfterConnector(
   segIn: readonly [number, number][],
@@ -1191,7 +1217,8 @@ export class Game {
       };
       let prevLaneWasConnector = false;
 
-      for (const laneId of laneIds) {
+      for (let laneIdx = 0; laneIdx < laneIds.length; laneIdx++) {
+        const laneId = laneIds[laneIdx]!;
         const lane = this.laneById.get(laneId);
         if (!lane || lane.points.length === 0) continue;
 
@@ -1209,6 +1236,19 @@ export class Game {
           seg = trimLeadingBacktrackTowardJoin(seg, joinLl, maxTrim);
           if (!lane.isConnector && prevLaneWasConnector && refEn) {
             seg = trimLeadingOutboundSpikeAfterConnector(seg, joinLl, refEn, 64);
+          }
+          // If the next lane is a connector, trim this road lane's tail so it does not overshoot
+          // past the connector's inset entry point (~7 m before the junction node centre).
+          // Without this the road lane ends at the junction centre and the connector starts 7 m
+          // behind it, creating a visible backward zig-zag in the purple route overlay.
+          if (!lane.isConnector && seg.length > 1) {
+            const nextLane = laneIds[laneIdx + 1] !== undefined
+              ? this.laneById.get(laneIds[laneIdx + 1]!)
+              : undefined;
+            if (nextLane?.isConnector && nextLane.points.length > 0) {
+              const [connFirstLat, connFirstLng] = nextLane.points[0]!;
+              seg = trimRoadLaneTailPastConnectorEntry(seg, [connFirstLng, connFirstLat]);
+            }
           }
         }
         /** Connectors: `lineTo` needs many vertices; sparse map data → quadratic sample from IDM debug, else chord subdivide. */

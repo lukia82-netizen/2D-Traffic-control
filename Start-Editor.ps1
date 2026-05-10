@@ -6,15 +6,24 @@
 $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $OriginalLocation = Get-Location
 
-# --- Tool paths (adjust if your installation differs) ------------------------
-$NodeDir  = "C:\Users\lukia\AppData\Local\nodejs-portable\node-v20.19.1-win-x64"
-$CargoDir = "C:\Users\lukia\.cargo\bin"
-$MinGWDir = "C:\Users\lukia\AppData\Local\mingw64\mingw64\bin"
+# --- Tool paths (current Windows user — do not hardcode another profile) -----
+$UserHome = $env:USERPROFILE
+$NodeDir  = Join-Path $UserHome "AppData\Local\nodejs-portable\node-v20.19.1-win-x64"
+$CargoDir = Join-Path $UserHome ".cargo\bin"
+$MinGWDir = Join-Path $UserHome "AppData\Local\mingw64\mingw64\bin"
 
 # --- Environment -------------------------------------------------------------
-$env:PATH        = "$MinGWDir;$CargoDir;$NodeDir;" + $env:PATH
-$env:RUSTUP_HOME = "C:\Users\lukia\.rustup"
-$env:CARGO_HOME  = "C:\Users\lukia\.cargo"
+$prepend = @()
+foreach ($d in @($MinGWDir, $CargoDir, $NodeDir)) {
+    if (Test-Path -LiteralPath $d) { $prepend += $d }
+}
+if ($prepend.Count -gt 0) {
+    $env:PATH = ($prepend -join ";") + ";" + $env:PATH
+}
+
+$env:RUSTUP_HOME = Join-Path $UserHome ".rustup"
+$env:CARGO_HOME  = Join-Path $UserHome ".cargo"
+. (Join-Path $ProjectRoot "scripts\Windows-RustEnv.ps1") -ProjectRoot $ProjectRoot
 # Force frontend into editor-only mode (no simulation boot).
 $env:VITE_EDITOR_ONLY = "1"
 if (-not $env:RUST_LOG) {
