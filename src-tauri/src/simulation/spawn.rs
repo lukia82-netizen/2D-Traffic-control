@@ -543,18 +543,12 @@ fn build_lane_route_from_edge_route(
                     .get(&prev)
                     .is_some_and(|l| l.edge_id != chosen_edge)
                 {
-                    ensure_lane_connector_between(map, prev, chosen_id);
-                    let connector_retry = map.lanes.get(&prev).and_then(|l| {
-                        l.connections.iter().copied().find(|c| {
-                            map.lanes.get(&c).map(|cl| {
-                                cl.edge_id == u64::MAX && cl.connections.contains(&chosen_id)
-                            }).unwrap_or(false)
-                        })
-                    });
-                    if let Some(conn) = connector_retry {
-                        out.push(conn);
-                    } else {
-                        let candidate_diag = map
+                    match ensure_lane_connector_between(map, prev, chosen_id) {
+                        Some(conn_id) => {
+                            out.push(conn_id);
+                        }
+                        None => {
+                            let candidate_diag = map
                             .lanes
                             .values()
                             .filter(|l| l.edge_id == chosen_edge)
@@ -586,6 +580,7 @@ fn build_lane_route_from_edge_route(
                             chosen_edge,
                             candidate_diag
                         );
+                        }
                     }
                 }
             }

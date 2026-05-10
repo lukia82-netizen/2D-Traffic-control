@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use petgraph::graph::{EdgeIndex, NodeIndex};
 
 use crate::map::road_network::{LaneDirection, MapData, RoadGraph};
+use crate::simulation::lane_change::turn_direction_between;
 use crate::state::LightControlMode;
 use crate::traffic::phased_traffic_light::{JunctionLayout, PhasedVehicleLight};
 use crate::vehicles::vehicle::Vehicle;
@@ -271,9 +272,23 @@ impl TrafficLight {
                 let Some(edge) = map.graph.edge_weight(e) else {
                     return true;
                 };
-                let lane = vehicle.current_lane as usize;
-                let dir = edge.lane_directions.get(lane).copied().unwrap_or(LaneDirection::Straight);
-                let sig = ph.signal_for(e, dir);
+                // Movement-aware: use route geometry instead of lane slot typing alone.
+                // Lane `lane_directions[i]` describes allowed movements from that lane, but vehicles
+                // can occupy the wrong lane after spawn/connectors; matching only `current_lane`
+                // falsely grants e.g. a protected-left red to a straight vehicle in lane index 0
+                // on [Left,Straight] roads.
+                let movement_dir =
+                    if vehicle.route_pos.saturating_add(1) < vehicle.route.len() {
+                        let next = vehicle.route[vehicle.route_pos + 1];
+                        turn_direction_between(map, e, next)
+                    } else {
+                        let lane = vehicle.current_lane as usize;
+                        edge.lane_directions
+                            .get(lane)
+                            .copied()
+                            .unwrap_or(LaneDirection::Straight)
+                    };
+                let sig = ph.signal_for(e, movement_dir);
                 matches!(sig, LightPhase::Green | LightPhase::Yellow)
             }
         }

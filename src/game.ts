@@ -85,7 +85,7 @@ function buildDemoMapData(): MapData {
         id: nid(r, c),
         lat: CY + (r - Math.floor(ROWS / 2)) * STEP_LAT,
         lng: CX + (c - Math.floor(COLS / 2)) * STEP_LNG,
-        intersectionType: 'traffic_light',
+        intersectionType: 'plain',
       });
     }
   }
@@ -155,6 +155,150 @@ type AppMode = 'game' | 'editor' | 'sandbox';
 interface GameOptions {
   editorOnly?: boolean;
   appMode?: AppMode;
+}
+
+/** Matches Rust `GEO_LNG_M` / `GEO_LAT_M` in `sim_loop.rs` — quick metre deltas for stitch orientation only. */
+const ROUTE_HINT_GEO_LNG_M = 71700;
+const ROUTE_HINT_GEO_LAT_M = 111320;
+
+function routeHintMetreDelta(
+  fromLl: readonly [number, number],
+  toLl: readonly [number, number],
+): { ex: number; ny: number } {
+  return {
+    ex: (toLl[0] - fromLl[0]) * ROUTE_HINT_GEO_LNG_M,
+    ny: (toLl[1] - fromLl[1]) * ROUTE_HINT_GEO_LAT_M,
+  };
+}
+
+function routeHintNormalize(v: { ex: number; ny: number }): { ex: number; ny: number } | null {
+  const len = Math.hypot(v.ex, v.ny);
+  if (len < 0.06) return null;
+  return { ex: v.ex / len, ny: v.ny / len };
+}
+
+/** Flip polyline if its start tangent opposes nominal travel (`refEn` east/north metres). */
+function orientLngLatPolylineForward(
+  pts: readonly [number, number][],
+  refEn: { ex: number; ny: number } | null,
+): [number, number][] {
+  if (!refEn || pts.length < 2) return [...pts];
+  const d = routeHintMetreDelta(pts[0], pts[1]);
+  const t = routeHintNormalize(d);
+  if (!t || t.ex * refEn.ex + t.ny * refEn.ny >= -0.02) return [...pts];
+  return [...pts].reverse();
+}
+
+function trimLeadingBacktrackTowardJoin(
+  segIn: readonly [number, number][],
+  joinLl: readonly [number, number],
+  maxTrim: number,
+): [number, number][] {
+  const seg = [...segIn];
+  let n = 0;
+  while (n < maxTrim && seg.length >= 2) {
+    const tf = routeHintNormalize(routeHintMetreDelta(joinLl, seg[0]));
+    const ta = routeHintNormalize(routeHintMetreDelta(seg[0], seg[1]));
+    if (!tf || !ta || tf.ex * ta.ex + tf.ny * ta.ny >= -0.25) break;
+    seg.shift();
+    n++;
+  }
+  return seg;
+}
+
+/** After a connector, drop outbound road vertices that sit behind `joinLl` along `refEn` (junction-node spike). */
+function trimLeadingOutboundSpikeAfterConnector(
+  segIn: readonly [number, number][],
+  joinLl: readonly [number, number],
+  refEn: { ex: number; ny: number },
+  maxTrim: number,
+): [number, number][] {
+  const seg = [...segIn];
+  let n = 0;
+  while (n < maxTrim && seg.length > 1) {
+    const d = routeHintMetreDelta(joinLl, seg[0]!);
+    const dot = d.ex * refEn.ex + d.ny * refEn.ny;
+    if (dot < -0.35) {
+      seg.shift();
+      n++;
+    } else {
+      break;
+    }
+  }
+  return seg;
+}
+
+function dedupeLngLatTail(out: [number, number][], p: [number, number]): void {
+  const prev = out[out.length - 1];
+  if (prev && Math.abs(prev[0] - p[0]) < 1e-10 && Math.abs(prev[1] - p[1]) < 1e-10) return;
+  out.push(p);
+}
+
+/** Chord length in metres (local plane, same as Rust route hints). */
+function lngLatChordMetres(a: readonly [number, number], b: readonly [number, number]): number {
+  const d = routeHintMetreDelta(a, b);
+  return Math.hypot(d.ex, d.ny);
+}
+
+/**
+ * Insert points along each segment so no chord exceeds `maxStepM`.
+ * `lineTo` between sparse vertices looks jagged; this keeps Pixi polyline close to the sampled curve.
+ */
+function densifyLngLatPolyline(
+  pts: readonly [number, number][],
+  maxStepM: number,
+): [number, number][] {
+  if (pts.length < 2 || maxStepM < 0.15) return [...pts];
+  const out: [number, number][] = [[pts[0][0], pts[0][1]]];
+  for (let i = 1; i < pts.length; i++) {
+    const a = out[out.length - 1];
+    const b = pts[i];
+    const len = lngLatChordMetres(a, b);
+    if (len < 0.02) continue;
+    const steps = Math.max(1, Math.ceil(len / maxStepM));
+    for (let s = 1; s < steps; s++) {
+      const t = s / steps;
+      out.push([a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]);
+    }
+    out.push([b[0], b[1]]);
+  }
+  return out;
+}
+
+/**
+ * Quadratic Bezier in [lng, lat] (matches Rust `bezier_point_lat_lng` / debug control polyline).
+ */
+function sampleQuadraticBezierLngLat(
+  p1: readonly [number, number],
+  ctrl: readonly [number, number],
+  p2: readonly [number, number],
+  numSegments: number,
+): [number, number][] {
+  const n = Math.max(12, numSegments);
+  const out: [number, number][] = [];
+  for (let i = 0; i <= n; i++) {
+    const t = i / n;
+    const u = 1 - t;
+    const lng = u * u * p1[0] + 2 * u * t * ctrl[0] + t * t * p2[0];
+    const lat = u * u * p1[1] + 2 * u * t * ctrl[1] + t * t * p2[1];
+    out.push([lng, lat]);
+  }
+  return out;
+}
+
+/** If any hop is longer than `sparseIfOverM`, subdivide segments (~`targetStepM`). */
+function densifyLngLatIfSparse(
+  pts: readonly [number, number][],
+  sparseIfOverM: number,
+  targetStepM: number,
+): [number, number][] {
+  if (pts.length < 2) return [...pts];
+  let maxJump = 0;
+  for (let i = 1; i < pts.length; i++) {
+    maxJump = Math.max(maxJump, lngLatChordMetres(pts[i - 1], pts[i]));
+  }
+  if (maxJump < sparseIfOverM) return [...pts];
+  return densifyLngLatPolyline(pts, targetStepM);
 }
 
 // ─── Game ─────────────────────────────────────────────────────────────────────
@@ -852,8 +996,10 @@ export class Game {
   }
 
   private onIdmDebug(data: IdmDebugPayload): void {
+    const distHud = data.gap ?? data.distanceToLeaderM ?? data.distanceToLeader ?? 0;
     this.uiRenderer.updateIdmDebug({
       ...data,
+      distanceToLeader: distHud,
       brakeReason: data.brakeReason ?? null,
       laneRouteIds: data.laneRouteIds ?? [],
     });
@@ -864,7 +1010,7 @@ export class Game {
         speed: data.speed,
         desiredSpeed: data.desiredSpeed,
         acceleration: data.acceleration,
-        distanceToLeader: data.distanceToLeader,
+        distanceToLeader: data.gap ?? data.distanceToLeaderM ?? data.distanceToLeader ?? 0,
         gap: data.gap,
         deltaV: data.deltaV,
         turnT: data.turnT,
@@ -1033,28 +1179,69 @@ export class Game {
     const fallbackRouteFromLaneIds = (): [number, number][] => {
       const d = this.latestIdmDebugSelection;
       if (!d || d.vehicleId !== this.selectedVehicleId) return [];
+      const v = this.vehicles.get(this.selectedVehicleId);
       const laneIds = d.laneRouteIds ?? [];
-      if (laneIds.length === 0) return [];
-      const out: [number, number][] = [];
+      if (!v || laneIds.length === 0) return [];
+
+      /** Same stitch logic as Rust `build_debug_target_path_points` — prevents reversed connector polylines. */
+      const out: [number, number][] = [[v.lng, v.lat]];
+      let refEn: { ex: number; ny: number } | null = {
+        ex: Math.sin(v.angle),
+        ny: Math.cos(v.angle),
+      };
+      let prevLaneWasConnector = false;
+
       for (const laneId of laneIds) {
         const lane = this.laneById.get(laneId);
         if (!lane || lane.points.length === 0) continue;
+
+        let seg: [number, number][] = [];
         for (const [lat, lng] of lane.points) {
-          const prev = out[out.length - 1];
-          if (prev && Math.abs(prev[0] - lng) < 1e-10 && Math.abs(prev[1] - lat) < 1e-10) continue;
-          out.push([lng, lat]);
+          dedupeLngLatTail(seg, [lng, lat]);
         }
+        if (seg.length === 0) continue;
+
+        const joinLl = out[out.length - 1]!;
+        if (seg.length >= 2) {
+          seg = orientLngLatPolylineForward(seg, refEn);
+          /** Connectors: do not trim — backend Kubro polyline must stay intact (Rust skips trim too). */
+          const maxTrim = lane.isConnector ? 0 : 96;
+          seg = trimLeadingBacktrackTowardJoin(seg, joinLl, maxTrim);
+          if (!lane.isConnector && prevLaneWasConnector && refEn) {
+            seg = trimLeadingOutboundSpikeAfterConnector(seg, joinLl, refEn, 64);
+          }
+        }
+        /** Connectors: `lineTo` needs many vertices; sparse map data → quadratic sample from IDM debug, else chord subdivide. */
+        if (lane.isConnector) {
+          const bz = d.bezierControlPathLngLat;
+          if (seg.length <= 4 && bz?.length === 3 && d.onCurve) {
+            seg = sampleQuadraticBezierLngLat(bz[0], bz[1], bz[2], 28);
+          } else {
+            seg = densifyLngLatPolyline(seg, 0.6);
+          }
+        }
+        for (const p of seg) {
+          dedupeLngLatTail(out, p);
+        }
+
+        if (out.length >= 2) {
+          const a = out[out.length - 2];
+          const b = out[out.length - 1];
+          refEn = routeHintNormalize(routeHintMetreDelta(a, b)) ?? refEn;
+        }
+        prevLaneWasConnector = lane.isConnector;
       }
       return out;
     };
 
+    /** Prefer backend `routePoints` (Kurbo-sampled); lane-ID fallback if empty. Always avoid long `lineTo` chords. */
     let routeLngLat: [number, number][] = [];
     if (this.selectedRoutePoints.length >= 2) {
-      routeLngLat = this.selectedRoutePoints;
+      routeLngLat = densifyLngLatIfSparse(this.selectedRoutePoints, 4.5, 0.85);
     } else {
       const fromIds = fallbackRouteFromLaneIds();
       if (fromIds.length >= 2) {
-        routeLngLat = fromIds;
+        routeLngLat = densifyLngLatIfSparse(fromIds, 4.5, 0.85);
       } else {
         routeLngLat = [];
       }
@@ -1667,8 +1854,9 @@ export class Game {
     const p2x = p2Lng * lngM;
     const p2y = p2Lat * latM;
     const det = inFx * (-outFy) - inFy * (-outFx);
-    let ctrlLng = junction.lng;
-    let ctrlLat = junction.lat;
+    /** Mid-chord control if tangents are parallel — never the raw junction node (avoids a path through centre). */
+    let ctrlLng = (p1Lng + p2Lng) * 0.5;
+    let ctrlLat = (p1Lat + p2Lat) * 0.5;
     if (Math.abs(det) > 1e-9) {
       const dx = p2x - p1x;
       const dy = p2y - p1y;

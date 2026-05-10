@@ -44,7 +44,7 @@ export class CameraManager {
   static readonly ZOOM_REF = 16;            // reference zoom for scale = 2.0
   static readonly SPRITE_SCALE_MIN = 1.0;   // scale at ZOOM_SPRITE_FULL
   static readonly SPRITE_SCALE_REF = 2.8;   // scale at ZOOM_REF (car = ~17×34 px)
-  static readonly SPRITE_SCALE_MAX = 6.0;   // higher cap for close-in zoom readability
+  static readonly SPRITE_SCALE_MAX = 8.0;   // cap at very high zoom (max ~22)
 
   constructor(map: maplibregl.Map) {
     this.map = map;

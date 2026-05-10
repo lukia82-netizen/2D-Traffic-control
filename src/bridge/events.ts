@@ -160,11 +160,15 @@ export interface GameOverPayload {
 export interface IdmDebugPayload {
   vehicleId: number;
   speed: number;
+  /** IDM bumper gap to dominant obstacle (≤~0.1 m when hard conflict). */
   gap: number;
   deltaV: number;
   desiredSpeed: number;
   acceleration: number;
-  distanceToLeader: number;
+  /** Rust `distance_to_leader_m` serde (camelCase): same as `gap` in current backend. */
+  distanceToLeaderM?: number;
+  /** Legacy naming — prefer `gap`. */
+  distanceToLeader?: number;
   leaderVehicleId: number | null;
   conflictReserverId: number | null;
   distToStopLine: number;
@@ -187,6 +191,10 @@ export interface IdmDebugPayload {
   targetLane?: number;
   nextTurnIntent?: string;
   idmFocus?: string;
+  /**
+   * Dense [lng, lat] polyline for debug overlay. Unbounded length; connector segments are sampled
+   * in Rust (≥11 arc subintervals on Kubro / resampled fallback), not graph-node chords.
+   */
   routePoints: [number, number][];
   /** P1 → control → P2 in [lng, lat] while on a turn connector (Bezier debug). */
   bezierControlPathLngLat?: [number, number][];

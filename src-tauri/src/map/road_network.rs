@@ -180,7 +180,8 @@ pub struct MapData {
 /// | `"two_lane"`  | 2                          |
 /// | `"three_lane"`| 3                          |
 ///
-/// All roads bidirectional, all intersections = TrafficLight.
+/// All roads bidirectional, all intersections = **Plain** (uncontrolled / priority-to-the-right —
+/// see [`crate::traffic::IntersectionManager`] and `cross_traffic_yield_target`); no signal heads.
 pub fn build_demo_road_network(grid_type: &str, bbox: [f64; 4]) -> MapData {
     // Centre the demo grid on the requested bbox so it's always in view.
     // bbox = [west, south, east, north]
@@ -209,7 +210,7 @@ pub fn build_demo_road_network(grid_type: &str, bbox: [f64; 4]) -> MapData {
                 osm_id: nid(r, c),
                 lat,
                 lng,
-                intersection_type: IntersectionType::TrafficLight,
+                intersection_type: IntersectionType::Plain,
             });
             node_index_map.insert(nid(r, c), idx);
         }
@@ -1565,6 +1566,265 @@ fn merge_close_points(pts: &mut Vec<(f64, f64)>, min_dist: f64) {
     *pts = out;
 }
 
+/// Planar tangent from `lane.path` toward an endpoint index (exclusive of midpoint samples).
+///
+/// Geometry is stored \[lat,lng\] on each vertex.
+#[inline]
+fn lane_endpoint_interior_neighbor(poly_len: usize, endpoint_idx: usize) -> Option<usize> {
+    if poly_len < 2 {
+        return None;
+    }
+    match endpoint_idx {
+        0 => Some(1),
+        i if i + 1 == poly_len => Some(poly_len.saturating_sub(2)),
+        _ => None,
+    }
+}
+
+/// Vector in metre space \(east, north\) from `a` to `b` (`a`,`b`: \[lat,lng\]).
+#[inline]
+fn ll_delta_m_xy(a_ll: [f64; 2], b_ll: [f64; 2]) -> (f64, f64) {
+    let (ax, ay) = geo_to_m_xy(a_ll[0], a_ll[1]);
+    let (bx, by) = geo_to_m_xy(b_ll[0], b_ll[1]);
+    (bx - ax, by - ay)
+}
+
+#[inline]
+fn chord_len_ll_m(a_ll: [f64; 2], b_ll: [f64; 2]) -> f64 {
+    let d = ll_delta_m_xy(a_ll, b_ll);
+    (d.0 * d.0 + d.1 * d.1).sqrt()
+}
+
+/// When strict tangent scoring rejects all pairings—or legacy endpoints coincide—pick any
+/// vertex pair (`from_pts` tail × `to_pts`) with a metre chord above `MIN_SEP_M`.
+fn connector_endpoint_force_split(
+    from_pts: &[[f64; 2]],
+    to_pts: &[[f64; 2]],
+) -> Option<([f64; 2], [f64; 2], [f64; 2], [f64; 2])> {
+    const MIN_SEP_M: f64 = 0.25;
+    let nf = from_pts.len();
+    let nt = to_pts.len();
+    if nf < 2 || nt < 2 {
+        return None;
+    }
+    for i in (1..nf).rev() {
+        let p0_geo = from_pts[i];
+        let prev_geo = from_pts[i - 1];
+        for j in 0..nt {
+            let p3_geo = to_pts[j];
+            if chord_len_ll_m(p0_geo, p3_geo) < MIN_SEP_M {
+                continue;
+            }
+            let pj_next_idx = if j + 1 < nt {
+                j + 1
+            } else if j > 0 {
+                j - 1
+            } else {
+                1.min(nt.saturating_sub(1))
+            };
+            let next_geo = to_pts[pj_next_idx.min(nt.saturating_sub(1))];
+            return Some((p0_geo, prev_geo, p3_geo, next_geo));
+        }
+    }
+    None
+}
+
+/// Last-resort planar offset so [`build_lane_connector`] never refuses a turn because inbound and
+/// outbound polylines share a single snapped junction coordinate.
+fn connector_endpoint_artificial_nudge(
+    from_pts: &[[f64; 2]],
+    to_pts: &[[f64; 2]],
+) -> Option<([f64; 2], [f64; 2], [f64; 2], [f64; 2])> {
+    let nf = from_pts.len();
+    let nt = to_pts.len();
+    if nf < 2 || nt < 2 {
+        return None;
+    }
+    let p0_geo = *from_pts.last()?;
+    let prev_geo = from_pts[nf - 2];
+    let (p0x, p0y) = geo_to_m_xy(p0_geo[0], p0_geo[1]);
+    let (prx, pry) = geo_to_m_xy(prev_geo[0], prev_geo[1]);
+
+    let (mut ux, mut uy) = normalize_xy(p0x - prx, p0y - pry);
+    if ux.abs() <= 1e-12 && uy.abs() <= 1e-12 {
+        let mut best_j = 0usize;
+        let mut best_d2 = 0.0f64;
+        for (j, pt) in to_pts.iter().enumerate() {
+            let (xj, yj) = geo_to_m_xy(pt[0], pt[1]);
+            let d2 = (xj - p0x).powi(2) + (yj - p0y).powi(2);
+            if d2 > best_d2 {
+                best_d2 = d2;
+                best_j = j;
+            }
+        }
+        let (xj, yj) = geo_to_m_xy(to_pts[best_j][0], to_pts[best_j][1]);
+        (ux, uy) = normalize_xy(xj - p0x, yj - p0y);
+    }
+    if ux.abs() <= 1e-12 && uy.abs() <= 1e-12 {
+        ux = 1.0;
+        uy = 0.0;
+    }
+
+    let mut best_j = 0usize;
+    let mut best_d2 = 0.0f64;
+    for (j, pt) in to_pts.iter().enumerate() {
+        let (xj, yj) = geo_to_m_xy(pt[0], pt[1]);
+        let d2 = (xj - p0x).powi(2) + (yj - p0y).powi(2);
+        if d2 > best_d2 {
+            best_d2 = d2;
+            best_j = j;
+        }
+    }
+    let p_far = to_pts[best_j];
+    let (fx, fy) = geo_to_m_xy(p_far[0], p_far[1]);
+    let (mut vx, mut vy) = normalize_xy(fx - p0x, fy - p0y);
+    if vx.abs() <= 1e-12 && vy.abs() <= 1e-12 {
+        vx = ux;
+        vy = uy;
+    }
+
+    const ARM_M: f64 = 6.0;
+    let p3x = p0x + vx * ARM_M;
+    let p3y = p0y + vy * ARM_M;
+    let nextx = p3x + vx * ARM_M * 0.5;
+    let nexty = p3y + vy * ARM_M * 0.5;
+    let p3_ll = m_xy_to_geo(p3x, p3y);
+    let next_ll = m_xy_to_geo(nextx, nexty);
+    Some((
+        p0_geo,
+        prev_geo,
+        [p3_ll.0, p3_ll.1],
+        [next_ll.0, next_ll.1],
+    ))
+}
+
+#[inline]
+fn connector_endpoint_geometry_legacy(
+    from_pts: &[[f64; 2]],
+    to_pts: &[[f64; 2]],
+) -> ([f64; 2], [f64; 2], [f64; 2], [f64; 2]) {
+    let nf = from_pts.len();
+    let nt = to_pts.len();
+    let p0_geo = from_pts.last().copied().unwrap_or([0.0, 0.0]);
+    let p3_geo = to_pts.first().copied().unwrap_or([0.0, 0.0]);
+    let prev_geo = if nf >= 2 {
+        from_pts[nf.saturating_sub(2)]
+    } else {
+        p0_geo
+    };
+    let next_geo = if nt >= 2 { to_pts[1] } else { p3_geo };
+    (p0_geo, prev_geo, p3_geo, next_geo)
+}
+
+/// Ingress / egress polyline anchors for a turn connector (`p0`,`p3`).
+///
+/// Older maps sometimes store lane centerlines reversed relative to directed-edge travel,
+/// which made `last`→`first` stitching traverse the manoeuvre backwards. We score all four endpoint
+/// pairings plus interior neighbors and prefer the shortest junction span whose tangents align with
+/// the chord ` p0→p3 `.
+fn pick_connector_endpoint_attachment(
+    from_pts: &[[f64; 2]],
+    to_pts: &[[f64; 2]],
+) -> Option<([f64; 2], [f64; 2], [f64; 2], [f64; 2])> {
+    let nf = from_pts.len();
+    let nt = to_pts.len();
+    if nf < 2 || nt < 2 {
+        return None;
+    }
+    let from_ends = [0usize, nf - 1];
+    let to_ends = [0usize, nt - 1];
+
+    let mut best: Option<(f64, f64, [f64; 2], [f64; 2], [f64; 2], [f64; 2])> = None;
+
+    for &fi in &from_ends {
+        let Some(pi_prev) = lane_endpoint_interior_neighbor(nf, fi) else {
+            continue;
+        };
+        let p0_geo = from_pts[fi];
+        let prev_geo = from_pts[pi_prev];
+        for &tj in &to_ends {
+            let Some(pj_next) = lane_endpoint_interior_neighbor(nt, tj) else {
+                continue;
+            };
+            let p3_geo = to_pts[tj];
+            let next_geo = to_pts[pj_next];
+            if p0_geo == p3_geo {
+                continue;
+            }
+            let chord = ll_delta_m_xy(p0_geo, p3_geo);
+            let chord_len = (chord.0 * chord.0 + chord.1 * chord.1).sqrt();
+            if chord_len < 0.15 {
+                continue;
+            }
+            let in_trail = ll_delta_m_xy(prev_geo, p0_geo);
+            let out_trail = ll_delta_m_xy(p3_geo, next_geo);
+            let in_len = (in_trail.0 * in_trail.0 + in_trail.1 * in_trail.1).sqrt();
+            let out_len = (out_trail.0 * out_trail.0 + out_trail.1 * out_trail.1).sqrt();
+            if in_len < 1e-4 || out_len < 1e-4 {
+                continue;
+            }
+            let in_hat = (in_trail.0 / in_len, in_trail.1 / in_len);
+            let out_hat = (out_trail.0 / out_len, out_trail.1 / out_len);
+            let c_hat = (chord.0 / chord_len, chord.1 / chord_len);
+
+            let align_in = in_hat.0 * c_hat.0 + in_hat.1 * c_hat.1;
+            let align_out = out_hat.0 * c_hat.0 + out_hat.1 * c_hat.1;
+
+            // Reject pairings whose endpoint tangents fight the manoeuvre chord (backward / zig-zag).
+            if align_in < -0.08 || align_out < -0.08 {
+                continue;
+            }
+
+            let quality = align_in.min(align_out);
+
+            let take = match best {
+                Some((best_len, best_qual, _, _, _, _)) => {
+                    chord_len + 1e-3 < best_len
+                        || ((chord_len - best_len).abs() <= 0.25 && quality > best_qual + 0.02)
+                }
+                None => true,
+            };
+
+            if take {
+                best = Some((chord_len, quality, p0_geo, prev_geo, p3_geo, next_geo));
+            }
+        }
+    }
+
+    best.map(|(_, _, p0_geo, prev_geo, p3_geo, next_geo)| (p0_geo, prev_geo, p3_geo, next_geo))
+}
+
+#[inline]
+fn connector_endpoint_attachment_resolved(
+    from_pts: &[[f64; 2]],
+    to_pts: &[[f64; 2]],
+) -> ([f64; 2], [f64; 2], [f64; 2], [f64; 2]) {
+    const MIN_JUNCTION_CHORD_M: f64 = 0.12;
+
+    fn accept_if_valid(
+        quad: ([f64; 2], [f64; 2], [f64; 2], [f64; 2]),
+    ) -> Option<([f64; 2], [f64; 2], [f64; 2], [f64; 2])> {
+        let (p0, _, p3, _) = quad;
+        if p0 != p3 && chord_len_ll_m(p0, p3) >= MIN_JUNCTION_CHORD_M {
+            Some(quad)
+        } else {
+            None
+        }
+    }
+
+    if let Some(q) = pick_connector_endpoint_attachment(from_pts, to_pts).and_then(accept_if_valid) {
+        return q;
+    }
+    if let Some(q) = accept_if_valid(connector_endpoint_geometry_legacy(from_pts, to_pts)) {
+        return q;
+    }
+    if let Some(q) = connector_endpoint_force_split(from_pts, to_pts) {
+        return q;
+    }
+    connector_endpoint_artificial_nudge(from_pts, to_pts)
+        .unwrap_or_else(|| connector_endpoint_geometry_legacy(from_pts, to_pts))
+}
+
 fn build_lane_connector(
     lanes: &HashMap<LaneId, Lane>,
     from_lane_id: LaneId,
@@ -1573,25 +1833,16 @@ fn build_lane_connector(
 ) -> Option<Lane> {
     let from = lanes.get(&from_lane_id)?;
     let to = lanes.get(&to_lane_id)?;
-    let p0_geo = *from.path.points.last()?;
-    let p3_geo = *to.path.points.first()?;
+
+    let (p0_geo, prev_geo, p3_geo, next_geo) =
+        connector_endpoint_attachment_resolved(&from.path.points, &to.path.points);
     if p0_geo == p3_geo {
         return None;
     }
-    let prev = if from.path.points.len() >= 2 {
-        from.path.points[from.path.points.len() - 2]
-    } else {
-        p0_geo
-    };
-    let next = if to.path.points.len() >= 2 {
-        to.path.points[1]
-    } else {
-        p3_geo
-    };
     let (mut p0x, mut p0y) = geo_to_m_xy(p0_geo[0], p0_geo[1]);
     let (mut p3x, mut p3y) = geo_to_m_xy(p3_geo[0], p3_geo[1]);
-    let (prx, pry) = geo_to_m_xy(prev[0], prev[1]);
-    let (nx, ny) = geo_to_m_xy(next[0], next[1]);
+    let (prx, pry) = geo_to_m_xy(prev_geo[0], prev_geo[1]);
+    let (nx, ny) = geo_to_m_xy(next_geo[0], next_geo[1]);
     let in_dir = normalize_xy(p0x - prx, p0y - pry);
     let out_dir = normalize_xy(nx - p3x, ny - p3y);
     // Move endpoints off the junction: back along the incoming arm, forward on the outgoing arm.
@@ -1655,23 +1906,17 @@ fn build_lane_connector_with_fallback(
     }
     let from = lanes.get(&from_lane_id)?;
     let to = lanes.get(&to_lane_id)?;
-    let p0_geo = *from.path.points.last()?;
-    let p3_geo = *to.path.points.first()?;
-    let prev = if from.path.points.len() >= 2 {
-        from.path.points[from.path.points.len() - 2]
-    } else {
-        p0_geo
-    };
-    let next = if to.path.points.len() >= 2 {
-        to.path.points[1]
-    } else {
-        p3_geo
-    };
+
+    let (p0_geo, prev_geo, p3_geo, next_geo) =
+        connector_endpoint_attachment_resolved(&from.path.points, &to.path.points);
+    if p0_geo == p3_geo {
+        return None;
+    }
 
     let (mut p0x, mut p0y) = geo_to_m_xy(p0_geo[0], p0_geo[1]);
     let (mut p3x, mut p3y) = geo_to_m_xy(p3_geo[0], p3_geo[1]);
-    let (prx, pry) = geo_to_m_xy(prev[0], prev[1]);
-    let (nx, ny) = geo_to_m_xy(next[0], next[1]);
+    let (prx, pry) = geo_to_m_xy(prev_geo[0], prev_geo[1]);
+    let (nx, ny) = geo_to_m_xy(next_geo[0], next_geo[1]);
     let mut in_dir = normalize_xy(p0x - prx, p0y - pry);
     let mut out_dir = normalize_xy(nx - p3x, ny - p3y);
 

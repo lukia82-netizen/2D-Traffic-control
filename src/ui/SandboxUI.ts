@@ -47,10 +47,10 @@ export type MapModeCb = (forceSandbox: string | null) => void;
 const GRID_TYPES = [
   { label: 'Skrzyżowanie', value: 'single_intersection', hint: '2 drogi bez świateł' },
   { label: 'Jedna droga',  value: 'single_road',  hint: '1 droga IDM test' },
-  { label: 'Mieszana',     value: 'mixed',         hint: '1/2/3 pasy 3x3' },
-  { label: '1 pas',        value: 'one_lane',      hint: 'tertiary 50' },
-  { label: '2 pasy',       value: 'two_lane',      hint: 'secondary 70' },
-  { label: '3 pasy',       value: 'three_lane',    hint: 'primary 70' },
+  { label: 'Mieszana',     value: 'mixed',         hint: '3×3 · 1/2/3 pas · równorzędne' },
+  { label: '1 pas',        value: 'one_lane',      hint: '3×3 · równorzędne' },
+  { label: '2 pasy',       value: 'two_lane',      hint: '3×3 · równorzędne' },
+  { label: '3 pasy',       value: 'three_lane',    hint: '3×3 · równorzędne' },
 ] as const;
 const UI_STORAGE_PREFIX = 'sandbox-ui:';
 

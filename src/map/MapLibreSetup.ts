@@ -10,6 +10,9 @@ export const KRAKOW_BBOX: [number, number, number, number] = [19.930, 50.057, 19
 export const LESZNO_CENTER: [number, number] = [16.575, 51.845];
 export const LESZNO_BBOX: [number, number, number, number] = [16.571, 51.843, 16.579, 51.847];
 
+/** MapLibre absolute max zoom — higher = more street detail (tile source may limit visuals). */
+export const MAX_MAP_ZOOM = 22;
+
 // Active defaults (sandbox starts with Leszno)
 const DEFAULT_CENTER = LESZNO_CENTER;
 const DEFAULT_ZOOM = 15;
@@ -59,7 +62,7 @@ export async function createMap(containerId: string): Promise<maplibregl.Map> {
       style: styleUrl,
       center: DEFAULT_CENTER,
       zoom: DEFAULT_ZOOM,
-      maxZoom: 19,
+      maxZoom: MAX_MAP_ZOOM,
       minZoom: 12,
       attributionControl: false,
     });
@@ -87,7 +90,7 @@ export async function createMap(containerId: string): Promise<maplibregl.Map> {
         style: OFFLINE_STYLE,
         center: DEFAULT_CENTER,
         zoom: DEFAULT_ZOOM,
-        maxZoom: 19,
+        maxZoom: MAX_MAP_ZOOM,
         minZoom: 12,
         attributionControl: false,
       });
