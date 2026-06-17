@@ -1,0 +1,3 @@
+## 2025-05-14 - GC Churn and API Hoisting in Renderer
+**Learning:** In a 60 FPS rendering loop with potentially thousands of entities, even small helper functions that return new objects (e.g., `{lng, lat, angle}`) cause significant GC pressure (e.g., 60,000 objects/sec for 1k vehicles). Additionally, MapLibre API calls like `map.getBounds()` inside loops add redundant overhead as they may involve matrix calculations or getter logic.
+**Action:** Always hoist map-wide properties (bounds, zoom-based scales) outside of per-entity loops. Inline entity state access to avoid per-frame object allocations. Reuse Set/Array instances instead of re-allocating them every frame.
