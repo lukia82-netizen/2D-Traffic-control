@@ -1,0 +1,9 @@
+
+> traffic-control@0.1.0 dev
+> vite --config vite.config.stable.ts
+
+
+  VITE v5.4.21  ready in 266 ms
+
+  ➜  Local:   http://localhost:1420/
+  ➜  Network: use --host to expose
