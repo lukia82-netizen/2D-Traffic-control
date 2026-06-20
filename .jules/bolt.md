@@ -1,0 +1,3 @@
+## 2025-05-15 - [O(1) Vehicle Filtering and Allocation Reduction]
+**Learning:** High-frequency rendering loops (60 FPS) in MapLibre/PixiJS applications are extremely sensitive to method call overhead and GC pressure. Hoisting `map.getBounds()` getters and casting state objects to `LngLatLike` (instead of creating `[lng, lat]` arrays) significantly reduces frame time. Additionally, leveraging `currentLaneId` for $O(1)$ road-group lookups eliminates the need for expensive spatial distance checks.
+**Action:** Always check if backend-provided IDs can be used for $O(1)$ metadata lookups before falling back to spatial searches. Hoist all property access and avoid any object/array allocations inside vehicle loops.
