@@ -1,0 +1,3 @@
+## 2025-05-14 - [O(1) road-group lookup and reduced GC pressure in VehicleRenderer]
+**Learning:** High-frequency rendering loops (60 FPS) are extremely sensitive to object allocations and linear searches. Mapping backend IDs (like `currentLaneId`) to frontend metadata (like `roadGroup`) during initialization converts O(E) spatial searches into O(1) lookups. Additionally, passing existing state objects to MapLibre's `project` method instead of wrapping them in new array literals `[lng, lat]` significantly reduces GC pressure.
+**Action:** Always check if backend state already contains unique IDs that can be pre-indexed to avoid per-frame spatial or linear searches. Minimize array/object literals in loops.
