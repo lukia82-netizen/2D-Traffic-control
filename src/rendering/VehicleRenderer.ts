@@ -152,6 +152,8 @@ export class VehicleRenderer {
 
   // ── Road-group filtering ───────────────────────────────────────────────────
   private edgeIndex: EdgeLine[] = [];
+  /** O(1) lookup from lane ID to road group (motorway, primary, etc.) */
+  private readonly laneGroupMap: Map<number, string> = new Map();
   private readonly vehicleGroupCache: Map<number, string> = new Map();
   private readonly prevVehiclePos: Map<number, { lat: number; lng: number }> = new Map();
   private hiddenGroups: Set<string> = new Set();
@@ -169,26 +171,49 @@ export class VehicleRenderer {
    */
   private pxPerMetre(): number {
     const c  = this.map.getCenter();
-    const p1 = this.map.project([c.lng, c.lat]);
+    const p1 = this.map.project(c);
     const p2 = this.map.project([c.lng, c.lat + 1 / 111_320]); // 1 m north
     return Math.abs(p2.y - p1.y);
   }
 
   // ─── Road-group filtering API ──────────────────────────────────────────────
 
+  /**
+   * Pre-builds spatial and ID-based indices for road-group filtering.
+   * This allows O(1) hidden-group checks for vehicles with valid lane data.
+   */
   setEdgeIndex(mapData: MapData): void {
     const nodeMap = new Map(mapData.nodes.map(n => [n.id, n]));
     this.edgeIndex = [];
+    this.laneGroupMap.clear();
+
+    const edgeToGroup = new Map<string, string>();
+
     for (const edge of mapData.edges) {
       const a = nodeMap.get(edge.from);
       const b = nodeMap.get(edge.to);
       if (!a || !b) continue;
+
+      const group = ROAD_TYPE_GROUP[edge.roadType] ?? 'residential';
       this.edgeIndex.push({
         aLat: a.lat, aLng: a.lng,
         bLat: b.lat, bLng: b.lng,
-        group: ROAD_TYPE_GROUP[edge.roadType] ?? 'residential',
+        group,
       });
+
+      // Index by "from_to" node ID pair to associate lanes with this edge's group
+      edgeToGroup.set(`${edge.from}_${edge.to}`, group);
     }
+
+    // Map each lane ID to its parent road group for O(1) per-frame lookup.
+    // Reduces CPU usage by bypassing spatial search for vehicles on known lanes.
+    for (const lane of mapData.lanes) {
+      const group = edgeToGroup.get(`${lane.fromNodeOsmId}_${lane.toNodeOsmId}`);
+      if (group) {
+        this.laneGroupMap.set(lane.id, group);
+      }
+    }
+
     this.vehicleGroupCache.clear();
     this.prevVehiclePos.clear();
   }
@@ -253,7 +278,7 @@ export class VehicleRenderer {
 
       const typeId = v.vehicleType < VEHICLE_TYPES.length ? v.vehicleType : 0;
       const color  = frustrationDotColor(v.frustration, DOT_COLORS[typeId] ?? 0x4488ff);
-      const px     = this.map.project([s.lng, s.lat]);
+      const px     = this.map.project(s as maplibregl.LngLatLike);
 
       // Backend now provides lane-centered geometry directly.
       const cx = px.x;
@@ -292,7 +317,7 @@ export class VehicleRenderer {
       else                                           tier = 0;
 
       const color = BUBBLE_COLORS[tier];
-      const px    = this.map.project([s.lng, s.lat]);
+      const px    = this.map.project(s as maplibregl.LngLatLike);
       const cx    = px.x;
       const cy    = px.y - BUBBLE_OFFSET_Y;
 
@@ -349,7 +374,7 @@ export class VehicleRenderer {
         }
       }
 
-      const px = this.map.project([s.lng, s.lat]);
+      const px = this.map.project(s as maplibregl.LngLatLike);
 
       rect.x        = px.x;
       rect.y        = px.y;
@@ -391,6 +416,13 @@ export class VehicleRenderer {
   private isVehicleHidden(v: VehicleState): boolean {
     if (this.hiddenGroups.size === 0 || this.edgeIndex.length === 0) return false;
 
+    // Fast path: O(1) lookup if we have the lane ID and it's in our map
+    if (v.currentLaneId !== null) {
+      const group = this.laneGroupMap.get(v.currentLaneId);
+      if (group) return this.hiddenGroups.has(group);
+    }
+
+    // Fallback: O(E) spatial search (rechecked every ~9m of movement)
     const prev  = this.prevVehiclePos.get(v.id);
     const moved = !prev ||
       Math.abs(v.lat - prev.lat) > RECHECK_THRESHOLD ||
@@ -456,6 +488,7 @@ export class VehicleRenderer {
     this.rectPools.clear();
     this.activeRects.clear();
     this.activeRectTypes.clear();
+    this.laneGroupMap.clear();
     this.smoothState.clear();
     this.prevOnConnector.clear();
   }
