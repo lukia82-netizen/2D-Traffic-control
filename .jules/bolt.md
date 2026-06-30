@@ -1,0 +1,3 @@
+## 2025-05-15 - Optimize vehicle rendering and road-group filtering
+**Learning:** In high-frequency rendering loops (60 FPS), small overheads like `map.getBounds()` and temporary array allocations (`[lng, lat]`) can significantly contribute to CPU usage. Additionally, O(E) spatial searches for road-group filtering become a major bottleneck as the number of vehicles and edges increases.
+**Action:** Always hoist expensive API calls outside of loops. Use available unique identifiers (like `currentLaneId`) to implement O(1) lookups. Pass compatible objects directly to library methods (like `map.project()`) to minimize GC pressure.
