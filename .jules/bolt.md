@@ -1,0 +1,3 @@
+## 2025-07-02 - O(1) Road-Group Filtering
+**Learning:** High-frequency rendering loops (60 FPS) are extremely sensitive to O(N) spatial searches. Replacing an O(E) spatial search with an O(1) Map lookup based on lane IDs provided by the backend drastically reduces CPU overhead. Hoisting object property access (like map bounds) and avoiding temporary array allocations ([lng, lat]) also significantly reduces GC pressure.
+**Action:** Always check if entity-level IDs can be mapped to metadata (like road groups) during a one-time setup phase instead of performing spatial lookups per frame. Hoist invariant calculations and avoid temporary objects in any method that iterates over active entities.
