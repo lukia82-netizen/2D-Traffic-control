@@ -152,6 +152,7 @@ export class VehicleRenderer {
 
   // ── Road-group filtering ───────────────────────────────────────────────────
   private edgeIndex: EdgeLine[] = [];
+  private readonly laneGroupCache: Map<number, string> = new Map();
   private readonly vehicleGroupCache: Map<number, string> = new Map();
   private readonly prevVehiclePos: Map<number, { lat: number; lng: number }> = new Map();
   private hiddenGroups: Set<string> = new Set();
@@ -176,19 +177,39 @@ export class VehicleRenderer {
 
   // ─── Road-group filtering API ──────────────────────────────────────────────
 
+  /**
+   * Pre-calculates spatial index and O(1) lane-to-group mapping for high-speed filtering.
+   * Reduces CPU overhead by avoiding per-frame O(E) spatial searches.
+   */
   setEdgeIndex(mapData: MapData): void {
     const nodeMap = new Map(mapData.nodes.map(n => [n.id, n]));
     this.edgeIndex = [];
+    const edgeGroupMap = new Map<string, string>();
+
     for (const edge of mapData.edges) {
       const a = nodeMap.get(edge.from);
       const b = nodeMap.get(edge.to);
-      if (!a || !b) continue;
-      this.edgeIndex.push({
-        aLat: a.lat, aLng: a.lng,
-        bLat: b.lat, bLng: b.lng,
-        group: ROAD_TYPE_GROUP[edge.roadType] ?? 'residential',
-      });
+      const group = ROAD_TYPE_GROUP[edge.roadType] ?? 'residential';
+
+      if (a && b) {
+        this.edgeIndex.push({
+          aLat: a.lat, aLng: a.lng,
+          bLat: b.lat, bLng: b.lng,
+          group,
+        });
+      }
+      edgeGroupMap.set(`${edge.from}->${edge.to}`, group);
     }
+
+    // Populate O(1) cache for per-frame vehicle filtering
+    this.laneGroupCache.clear();
+    for (const lane of mapData.lanes) {
+      const group = edgeGroupMap.get(`${lane.fromNodeOsmId}->${lane.toNodeOsmId}`);
+      if (group) {
+        this.laneGroupCache.set(lane.id, group);
+      }
+    }
+
     this.vehicleGroupCache.clear();
     this.prevVehiclePos.clear();
   }
@@ -239,6 +260,8 @@ export class VehicleRenderer {
   private renderDots(vehicles: Map<number, VehicleState>, radius: number): void {
     const gfx = this.dotGraphics!;
     const bounds = this.map.getBounds();
+    const west = bounds.getWest(), east = bounds.getEast();
+    const south = bounds.getSouth(), north = bounds.getNorth();
     gfx.clear();
 
     for (const v of vehicles.values()) {
@@ -246,14 +269,15 @@ export class VehicleRenderer {
 
       const s = this.advanceSmooth(v);
 
-      if (
-        s.lng < bounds.getWest() || s.lng > bounds.getEast() ||
-        s.lat < bounds.getSouth() || s.lat > bounds.getNorth()
-      ) continue;
+      // Frustum culling using hoisted bounds
+      if (s.lng < west || s.lng > east || s.lat < south || s.lat > north) {
+        continue;
+      }
 
       const typeId = v.vehicleType < VEHICLE_TYPES.length ? v.vehicleType : 0;
       const color  = frustrationDotColor(v.frustration, DOT_COLORS[typeId] ?? 0x4488ff);
-      const px     = this.map.project([s.lng, s.lat]);
+      // Avoid temporary array allocation [s.lng, s.lat] by passing state directly (maplibregl.LngLatLike)
+      const px     = this.map.project(s as maplibregl.LngLatLike);
 
       // Backend now provides lane-centered geometry directly.
       const cx = px.x;
@@ -272,6 +296,8 @@ export class VehicleRenderer {
   private renderFrustrationBubbles(vehicles: Map<number, VehicleState>): void {
     const gfx = this.bubbleGraphics!;
     const bounds = this.map.getBounds();
+    const west = bounds.getWest(), east = bounds.getEast();
+    const south = bounds.getSouth(), north = bounds.getNorth();
     gfx.clear();
 
     const now = performance.now();
@@ -280,10 +306,9 @@ export class VehicleRenderer {
 
       const s = this.smoothState.get(v.id) ?? { lat: v.lat, lng: v.lng };
 
-      if (
-        s.lng < bounds.getWest() || s.lng > bounds.getEast() ||
-        s.lat < bounds.getSouth() || s.lat > bounds.getNorth()
-      ) continue;
+      if (s.lng < west || s.lng > east || s.lat < south || s.lat > north) {
+        continue;
+      }
 
       let tier: number;
       if (v.frustration >= FRUSTRATION_RAGE)         tier = 3;
@@ -292,7 +317,7 @@ export class VehicleRenderer {
       else                                           tier = 0;
 
       const color = BUBBLE_COLORS[tier];
-      const px    = this.map.project([s.lng, s.lat]);
+      const px    = this.map.project(s as maplibregl.LngLatLike);
       const cx    = px.x;
       const cy    = px.y - BUBBLE_OFFSET_Y;
 
@@ -313,8 +338,10 @@ export class VehicleRenderer {
     infraMap: Map<number, string>,
     _spriteScale: number,
   ): void {
-    const bounds    = this.map.getBounds();
-    const pxPerM    = this.pxPerMetre();
+    const bounds = this.map.getBounds();
+    const west = bounds.getWest(), east = bounds.getEast();
+    const south = bounds.getSouth(), north = bounds.getNorth();
+    const pxPerM = this.pxPerMetre();
     const renderedIds = new Set<number>();
 
     for (const [id, v] of vehicles) {
@@ -322,10 +349,9 @@ export class VehicleRenderer {
 
       const s = this.advanceSmooth(v);
 
-      if (
-        s.lng < bounds.getWest() || s.lng > bounds.getEast() ||
-        s.lat < bounds.getSouth() || s.lat > bounds.getNorth()
-      ) continue;
+      if (s.lng < west || s.lng > east || s.lat < south || s.lat > north) {
+        continue;
+      }
 
       const typeId    = v.vehicleType < VEHICLE_TYPES.length ? v.vehicleType : 0;
       const dims      = VEHICLE_DIMS[typeId]  ?? VEHICLE_DIMS[0];
@@ -349,7 +375,7 @@ export class VehicleRenderer {
         }
       }
 
-      const px = this.map.project([s.lng, s.lat]);
+      const px = this.map.project(s as maplibregl.LngLatLike);
 
       rect.x        = px.x;
       rect.y        = px.y;
@@ -388,15 +414,29 @@ export class VehicleRenderer {
 
   // ─── Road-group lookup ─────────────────────────────────────────────────────
 
+  /**
+   * Fast filtering of vehicles based on road-group visibility.
+   * Priority: O(1) lane cache → O(1) state cache → O(E) spatial fallback.
+   */
   private isVehicleHidden(v: VehicleState): boolean {
-    if (this.hiddenGroups.size === 0 || this.edgeIndex.length === 0) return false;
+    if (this.hiddenGroups.size === 0) return false;
 
+    // 1. Priority 1: O(1) Lane Graph Lookup (fastest)
+    if (v.currentLaneId !== null) {
+      const group = this.laneGroupCache.get(v.currentLaneId);
+      if (group) return this.hiddenGroups.has(group);
+    }
+
+    if (this.edgeIndex.length === 0) return false;
+
+    // 2. Priority 2: O(1) State Cache (debounced spatial search)
     const prev  = this.prevVehiclePos.get(v.id);
     const moved = !prev ||
       Math.abs(v.lat - prev.lat) > RECHECK_THRESHOLD ||
       Math.abs(v.lng - prev.lng) > RECHECK_THRESHOLD;
 
     if (moved) {
+      // 3. Priority 3: O(E) Spatial Fallback (expensive, only if laneId is unknown)
       const group = this.resolveVehicleGroup(v.lat, v.lng);
       this.vehicleGroupCache.set(v.id, group);
       this.prevVehiclePos.set(v.id, { lat: v.lat, lng: v.lng });
