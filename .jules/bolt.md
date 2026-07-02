@@ -1,0 +1,3 @@
+## 2025-05-15 - Vehicle Rendering and Road-Group Filtering Optimization
+**Learning:** Performing spatial searches ($O(E)$) per-vehicle, per-frame to filter visibility by road groups is a major bottleneck in simulation-heavy applications. Mapping lane IDs to road groups allows for $O(1)$ lookups during the render loop. Additionally, creating temporary coordinate arrays for MapLibre's `project` method significantly increases GC pressure.
+**Action:** Use a pre-computed `Map` to cache lane-to-group associations during data ingestion. Hoist expensive API calls (like `map.getBounds()`) and constant multipliers outside of per-entity loops. Pass entity objects directly to `project()` if they contain `lng`/`lat` to avoid array allocations.
