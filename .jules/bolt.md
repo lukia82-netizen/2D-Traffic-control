@@ -1,0 +1,3 @@
+## 2026-07-07 - [VehicleRenderer Performance Optimizations]
+**Learning:** Per-frame spatial searches and object allocations in the hot rendering loop (60 FPS) were significantly impacting performance. Specifically, O(E) spatial lookups for road-group filtering and creating temporary coordinate arrays for MapLibre's `project` method were major bottlenecks.
+**Action:** Use pre-computed caches (like `laneGroupCache`) for O(1) lookups whenever possible. Hoist expensive API calls and constant values out of loops. Pass existing objects directly to library functions (like `this.map.project(v)`) instead of allocating temporary ones.
