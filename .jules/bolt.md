@@ -1,0 +1,3 @@
+## 2025-07-08 - Vehicle Rendering Optimization
+**Learning:** Per-frame spatial searches ($O(V \times E)$) are the primary bottleneck in the traffic simulation frontend when handling thousands of vehicles. Using static data like `currentLaneId` to perform $O(1)$ road-group lookups significantly reduces CPU overhead. Additionally, reducing small object allocations (like coordinate arrays) in high-frequency loops helps minimize GC pauses.
+**Action:** Always check if spatial queries in rendering loops can be replaced by index/ID lookups using data already available in the entity state. Hoist MapLibre property accessors (like `getBounds`) outside of loops.
