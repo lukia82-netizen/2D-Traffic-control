@@ -154,6 +154,7 @@ export class VehicleRenderer {
   private edgeIndex: EdgeLine[] = [];
   private readonly vehicleGroupCache: Map<number, string> = new Map();
   private readonly prevVehiclePos: Map<number, { lat: number; lng: number }> = new Map();
+  private readonly laneGroupCache: Map<number, string> = new Map();
   private hiddenGroups: Set<string> = new Set();
 
 
@@ -179,16 +180,30 @@ export class VehicleRenderer {
   setEdgeIndex(mapData: MapData): void {
     const nodeMap = new Map(mapData.nodes.map(n => [n.id, n]));
     this.edgeIndex = [];
+    const roadGroupMap = new Map<string, string>();
+
     for (const edge of mapData.edges) {
       const a = nodeMap.get(edge.from);
       const b = nodeMap.get(edge.to);
       if (!a || !b) continue;
+
+      const group = ROAD_TYPE_GROUP[edge.roadType] ?? 'residential';
       this.edgeIndex.push({
         aLat: a.lat, aLng: a.lng,
         bLat: b.lat, bLng: b.lng,
-        group: ROAD_TYPE_GROUP[edge.roadType] ?? 'residential',
+        group,
       });
+      roadGroupMap.set(`${edge.from}_${edge.to}`, group);
     }
+
+    this.laneGroupCache.clear();
+    for (const lane of mapData.lanes) {
+      const group = roadGroupMap.get(`${lane.fromNodeOsmId}_${lane.toNodeOsmId}`);
+      if (group) {
+        this.laneGroupCache.set(lane.id, group);
+      }
+    }
+
     this.vehicleGroupCache.clear();
     this.prevVehiclePos.clear();
   }
@@ -391,6 +406,12 @@ export class VehicleRenderer {
   private isVehicleHidden(v: VehicleState): boolean {
     if (this.hiddenGroups.size === 0 || this.edgeIndex.length === 0) return false;
 
+    // O(1) lookup via lane ID if available (from Rust backend)
+    if (v.currentLaneId !== null) {
+      const group = this.laneGroupCache.get(v.currentLaneId);
+      if (group) return this.hiddenGroups.has(group);
+    }
+
     const prev  = this.prevVehiclePos.get(v.id);
     const moved = !prev ||
       Math.abs(v.lat - prev.lat) > RECHECK_THRESHOLD ||
@@ -458,5 +479,6 @@ export class VehicleRenderer {
     this.activeRectTypes.clear();
     this.smoothState.clear();
     this.prevOnConnector.clear();
+    this.laneGroupCache.clear();
   }
 }
