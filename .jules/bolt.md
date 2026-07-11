@@ -1,0 +1,3 @@
+## 2026-07-11 - [VehicleRenderer] Rendering loop optimizations
+**Learning:** High-frequency rendering loops (60 FPS) in this codebase suffered from redundant MapLibre API calls (like `map.getBounds()` and its getters) and unnecessary object allocations (temporary `[lng, lat]` arrays and `SmoothState` objects).
+**Action:** Always hoist map bounds and scale factors (pxPerMetre) outside of per-entity loops. Pass `VehicleState` objects directly to `map.project()` (they are natively compatible with `LngLatLike`) to avoid GC pressure. Use `currentLaneId` for O(1) road-group lookups to bypass O(E) spatial searches.
