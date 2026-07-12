@@ -152,6 +152,9 @@ export class VehicleRenderer {
 
   // ── Road-group filtering ───────────────────────────────────────────────────
   private edgeIndex: EdgeLine[] = [];
+  /** O(1) cache mapping lane ID → road group (populated on map load). */
+  private readonly laneGroupCache: Map<number, string> = new Map();
+  /** Fallback cache for vehicles without lane IDs or in junctions. */
   private readonly vehicleGroupCache: Map<number, string> = new Map();
   private readonly prevVehiclePos: Map<number, { lat: number; lng: number }> = new Map();
   private hiddenGroups: Set<string> = new Set();
@@ -179,16 +182,31 @@ export class VehicleRenderer {
   setEdgeIndex(mapData: MapData): void {
     const nodeMap = new Map(mapData.nodes.map(n => [n.id, n]));
     this.edgeIndex = [];
+    const edgeGroupMap = new Map<string, string>();
+
     for (const edge of mapData.edges) {
       const a = nodeMap.get(edge.from);
       const b = nodeMap.get(edge.to);
       if (!a || !b) continue;
+
+      const group = ROAD_TYPE_GROUP[edge.roadType] ?? 'residential';
       this.edgeIndex.push({
         aLat: a.lat, aLng: a.lng,
         bLat: b.lat, bLng: b.lng,
-        group: ROAD_TYPE_GROUP[edge.roadType] ?? 'residential',
+        group,
       });
+      edgeGroupMap.set(`${edge.from}_${edge.to}`, group);
     }
+
+    // Populate lane-to-group cache for O(1) lookups during render
+    this.laneGroupCache.clear();
+    for (const lane of mapData.lanes) {
+      const group = edgeGroupMap.get(`${lane.fromNodeOsmId}_${lane.toNodeOsmId}`);
+      if (group) {
+        this.laneGroupCache.set(lane.id, group);
+      }
+    }
+
     this.vehicleGroupCache.clear();
     this.prevVehiclePos.clear();
   }
@@ -389,7 +407,16 @@ export class VehicleRenderer {
   // ─── Road-group lookup ─────────────────────────────────────────────────────
 
   private isVehicleHidden(v: VehicleState): boolean {
-    if (this.hiddenGroups.size === 0 || this.edgeIndex.length === 0) return false;
+    if (this.hiddenGroups.size === 0) return false;
+
+    // 1. Try O(1) lane-id lookup if available (covers ~95% of frames)
+    if (v.currentLaneId !== null) {
+      const group = this.laneGroupCache.get(v.currentLaneId);
+      if (group) return this.hiddenGroups.has(group);
+    }
+
+    // 2. Fall back to O(E) spatial search if lane ID is missing or not indexed (e.g. junctions)
+    if (this.edgeIndex.length === 0) return false;
 
     const prev  = this.prevVehiclePos.get(v.id);
     const moved = !prev ||
@@ -458,5 +485,8 @@ export class VehicleRenderer {
     this.activeRectTypes.clear();
     this.smoothState.clear();
     this.prevOnConnector.clear();
+    this.laneGroupCache.clear();
+    this.vehicleGroupCache.clear();
+    this.prevVehiclePos.clear();
   }
 }
