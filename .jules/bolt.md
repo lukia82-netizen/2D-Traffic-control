@@ -1,0 +1,3 @@
+## 2025-07-13 - [VehicleRenderer] O(1) Road Group Lookup & Loop Hoisting
+**Learning:** High-frequency rendering loops (60 FPS) are extremely sensitive to per-entity allocations and redundant API calls. MapLibre's `map.getBounds()` and its getters (`getWest()`, etc.) add up when called for 1000+ vehicles. Furthermore, (E)$ spatial searches for road-group filtering (to hide/show road types) are a massive CPU sink when vehicles move.
+**Action:** Always hoist map bounds and scale calculations outside of loops. Use `currentLaneId` for (1)$ road-group lookups via a pre-computed cache (`laneGroupCache`) instead of spatial searches. Pass entity objects directly to `map.project()` to avoid `[lng, lat]` array allocations.
