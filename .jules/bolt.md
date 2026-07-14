@@ -1,0 +1,3 @@
+## 2026-07-14 - Optimized vehicle rendering and filtering
+**Learning:** O(E) spatial searches in high-frequency rendering loops (like road-group filtering) are a major CPU bottleneck as the number of vehicles and map complexity grow. Utilizing backend-provided identifiers (like lane IDs) for O(1) lookups is significantly more efficient. Additionally, hoisting MapLibre API calls like 'getBounds()' and avoiding temporary array allocations for coordinates further reduces per-frame overhead.
+**Action:** Always check for unique identifiers that can be used for O(1) cache lookups before falling back to spatial searches. Hoist map-related constants and bounds outside of loops in rendering logic.
