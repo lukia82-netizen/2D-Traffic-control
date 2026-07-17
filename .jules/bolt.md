@@ -1,0 +1,5 @@
+# Bolt's Journal
+
+## 2025-07-17 - VehicleRenderer Hot Loop and O(1) Cache Lookup Optimization
+**Learning:** In high-frequency 60 FPS rendering loops (like `VehicleRenderer.ts`), calling expensive MapLibre API methods like `map.getBounds()` and its getters (`getWest()`, `getEast()`, `getSouth()`, `getNorth()`) inside a loop over thousands of vehicles imposes severe per-frame CPU overhead. Additionally, performing O(E) spatial segment distance queries for road group filtering on every vehicle movement threshold creates a significant bottleneck. Finally, allocating temporary coordinate arrays like `[lng, lat]` or wrapper objects on every frame triggers frequent garbage collection (GC) pauses.
+**Action:** Always hoist invariant API calls and bounds values outside of loops. Pre-compute mappings (e.g. from lane ID to road group) into O(1) lookups on map initialization/update, and pass entity states (which already contain `lat` and `lng` properties) directly to Leaflet/MapLibre's `.project()` method to eliminate coordinate array allocations.

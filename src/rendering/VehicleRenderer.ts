@@ -105,14 +105,6 @@ function ptSegDist2(
   return rLat * rLat + rLng * rLng;
 }
 
-// ─── Raw state per vehicle (no smoothing) ────────────────────────────────────
-
-interface SmoothState {
-  lat: number;
-  lng: number;
-  angle: number;
-}
-
 // ─── VehicleRenderer ─────────────────────────────────────────────────────────
 
 /**
@@ -121,14 +113,6 @@ interface SmoothState {
  * Two rendering modes managed by CameraManager:
  *  • dot    – single batched Graphics call per frame (ultra-fast for 3000+ cars)
  *  • sprite – textured rectangles with rotation (rich detail at street level)
- *
- * Smoothing: simple per-vehicle LERP applied every render frame.
- *  • LERP_STRAIGHT (0.4) on straight edges — gentle follow so timing jitter
- *    from the 60 Hz Rust→JS IPC doesn't cause frame-to-frame jumps.
- *  • LERP_ARC (0.9) on Bezier turn connectors — tight tracking of the
- *    analytically-exact Bezier position/angle from the Rust backend.
- *  • Instant snap on arc entry (t = 0) — eliminates any position lag from
- *    the straight-road LERP so the vehicle starts the arc from exactly P1.
  */
 export class VehicleRenderer {
   private readonly overlay: PixiOverlay;
@@ -147,11 +131,11 @@ export class VehicleRenderer {
   private bubbleGraphics: PIXI.Graphics | null = null;
 
   // ── Raw state cache (direct Rust data, no smoothing) ─────────────────────────
-  private readonly smoothState: Map<number, SmoothState> = new Map();
   private readonly prevOnConnector: Map<number, boolean> = new Map();
 
   // ── Road-group filtering ───────────────────────────────────────────────────
   private edgeIndex: EdgeLine[] = [];
+  private readonly laneGroupCache: Map<number, string> = new Map(); // O(1) road group cache linking lane ID to road groups
   private readonly vehicleGroupCache: Map<number, string> = new Map();
   private readonly prevVehiclePos: Map<number, { lat: number; lng: number }> = new Map();
   private hiddenGroups: Set<string> = new Set();
@@ -179,16 +163,37 @@ export class VehicleRenderer {
   setEdgeIndex(mapData: MapData): void {
     const nodeMap = new Map(mapData.nodes.map(n => [n.id, n]));
     this.edgeIndex = [];
+
+    // Create a temporary map to resolve lane groups in O(1) from edges
+    const edgeGroupMap = new Map<string, string>();
+
     for (const edge of mapData.edges) {
       const a = nodeMap.get(edge.from);
       const b = nodeMap.get(edge.to);
       if (!a || !b) continue;
+
+      const group = ROAD_TYPE_GROUP[edge.roadType] ?? 'residential';
       this.edgeIndex.push({
         aLat: a.lat, aLng: a.lng,
         bLat: b.lat, bLng: b.lng,
-        group: ROAD_TYPE_GROUP[edge.roadType] ?? 'residential',
+        group,
       });
+
+      edgeGroupMap.set(`${edge.from}_${edge.to}`, group);
     }
+
+    // Populate the O(1) laneGroupCache with mapping lane ID -> road group
+    this.laneGroupCache.clear();
+    if (mapData.lanes) {
+      for (const lane of mapData.lanes) {
+        const key = `${lane.fromNodeOsmId}_${lane.toNodeOsmId}`;
+        const group = edgeGroupMap.get(key);
+        if (group) {
+          this.laneGroupCache.set(lane.id, group);
+        }
+      }
+    }
+
     this.vehicleGroupCache.clear();
     this.prevVehiclePos.clear();
   }
@@ -227,33 +232,30 @@ export class VehicleRenderer {
     this.renderFrustrationBubbles(vehicles);
   }
 
-  // ─── Raw passthrough (no smoothing) ──────────────────────────────────────
-
-  /** Returns the raw Rust position and angle directly — zero smoothing. */
-  private advanceSmooth(v: VehicleState): SmoothState {
-    return { lat: v.lat, lng: v.lng, angle: v.angle };
-  }
-
   // ─── Dot rendering ─────────────────────────────────────────────────────────
 
   private renderDots(vehicles: Map<number, VehicleState>, radius: number): void {
     const gfx = this.dotGraphics!;
     const bounds = this.map.getBounds();
+    // Hoisting expensive bounds API calls outside of the rendering loop reduces frame overhead
+    const west = bounds.getWest();
+    const east = bounds.getEast();
+    const south = bounds.getSouth();
+    const north = bounds.getNorth();
     gfx.clear();
 
     for (const v of vehicles.values()) {
       if (this.isVehicleHidden(v)) continue;
 
-      const s = this.advanceSmooth(v);
-
       if (
-        s.lng < bounds.getWest() || s.lng > bounds.getEast() ||
-        s.lat < bounds.getSouth() || s.lat > bounds.getNorth()
+        v.lng < west || v.lng > east ||
+        v.lat < south || v.lat > north
       ) continue;
 
       const typeId = v.vehicleType < VEHICLE_TYPES.length ? v.vehicleType : 0;
       const color  = frustrationDotColor(v.frustration, DOT_COLORS[typeId] ?? 0x4488ff);
-      const px     = this.map.project([s.lng, s.lat]);
+      // Passing v directly to map.project avoids temporary coordinate array allocation [lng, lat]
+      const px     = this.map.project(v);
 
       // Backend now provides lane-centered geometry directly.
       const cx = px.x;
@@ -272,17 +274,20 @@ export class VehicleRenderer {
   private renderFrustrationBubbles(vehicles: Map<number, VehicleState>): void {
     const gfx = this.bubbleGraphics!;
     const bounds = this.map.getBounds();
+    // Hoisting expensive bounds API calls outside of the rendering loop reduces frame overhead
+    const west = bounds.getWest();
+    const east = bounds.getEast();
+    const south = bounds.getSouth();
+    const north = bounds.getNorth();
     gfx.clear();
 
     const now = performance.now();
     for (const v of vehicles.values()) {
       if (v.frustration < FRUSTRATION_CALM) continue;
 
-      const s = this.smoothState.get(v.id) ?? { lat: v.lat, lng: v.lng };
-
       if (
-        s.lng < bounds.getWest() || s.lng > bounds.getEast() ||
-        s.lat < bounds.getSouth() || s.lat > bounds.getNorth()
+        v.lng < west || v.lng > east ||
+        v.lat < south || v.lat > north
       ) continue;
 
       let tier: number;
@@ -292,7 +297,8 @@ export class VehicleRenderer {
       else                                           tier = 0;
 
       const color = BUBBLE_COLORS[tier];
-      const px    = this.map.project([s.lng, s.lat]);
+      // Passing v directly to map.project avoids temporary coordinate array allocation [lng, lat]
+      const px    = this.map.project(v);
       const cx    = px.x;
       const cy    = px.y - BUBBLE_OFFSET_Y;
 
@@ -314,17 +320,20 @@ export class VehicleRenderer {
     _spriteScale: number,
   ): void {
     const bounds    = this.map.getBounds();
+    // Hoisting expensive bounds API calls outside of the rendering loop reduces frame overhead
+    const west      = bounds.getWest();
+    const east      = bounds.getEast();
+    const south     = bounds.getSouth();
+    const north     = bounds.getNorth();
     const pxPerM    = this.pxPerMetre();
     const renderedIds = new Set<number>();
 
     for (const [id, v] of vehicles) {
       if (this.isVehicleHidden(v)) continue;
 
-      const s = this.advanceSmooth(v);
-
       if (
-        s.lng < bounds.getWest() || s.lng > bounds.getEast() ||
-        s.lat < bounds.getSouth() || s.lat > bounds.getNorth()
+        v.lng < west || v.lng > east ||
+        v.lat < south || v.lat > north
       ) continue;
 
       const typeId    = v.vehicleType < VEHICLE_TYPES.length ? v.vehicleType : 0;
@@ -349,11 +358,12 @@ export class VehicleRenderer {
         }
       }
 
-      const px = this.map.project([s.lng, s.lat]);
+      // Passing v directly to map.project avoids temporary coordinate array allocation [lng, lat]
+      const px = this.map.project(v);
 
       rect.x        = px.x;
       rect.y        = px.y;
-      rect.rotation = s.angle;
+      rect.rotation = v.angle;
 
       // Physical dimensions → pixels via map projection (correct at all zoom levels / latitudes).
       const targetWidth  = Math.max(2, pxPerM * phys.widthM);
@@ -372,7 +382,6 @@ export class VehicleRenderer {
         this.releaseRect(id, rect);
         this.activeRects.delete(id);
         this.activeRectTypes.delete(id);
-        this.smoothState.delete(id);
         this.prevOnConnector.delete(id);
         this.vehicleGroupCache.delete(id);
         this.prevVehiclePos.delete(id);
@@ -391,18 +400,28 @@ export class VehicleRenderer {
   private isVehicleHidden(v: VehicleState): boolean {
     if (this.hiddenGroups.size === 0 || this.edgeIndex.length === 0) return false;
 
-    const prev  = this.prevVehiclePos.get(v.id);
-    const moved = !prev ||
-      Math.abs(v.lat - prev.lat) > RECHECK_THRESHOLD ||
-      Math.abs(v.lng - prev.lng) > RECHECK_THRESHOLD;
+    let group: string | undefined;
 
-    if (moved) {
-      const group = this.resolveVehicleGroup(v.lat, v.lng);
-      this.vehicleGroupCache.set(v.id, group);
-      this.prevVehiclePos.set(v.id, { lat: v.lat, lng: v.lng });
+    // Use pre-populated laneGroupCache for O(1) road group lookup when currentLaneId is available
+    if (v.currentLaneId !== null && v.currentLaneId !== undefined) {
+      group = this.laneGroupCache.get(v.currentLaneId);
     }
 
-    const group = this.vehicleGroupCache.get(v.id) ?? 'residential';
+    if (group === undefined) {
+      const prev  = this.prevVehiclePos.get(v.id);
+      const moved = !prev ||
+        Math.abs(v.lat - prev.lat) > RECHECK_THRESHOLD ||
+        Math.abs(v.lng - prev.lng) > RECHECK_THRESHOLD;
+
+      if (moved) {
+        group = this.resolveVehicleGroup(v.lat, v.lng);
+        this.vehicleGroupCache.set(v.id, group);
+        this.prevVehiclePos.set(v.id, { lat: v.lat, lng: v.lng });
+      } else {
+        group = this.vehicleGroupCache.get(v.id) ?? 'residential';
+      }
+    }
+
     return this.hiddenGroups.has(group);
   }
 
@@ -456,7 +475,7 @@ export class VehicleRenderer {
     this.rectPools.clear();
     this.activeRects.clear();
     this.activeRectTypes.clear();
-    this.smoothState.clear();
+    this.laneGroupCache.clear();
     this.prevOnConnector.clear();
   }
 }
