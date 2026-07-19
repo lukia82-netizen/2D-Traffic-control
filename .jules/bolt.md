@@ -1,0 +1,3 @@
+## 2025-03-02 - O(1) Road-Group Filtering and Hoisted Rendering Bounds
+**Learning:** In high-frequency rendering loops, O(N) or O(E) spatial searches (like searching all map edges to filter visible road groups per vehicle) cause heavy CPU overhead. Pre-mapping lane IDs to their corresponding road groups (`laneGroupCache`) enables O(1) checks during per-frame vehicle state evaluation.
+**Action:** Always pre-compute mappings during map initialization or when the index changes, enabling O(1) checks during the per-frame loops, and hoist bounds getter operations outside of per-entity iteration blocks to avoid redundant function calls.
