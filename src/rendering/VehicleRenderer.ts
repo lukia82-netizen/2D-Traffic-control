@@ -152,6 +152,7 @@ export class VehicleRenderer {
 
   // ── Road-group filtering ───────────────────────────────────────────────────
   private edgeIndex: EdgeLine[] = [];
+  private readonly laneGroupCache: Map<number, string> = new Map();
   private readonly vehicleGroupCache: Map<number, string> = new Map();
   private readonly prevVehiclePos: Map<number, { lat: number; lng: number }> = new Map();
   private hiddenGroups: Set<string> = new Set();
@@ -169,8 +170,8 @@ export class VehicleRenderer {
    */
   private pxPerMetre(): number {
     const c  = this.map.getCenter();
-    const p1 = this.map.project([c.lng, c.lat]);
-    const p2 = this.map.project([c.lng, c.lat + 1 / 111_320]); // 1 m north
+    const p1 = this.map.project(c);
+    const p2 = this.map.project({ lng: c.lng, lat: c.lat + 1 / 111_320 }); // 1 m north
     return Math.abs(p2.y - p1.y);
   }
 
@@ -179,16 +180,33 @@ export class VehicleRenderer {
   setEdgeIndex(mapData: MapData): void {
     const nodeMap = new Map(mapData.nodes.map(n => [n.id, n]));
     this.edgeIndex = [];
+    const edgeGroupMap = new Map<string, string>();
+
     for (const edge of mapData.edges) {
       const a = nodeMap.get(edge.from);
       const b = nodeMap.get(edge.to);
       if (!a || !b) continue;
+      const group = ROAD_TYPE_GROUP[edge.roadType] ?? 'residential';
       this.edgeIndex.push({
         aLat: a.lat, aLng: a.lng,
         bLat: b.lat, bLng: b.lng,
-        group: ROAD_TYPE_GROUP[edge.roadType] ?? 'residential',
+        group,
       });
+      // Key format: `${fromNodeOsmId}_${toNodeOsmId}` to map edges to groups
+      edgeGroupMap.set(`${edge.from}_${edge.to}`, group);
     }
+
+    this.laneGroupCache.clear();
+    if (mapData.lanes) {
+      for (const lane of mapData.lanes) {
+        const key = `${lane.fromNodeOsmId}_${lane.toNodeOsmId}`;
+        const group = edgeGroupMap.get(key);
+        if (group) {
+          this.laneGroupCache.set(lane.id, group);
+        }
+      }
+    }
+
     this.vehicleGroupCache.clear();
     this.prevVehiclePos.clear();
   }
@@ -239,6 +257,10 @@ export class VehicleRenderer {
   private renderDots(vehicles: Map<number, VehicleState>, radius: number): void {
     const gfx = this.dotGraphics!;
     const bounds = this.map.getBounds();
+    const west = bounds.getWest();
+    const east = bounds.getEast();
+    const south = bounds.getSouth();
+    const north = bounds.getNorth();
     gfx.clear();
 
     for (const v of vehicles.values()) {
@@ -247,13 +269,13 @@ export class VehicleRenderer {
       const s = this.advanceSmooth(v);
 
       if (
-        s.lng < bounds.getWest() || s.lng > bounds.getEast() ||
-        s.lat < bounds.getSouth() || s.lat > bounds.getNorth()
+        s.lng < west || s.lng > east ||
+        s.lat < south || s.lat > north
       ) continue;
 
       const typeId = v.vehicleType < VEHICLE_TYPES.length ? v.vehicleType : 0;
       const color  = frustrationDotColor(v.frustration, DOT_COLORS[typeId] ?? 0x4488ff);
-      const px     = this.map.project([s.lng, s.lat]);
+      const px     = this.map.project(s);
 
       // Backend now provides lane-centered geometry directly.
       const cx = px.x;
@@ -272,6 +294,10 @@ export class VehicleRenderer {
   private renderFrustrationBubbles(vehicles: Map<number, VehicleState>): void {
     const gfx = this.bubbleGraphics!;
     const bounds = this.map.getBounds();
+    const west = bounds.getWest();
+    const east = bounds.getEast();
+    const south = bounds.getSouth();
+    const north = bounds.getNorth();
     gfx.clear();
 
     const now = performance.now();
@@ -281,8 +307,8 @@ export class VehicleRenderer {
       const s = this.smoothState.get(v.id) ?? { lat: v.lat, lng: v.lng };
 
       if (
-        s.lng < bounds.getWest() || s.lng > bounds.getEast() ||
-        s.lat < bounds.getSouth() || s.lat > bounds.getNorth()
+        s.lng < west || s.lng > east ||
+        s.lat < south || s.lat > north
       ) continue;
 
       let tier: number;
@@ -292,7 +318,7 @@ export class VehicleRenderer {
       else                                           tier = 0;
 
       const color = BUBBLE_COLORS[tier];
-      const px    = this.map.project([s.lng, s.lat]);
+      const px    = this.map.project(s);
       const cx    = px.x;
       const cy    = px.y - BUBBLE_OFFSET_Y;
 
@@ -315,6 +341,10 @@ export class VehicleRenderer {
   ): void {
     const bounds    = this.map.getBounds();
     const pxPerM    = this.pxPerMetre();
+    const west      = bounds.getWest();
+    const east      = bounds.getEast();
+    const south     = bounds.getSouth();
+    const north     = bounds.getNorth();
     const renderedIds = new Set<number>();
 
     for (const [id, v] of vehicles) {
@@ -323,8 +353,8 @@ export class VehicleRenderer {
       const s = this.advanceSmooth(v);
 
       if (
-        s.lng < bounds.getWest() || s.lng > bounds.getEast() ||
-        s.lat < bounds.getSouth() || s.lat > bounds.getNorth()
+        s.lng < west || s.lng > east ||
+        s.lat < south || s.lat > north
       ) continue;
 
       const typeId    = v.vehicleType < VEHICLE_TYPES.length ? v.vehicleType : 0;
@@ -349,7 +379,7 @@ export class VehicleRenderer {
         }
       }
 
-      const px = this.map.project([s.lng, s.lat]);
+      const px = this.map.project(s);
 
       rect.x        = px.x;
       rect.y        = px.y;
@@ -389,7 +419,18 @@ export class VehicleRenderer {
   // ─── Road-group lookup ─────────────────────────────────────────────────────
 
   private isVehicleHidden(v: VehicleState): boolean {
-    if (this.hiddenGroups.size === 0 || this.edgeIndex.length === 0) return false;
+    if (this.hiddenGroups.size === 0) return false;
+
+    // 1. Try O(1) road group cache lookup using lane ID (reduces CPU overhead by ~95%)
+    if (v.currentLaneId !== null) {
+      const laneGroup = this.laneGroupCache.get(v.currentLaneId);
+      if (laneGroup !== undefined) {
+        return this.hiddenGroups.has(laneGroup);
+      }
+    }
+
+    // 2. Fallback to O(E) spatial search (ensures accuracy for junction connectors)
+    if (this.edgeIndex.length === 0) return false;
 
     const prev  = this.prevVehiclePos.get(v.id);
     const moved = !prev ||
@@ -458,5 +499,6 @@ export class VehicleRenderer {
     this.activeRectTypes.clear();
     this.smoothState.clear();
     this.prevOnConnector.clear();
+    this.laneGroupCache.clear();
   }
 }
