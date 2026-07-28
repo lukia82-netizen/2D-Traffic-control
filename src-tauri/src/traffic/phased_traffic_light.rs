@@ -604,7 +604,8 @@ mod tests {
     #[test]
     fn first_green_allows_opposing_straight_pair_only() {
         let layout = four_arm_layout();
-        let mut ph = PhasedVehicleLight::new(42, layout);
+        let graph = RoadGraph::new();
+        let mut ph = PhasedVehicleLight::new(42, layout, &graph, NodeIndex::new(0), false);
         ph.step_index = 0;
         ph.timer = 0.0;
         let e0 = EdgeIndex::new(0);
@@ -616,7 +617,8 @@ mod tests {
     #[test]
     fn manual_mode_does_not_advance_timer() {
         let layout = four_arm_layout();
-        let mut ph = PhasedVehicleLight::new(1, layout);
+        let graph = RoadGraph::new();
+        let mut ph = PhasedVehicleLight::new(1, layout, &graph, NodeIndex::new(0), false);
         ph.set_mode(LightControlMode::Manual);
         let idx_before = ph.step_index;
         let t_before = ph.timer;
@@ -628,12 +630,13 @@ mod tests {
     #[test]
     fn adaptive_mode_increases_time_remaining_for_go_step() {
         let layout = four_arm_layout();
-        let mut ph_auto = PhasedVehicleLight::new(3, layout.clone());
+        let graph = RoadGraph::new();
+        let mut ph_auto = PhasedVehicleLight::new(3, layout.clone(), &graph, NodeIndex::new(0), false);
         ph_auto.set_mode(LightControlMode::Auto);
         ph_auto.step_index = 0;
         ph_auto.timer = 0.0;
 
-        let mut ph_adapt = PhasedVehicleLight::new(3, layout);
+        let mut ph_adapt = PhasedVehicleLight::new(3, layout, &graph, NodeIndex::new(0), false);
         ph_adapt.set_mode(LightControlMode::Adaptive);
         ph_adapt.queue_count = 80;
         ph_adapt.step_index = 0;

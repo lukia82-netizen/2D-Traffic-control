@@ -393,7 +393,8 @@ mod tests {
             edge_to_arm.insert(*e, i as u8);
         }
         let layout = JunctionLayout { arms, edge_to_arm };
-        let mut tl = TrafficLight::new_vehicle_multiphase(7, layout);
+        let graph = RoadGraph::new();
+        let mut tl = TrafficLight::new_vehicle_multiphase(7, layout, &graph, NodeIndex::new(0), false);
         let start = match &tl.kind {
             TrafficLightKind::VehiclePhased(ph) => ph.step_index,
             _ => panic!("expected vehicle phased"),
