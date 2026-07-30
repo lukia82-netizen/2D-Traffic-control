@@ -153,6 +153,7 @@ export class VehicleRenderer {
   // ── Road-group filtering ───────────────────────────────────────────────────
   private edgeIndex: EdgeLine[] = [];
   private readonly vehicleGroupCache: Map<number, string> = new Map();
+  private readonly laneGroupCache: Map<number, string> = new Map();
   private readonly prevVehiclePos: Map<number, { lat: number; lng: number }> = new Map();
   private hiddenGroups: Set<string> = new Set();
 
@@ -179,16 +180,39 @@ export class VehicleRenderer {
   setEdgeIndex(mapData: MapData): void {
     const nodeMap = new Map(mapData.nodes.map(n => [n.id, n]));
     this.edgeIndex = [];
+
+    // Create an edge map keyed by node osm id pairs to quickly resolve edge road type / group
+    const edgeGroupMap = new Map<string, string>();
+
     for (const edge of mapData.edges) {
       const a = nodeMap.get(edge.from);
       const b = nodeMap.get(edge.to);
       if (!a || !b) continue;
+
+      const group = ROAD_TYPE_GROUP[edge.roadType] ?? 'residential';
       this.edgeIndex.push({
         aLat: a.lat, aLng: a.lng,
         bLat: b.lat, bLng: b.lng,
-        group: ROAD_TYPE_GROUP[edge.roadType] ?? 'residential',
+        group,
       });
+
+      // Map both directions or specific direction as nodes are unique OSM identifiers
+      edgeGroupMap.set(`${edge.from}_${edge.to}`, group);
     }
+
+    // Build lane ID to road-group mapping cache (O(1) lookups during render frames)
+    this.laneGroupCache.clear();
+    if (mapData.lanes) {
+      for (const lane of mapData.lanes) {
+        // Map lane to edge group using its fromNodeOsmId and toNodeOsmId
+        const key = `${lane.fromNodeOsmId}_${lane.toNodeOsmId}`;
+        const group = edgeGroupMap.get(key);
+        if (group) {
+          this.laneGroupCache.set(lane.id, group);
+        }
+      }
+    }
+
     this.vehicleGroupCache.clear();
     this.prevVehiclePos.clear();
   }
@@ -391,6 +415,14 @@ export class VehicleRenderer {
   private isVehicleHidden(v: VehicleState): boolean {
     if (this.hiddenGroups.size === 0 || this.edgeIndex.length === 0) return false;
 
+    // Fast O(1) road group lookup using vehicle's currentLaneId from precomputed cache
+    if (v.currentLaneId !== null) {
+      const cachedGroup = this.laneGroupCache.get(v.currentLaneId);
+      if (cachedGroup !== undefined) {
+        return this.hiddenGroups.has(cachedGroup);
+      }
+    }
+
     const prev  = this.prevVehiclePos.get(v.id);
     const moved = !prev ||
       Math.abs(v.lat - prev.lat) > RECHECK_THRESHOLD ||
@@ -458,5 +490,8 @@ export class VehicleRenderer {
     this.activeRectTypes.clear();
     this.smoothState.clear();
     this.prevOnConnector.clear();
+    this.laneGroupCache.clear();
+    this.vehicleGroupCache.clear();
+    this.prevVehiclePos.clear();
   }
 }
