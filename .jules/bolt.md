@@ -1,0 +1,3 @@
+## 2025-02-17 - [Optimizing Road-Group Spatial Searches with O(1) Lane Caching]
+**Learning:** In high-frequency rendering loops (e.g. 60 FPS in `VehicleRenderer.ts`), executing spatial searches ($O(E)$ point-to-segment distance computations for all map road edges) to check if a vehicle's road-group is hidden introduces major CPU bottlenecks. Pre-computing a direct map-data mapping of lane IDs to their parent road groups (`laneGroupCache`) enables a static $O(1)$ lookup using `currentLaneId` from `VehicleState`.
+**Action:** Keep the spatial lookup only as a fallback for cases where a vehicle's lane ID is unknown or cannot be resolved from static map data (e.g. on unmapped junctions), ensuring both correctness and high performance.

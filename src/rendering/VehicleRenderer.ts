@@ -154,6 +154,7 @@ export class VehicleRenderer {
   private edgeIndex: EdgeLine[] = [];
   private readonly vehicleGroupCache: Map<number, string> = new Map();
   private readonly prevVehiclePos: Map<number, { lat: number; lng: number }> = new Map();
+  private readonly laneGroupCache: Map<number, string> = new Map();
   private hiddenGroups: Set<string> = new Set();
 
 
@@ -179,16 +180,39 @@ export class VehicleRenderer {
   setEdgeIndex(mapData: MapData): void {
     const nodeMap = new Map(mapData.nodes.map(n => [n.id, n]));
     this.edgeIndex = [];
+
+    // Intermediate map of node pairs to road groups for O(1) lane group cache population
+    const edgeGroupMap = new Map<string, string>();
+
     for (const edge of mapData.edges) {
       const a = nodeMap.get(edge.from);
       const b = nodeMap.get(edge.to);
       if (!a || !b) continue;
+
+      const group = ROAD_TYPE_GROUP[edge.roadType] ?? 'residential';
       this.edgeIndex.push({
         aLat: a.lat, aLng: a.lng,
         bLat: b.lat, bLng: b.lng,
-        group: ROAD_TYPE_GROUP[edge.roadType] ?? 'residential',
+        group,
       });
+
+      // Map edge node OSM IDs to group
+      edgeGroupMap.set(`${edge.from}_${edge.to}`, group);
+      edgeGroupMap.set(`${edge.to}_${edge.from}`, group);
     }
+
+    // Populate O(1) road group cache (laneGroupCache) mapping lane IDs to road groups
+    this.laneGroupCache.clear();
+    if (mapData.lanes) {
+      for (const lane of mapData.lanes) {
+        const key = `${lane.fromNodeOsmId}_${lane.toNodeOsmId}`;
+        const group = edgeGroupMap.get(key);
+        if (group) {
+          this.laneGroupCache.set(lane.id, group);
+        }
+      }
+    }
+
     this.vehicleGroupCache.clear();
     this.prevVehiclePos.clear();
   }
@@ -391,19 +415,29 @@ export class VehicleRenderer {
   private isVehicleHidden(v: VehicleState): boolean {
     if (this.hiddenGroups.size === 0 || this.edgeIndex.length === 0) return false;
 
-    const prev  = this.prevVehiclePos.get(v.id);
-    const moved = !prev ||
-      Math.abs(v.lat - prev.lat) > RECHECK_THRESHOLD ||
-      Math.abs(v.lng - prev.lng) > RECHECK_THRESHOLD;
+    let group: string | undefined;
 
-    if (moved) {
-      const group = this.resolveVehicleGroup(v.lat, v.lng);
-      this.vehicleGroupCache.set(v.id, group);
-      this.prevVehiclePos.set(v.id, { lat: v.lat, lng: v.lng });
+    if (v.currentLaneId !== null) {
+      group = this.laneGroupCache.get(v.currentLaneId);
     }
 
-    const group = this.vehicleGroupCache.get(v.id) ?? 'residential';
-    return this.hiddenGroups.has(group);
+    if (group === undefined) {
+      const prev  = this.prevVehiclePos.get(v.id);
+      const moved = !prev ||
+        Math.abs(v.lat - prev.lat) > RECHECK_THRESHOLD ||
+        Math.abs(v.lng - prev.lng) > RECHECK_THRESHOLD;
+
+      if (moved) {
+        group = this.resolveVehicleGroup(v.lat, v.lng);
+        this.vehicleGroupCache.set(v.id, group);
+        this.prevVehiclePos.set(v.id, { lat: v.lat, lng: v.lng });
+      } else {
+        group = this.vehicleGroupCache.get(v.id);
+      }
+    }
+
+    const finalGroup = group ?? 'residential';
+    return this.hiddenGroups.has(finalGroup);
   }
 
   private resolveVehicleGroup(lat: number, lng: number): string {
@@ -458,5 +492,9 @@ export class VehicleRenderer {
     this.activeRectTypes.clear();
     this.smoothState.clear();
     this.prevOnConnector.clear();
+    this.vehicleGroupCache.clear();
+    this.prevVehiclePos.clear();
+    this.laneGroupCache.clear();
+    this.edgeIndex = [];
   }
 }
