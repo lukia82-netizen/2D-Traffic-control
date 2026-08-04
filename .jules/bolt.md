@@ -1,0 +1,3 @@
+## 2025-03-05 - [Vehicle Road-Group Spatial Search Bypass]
+**Learning:** Checking whether vehicles were on a hidden road group was running an expensive O(E) spatial segment distance loop over all edges every time a vehicle moved. Since vehicles already have a `currentLaneId`, we can map lane IDs to road groups statically on map load, converting the O(E) spatial query into an O(1) map lookup.
+**Action:** Always check if dynamic entity states already carry stable references/identifiers that can be pre-mapped to static layout attributes, bypassing spatial search structures completely in high-frequency rendering loops.
