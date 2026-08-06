@@ -92,10 +92,28 @@ export class InfraRenderer {
     const h = this.overlay.height;
     const gfx = new PIXI.Graphics();
 
+    const bounds = this.map.getBounds();
+    const padLng = (bounds.getEast() - bounds.getWest()) * 0.05;
+    const padLat = (bounds.getNorth() - bounds.getSouth()) * 0.05;
+    const west = bounds.getWest() - padLng;
+    const east = bounds.getEast() + padLng;
+    const south = bounds.getSouth() - padLat;
+    const north = bounds.getNorth() + padLat;
+
     for (const edge of mapData.edges) {
       const fromNode = this.nodeMap.get(edge.from);
       const toNode   = this.nodeMap.get(edge.to);
       if (!fromNode || !toNode) continue;
+
+      // Viewport culling check
+      const minLng = Math.min(fromNode.lng, toNode.lng);
+      const maxLng = Math.max(fromNode.lng, toNode.lng);
+      const minLat = Math.min(fromNode.lat, toNode.lat);
+      const maxLat = Math.max(fromNode.lat, toNode.lat);
+
+      if (maxLng < west || minLng > east || maxLat < south || minLat > north) {
+        continue;
+      }
 
       const fromPx = projectPoint(this.map, fromNode.lng, fromNode.lat);
       const toPx   = projectPoint(this.map, toNode.lng,   toNode.lat);
@@ -180,12 +198,30 @@ export class InfraRenderer {
     const spacing = this.camera.getArrowSpacing();
     const sz      = this.camera.getArrowSize();
 
+    const bounds = this.map.getBounds();
+    const padLng = (bounds.getEast() - bounds.getWest()) * 0.05;
+    const padLat = (bounds.getNorth() - bounds.getSouth()) * 0.05;
+    const west = bounds.getWest() - padLng;
+    const east = bounds.getEast() + padLng;
+    const south = bounds.getSouth() - padLat;
+    const north = bounds.getNorth() + padLat;
+
     for (const edge of mapData.edges) {
       if (!edge.oneway) continue;
 
       const fromNode = this.nodeMap.get(edge.from);
       const toNode   = this.nodeMap.get(edge.to);
       if (!fromNode || !toNode) continue;
+
+      // Viewport culling check
+      const minLng = Math.min(fromNode.lng, toNode.lng);
+      const maxLng = Math.max(fromNode.lng, toNode.lng);
+      const minLat = Math.min(fromNode.lat, toNode.lat);
+      const maxLat = Math.max(fromNode.lat, toNode.lat);
+
+      if (maxLng < west || minLng > east || maxLat < south || minLat > north) {
+        continue;
+      }
 
       const from = projectPoint(this.map, fromNode.lng, fromNode.lat);
       const to   = projectPoint(this.map, toNode.lng,   toNode.lat);
@@ -230,12 +266,30 @@ export class InfraRenderer {
     const h = this.overlay.height;
     const gfx = new PIXI.Graphics();
 
+    const bounds = this.map.getBounds();
+    const padLng = (bounds.getEast() - bounds.getWest()) * 0.05;
+    const padLat = (bounds.getNorth() - bounds.getSouth()) * 0.05;
+    const west = bounds.getWest() - padLng;
+    const east = bounds.getEast() + padLng;
+    const south = bounds.getSouth() - padLat;
+    const north = bounds.getNorth() + padLat;
+
     for (const edge of mapData.edges) {
       if (edge.infraType !== 'tunnel') continue;
 
       const fromNode = this.nodeMap.get(edge.from);
       const toNode   = this.nodeMap.get(edge.to);
       if (!fromNode || !toNode) continue;
+
+      // Viewport culling check
+      const minLng = Math.min(fromNode.lng, toNode.lng);
+      const maxLng = Math.max(fromNode.lng, toNode.lng);
+      const minLat = Math.min(fromNode.lat, toNode.lat);
+      const maxLat = Math.max(fromNode.lat, toNode.lat);
+
+      if (maxLng < west || minLng > east || maxLat < south || minLat > north) {
+        continue;
+      }
 
       const fromPx = projectPoint(this.map, fromNode.lng, fromNode.lat);
       const toPx   = projectPoint(this.map, toNode.lng,   toNode.lat);
@@ -286,6 +340,14 @@ export class InfraRenderer {
 
     const sz = Math.max(5, this.camera.getArrowSize() * 0.8);
 
+    const bounds = this.map.getBounds();
+    const padLng = (bounds.getEast() - bounds.getWest()) * 0.05;
+    const padLat = (bounds.getNorth() - bounds.getSouth()) * 0.05;
+    const west = bounds.getWest() - padLng;
+    const east = bounds.getEast() + padLng;
+    const south = bounds.getSouth() - padLat;
+    const north = bounds.getNorth() + padLat;
+
     for (const edge of mapData.edges) {
       // Only draw arrows on edges that lead into a meaningful intersection
       if (!this.intersectionNodeIds.has(edge.to)) continue;
@@ -294,6 +356,16 @@ export class InfraRenderer {
       const fromNode = this.nodeMap.get(edge.from);
       const toNode   = this.nodeMap.get(edge.to);
       if (!fromNode || !toNode) continue;
+
+      // Viewport culling check
+      const minLng = Math.min(fromNode.lng, toNode.lng);
+      const maxLng = Math.max(fromNode.lng, toNode.lng);
+      const minLat = Math.min(fromNode.lat, toNode.lat);
+      const maxLat = Math.max(fromNode.lat, toNode.lat);
+
+      if (maxLng < west || minLng > east || maxLat < south || minLat > north) {
+        continue;
+      }
 
       const from = projectPoint(this.map, fromNode.lng, fromNode.lat);
       const to   = projectPoint(this.map, toNode.lng,   toNode.lat);

@@ -49,8 +49,32 @@ export class BuildingRenderer {
 
     if (!mapData.buildings || mapData.buildings.length === 0) return;
 
+    // O(1) viewport bounding box culling to avoid projecting off-screen buildings (reduces rendering overhead)
+    const bounds = this.map.getBounds();
+    const padLng = (bounds.getEast() - bounds.getWest()) * 0.05;
+    const padLat = (bounds.getNorth() - bounds.getSouth()) * 0.05;
+    const west = bounds.getWest() - padLng;
+    const east = bounds.getEast() + padLng;
+    const south = bounds.getSouth() - padLat;
+    const north = bounds.getNorth() + padLat;
+
     for (const building of mapData.buildings) {
       if (building.polygon.length < 3) continue;
+
+      // Compute building bounding box for viewport culling
+      let minLat = Infinity, maxLat = -Infinity;
+      let minLng = Infinity, maxLng = -Infinity;
+      for (const [lat, lng] of building.polygon) {
+        if (lat < minLat) minLat = lat;
+        if (lat > maxLat) maxLat = lat;
+        if (lng < minLng) minLng = lng;
+        if (lng > maxLng) maxLng = lng;
+      }
+
+      // Check if building bounding box overlaps with padded viewport bounds
+      if (maxLng < west || minLng > east || maxLat < south || minLat > north) {
+        continue;
+      }
 
       // Project each vertex [lat, lng] → screen {x, y}
       const pts: number[] = [];
