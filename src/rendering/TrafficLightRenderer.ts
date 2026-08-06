@@ -260,8 +260,30 @@ export class TrafficLightRenderer {
     const staticGfx = new PIXI.Graphics(); // shared batch for stop lines + zebras
     this.overlay.trafficLights.addChild(staticGfx);
 
+    // O(1) viewport culling on intersections to avoid rendering off-screen traffic signals
+    const bounds = this.map.getBounds();
+    const padLng = (bounds.getEast() - bounds.getWest()) * 0.1;
+    const padLat = (bounds.getNorth() - bounds.getSouth()) * 0.1;
+    const west = bounds.getWest() - padLng;
+    const east = bounds.getEast() + padLng;
+    const south = bounds.getSouth() - padLat;
+    const north = bounds.getNorth() + padLat;
+
+    // Fast O(1) Set of visible intersection node IDs to avoid off-screen approach projection and sprite allocation.
+    const visibleNodeIds = new Set<number>();
     for (const ap of this.approaches) {
       if (this.hiddenNodeIds.has(ap.nodeId)) continue;
+      if (visibleNodeIds.has(ap.nodeId)) continue;
+
+      const lng = ap.toLng;
+      const lat = ap.toLat;
+      if (lng >= west && lng <= east && lat >= south && lat <= north) {
+        visibleNodeIds.add(ap.nodeId);
+      }
+    }
+
+    for (const ap of this.approaches) {
+      if (!visibleNodeIds.has(ap.nodeId)) continue;
 
       const arms = this.junctionArmSignals.get(ap.nodeId);
       const phase =
