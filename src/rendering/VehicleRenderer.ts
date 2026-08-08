@@ -153,8 +153,10 @@ export class VehicleRenderer {
   // ── Road-group filtering ───────────────────────────────────────────────────
   private edgeIndex: EdgeLine[] = [];
   private readonly vehicleGroupCache: Map<number, string> = new Map();
+  private readonly laneGroupCache: Map<number, string> = new Map();
   private readonly prevVehiclePos: Map<number, { lat: number; lng: number }> = new Map();
   private hiddenGroups: Set<string> = new Set();
+  private readonly renderedIds: Set<number> = new Set();
 
 
   constructor(overlay: PixiOverlay, map: maplibregl.Map, camera: CameraManager) {
@@ -179,16 +181,35 @@ export class VehicleRenderer {
   setEdgeIndex(mapData: MapData): void {
     const nodeMap = new Map(mapData.nodes.map(n => [n.id, n]));
     this.edgeIndex = [];
+
+    // Map of edge node pairs (from_to) to their respective road group
+    const edgeGroupMap = new Map<string, string>();
+
     for (const edge of mapData.edges) {
       const a = nodeMap.get(edge.from);
       const b = nodeMap.get(edge.to);
       if (!a || !b) continue;
+      const group = ROAD_TYPE_GROUP[edge.roadType] ?? 'residential';
       this.edgeIndex.push({
         aLat: a.lat, aLng: a.lng,
         bLat: b.lat, bLng: b.lng,
-        group: ROAD_TYPE_GROUP[edge.roadType] ?? 'residential',
+        group,
       });
+      edgeGroupMap.set(`${edge.from}_${edge.to}`, group);
     }
+
+    // Clear and populate lane group cache for O(1) road group lookup from lane ID
+    this.laneGroupCache.clear();
+    if (mapData.lanes) {
+      for (const lane of mapData.lanes) {
+        const key = `${lane.fromNodeOsmId}_${lane.toNodeOsmId}`;
+        const group = edgeGroupMap.get(key);
+        if (group) {
+          this.laneGroupCache.set(lane.id, group);
+        }
+      }
+    }
+
     this.vehicleGroupCache.clear();
     this.prevVehiclePos.clear();
   }
@@ -315,7 +336,7 @@ export class VehicleRenderer {
   ): void {
     const bounds    = this.map.getBounds();
     const pxPerM    = this.pxPerMetre();
-    const renderedIds = new Set<number>();
+    this.renderedIds.clear();
 
     for (const [id, v] of vehicles) {
       if (this.isVehicleHidden(v)) continue;
@@ -362,12 +383,12 @@ export class VehicleRenderer {
       rect.alpha   = isTunnel ? TUNNEL_ALPHA : 1;
       rect.visible = true;
 
-      renderedIds.add(id);
+      this.renderedIds.add(id);
     }
 
     // Return sprites for vehicles that left the viewport or were despawned
     for (const [id, rect] of this.activeRects) {
-      if (!renderedIds.has(id)) {
+      if (!this.renderedIds.has(id)) {
         rect.visible = false;
         this.releaseRect(id, rect);
         this.activeRects.delete(id);
@@ -390,6 +411,14 @@ export class VehicleRenderer {
 
   private isVehicleHidden(v: VehicleState): boolean {
     if (this.hiddenGroups.size === 0 || this.edgeIndex.length === 0) return false;
+
+    // Fast O(1) road group lookup if currentLaneId is available
+    if (v.currentLaneId !== null && v.currentLaneId !== undefined) {
+      const cachedGroup = this.laneGroupCache.get(v.currentLaneId);
+      if (cachedGroup !== undefined) {
+        return this.hiddenGroups.has(cachedGroup);
+      }
+    }
 
     const prev  = this.prevVehiclePos.get(v.id);
     const moved = !prev ||
@@ -458,5 +487,7 @@ export class VehicleRenderer {
     this.activeRectTypes.clear();
     this.smoothState.clear();
     this.prevOnConnector.clear();
+    this.laneGroupCache.clear();
+    this.renderedIds.clear();
   }
 }
