@@ -198,7 +198,22 @@ export class RoadRenderer {
     const zoomScale = Math.pow(2, this.camera.zoom - 16);
     const casingColor = this.osmMode ? 0x888888 : 0x111111;
 
-    // ── Step 1: project visible edges ─────────────────────────────────────
+    // ── Step 1: project visible edges with viewport bounding box culling ──
+    const bounds = this.map.getBounds();
+    const west = bounds.getWest();
+    const east = bounds.getEast();
+    const south = bounds.getSouth();
+    const north = bounds.getNorth();
+
+    // 10% coordinate padding to prevent clipping artifacts near the screen edge
+    const lngPadding = (east - west) * 0.10;
+    const latPadding = (north - south) * 0.10;
+
+    const paddedWest = west - lngPadding;
+    const paddedEast = east + lngPadding;
+    const paddedSouth = south - latPadding;
+    const paddedNorth = north + latPadding;
+
     const renderables: EdgeRenderable[] = [];
     for (const edge of this.sortedEdges) {
       const group = ROAD_TYPE_GROUP[edge.roadType] ?? 'residential';
@@ -207,6 +222,16 @@ export class RoadRenderer {
       const fromNode = this.nodeMap.get(edge.from);
       const toNode   = this.nodeMap.get(edge.to);
       if (!fromNode || !toNode) continue;
+
+      // Viewport bounding box culling: skip edges entirely outside the padded viewport bounds
+      const minLng = Math.min(fromNode.lng, toNode.lng);
+      const maxLng = Math.max(fromNode.lng, toNode.lng);
+      const minLat = Math.min(fromNode.lat, toNode.lat);
+      const maxLat = Math.max(fromNode.lat, toNode.lat);
+
+      if (maxLng < paddedWest || minLng > paddedEast || maxLat < paddedSouth || minLat > paddedNorth) {
+        continue;
+      }
 
       const from = projectPoint(this.map, fromNode.lng, fromNode.lat);
       const to   = projectPoint(this.map, toNode.lng,   toNode.lat);
