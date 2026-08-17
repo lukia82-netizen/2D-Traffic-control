@@ -1,0 +1,3 @@
+## 2026-08-17 - Hoist Map Bounds Getters & Eliminate Temporary Array Allocations in High-Frequency Loops
+**Learning:** Calling `map.getBounds().getWest()` (and east/south/north) or allocating temporary `[lng, lat]` arrays inside per-vehicle loops at 60 FPS creates thousands of redundant method calls and unnecessary Garbage Collection (GC) pressure per second. MapLibre's `project()` natively accepts `{ lng, lat }` objects (`LngLatLike`).
+**Action:** Always hoist boundary getter methods outside `for` loops in 60 FPS render passes, pass vehicle/state objects directly to `map.project()`, and reuse class-level `Set` instances.
