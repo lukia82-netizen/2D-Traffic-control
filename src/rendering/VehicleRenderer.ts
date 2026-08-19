@@ -146,6 +146,9 @@ export class VehicleRenderer {
   // ── Frustration bubbles ──────────────────────────────────────────────────────
   private bubbleGraphics: PIXI.Graphics | null = null;
 
+  // ── Reusable per-frame data structures (reduces GC allocations at 60 FPS) ──
+  private readonly renderedIds: Set<number> = new Set();
+
   // ── Raw state cache (direct Rust data, no smoothing) ─────────────────────────
   private readonly smoothState: Map<number, SmoothState> = new Map();
   private readonly prevOnConnector: Map<number, boolean> = new Map();
@@ -239,6 +242,11 @@ export class VehicleRenderer {
   private renderDots(vehicles: Map<number, VehicleState>, radius: number): void {
     const gfx = this.dotGraphics!;
     const bounds = this.map.getBounds();
+    // Hoist boundary calls outside of per-vehicle loop (~3000 calls/frame saved)
+    const west = bounds.getWest();
+    const east = bounds.getEast();
+    const south = bounds.getSouth();
+    const north = bounds.getNorth();
     gfx.clear();
 
     for (const v of vehicles.values()) {
@@ -247,8 +255,8 @@ export class VehicleRenderer {
       const s = this.advanceSmooth(v);
 
       if (
-        s.lng < bounds.getWest() || s.lng > bounds.getEast() ||
-        s.lat < bounds.getSouth() || s.lat > bounds.getNorth()
+        s.lng < west || s.lng > east ||
+        s.lat < south || s.lat > north
       ) continue;
 
       const typeId = v.vehicleType < VEHICLE_TYPES.length ? v.vehicleType : 0;
@@ -272,6 +280,11 @@ export class VehicleRenderer {
   private renderFrustrationBubbles(vehicles: Map<number, VehicleState>): void {
     const gfx = this.bubbleGraphics!;
     const bounds = this.map.getBounds();
+    // Hoist boundary calls outside of per-vehicle loop
+    const west = bounds.getWest();
+    const east = bounds.getEast();
+    const south = bounds.getSouth();
+    const north = bounds.getNorth();
     gfx.clear();
 
     const now = performance.now();
@@ -281,8 +294,8 @@ export class VehicleRenderer {
       const s = this.smoothState.get(v.id) ?? { lat: v.lat, lng: v.lng };
 
       if (
-        s.lng < bounds.getWest() || s.lng > bounds.getEast() ||
-        s.lat < bounds.getSouth() || s.lat > bounds.getNorth()
+        s.lng < west || s.lng > east ||
+        s.lat < south || s.lat > north
       ) continue;
 
       let tier: number;
@@ -314,8 +327,15 @@ export class VehicleRenderer {
     _spriteScale: number,
   ): void {
     const bounds    = this.map.getBounds();
+    // Hoist boundary calls outside of per-vehicle loop
+    const west      = bounds.getWest();
+    const east      = bounds.getEast();
+    const south     = bounds.getSouth();
+    const north     = bounds.getNorth();
     const pxPerM    = this.pxPerMetre();
-    const renderedIds = new Set<number>();
+
+    // Reuse class-level Set to eliminate GC allocations per frame at 60 FPS
+    this.renderedIds.clear();
 
     for (const [id, v] of vehicles) {
       if (this.isVehicleHidden(v)) continue;
@@ -323,8 +343,8 @@ export class VehicleRenderer {
       const s = this.advanceSmooth(v);
 
       if (
-        s.lng < bounds.getWest() || s.lng > bounds.getEast() ||
-        s.lat < bounds.getSouth() || s.lat > bounds.getNorth()
+        s.lng < west || s.lng > east ||
+        s.lat < south || s.lat > north
       ) continue;
 
       const typeId    = v.vehicleType < VEHICLE_TYPES.length ? v.vehicleType : 0;
@@ -362,12 +382,12 @@ export class VehicleRenderer {
       rect.alpha   = isTunnel ? TUNNEL_ALPHA : 1;
       rect.visible = true;
 
-      renderedIds.add(id);
+      this.renderedIds.add(id);
     }
 
     // Return sprites for vehicles that left the viewport or were despawned
     for (const [id, rect] of this.activeRects) {
-      if (!renderedIds.has(id)) {
+      if (!this.renderedIds.has(id)) {
         rect.visible = false;
         this.releaseRect(id, rect);
         this.activeRects.delete(id);
@@ -456,6 +476,7 @@ export class VehicleRenderer {
     this.rectPools.clear();
     this.activeRects.clear();
     this.activeRectTypes.clear();
+    this.renderedIds.clear();
     this.smoothState.clear();
     this.prevOnConnector.clear();
   }
