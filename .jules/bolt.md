@@ -1,0 +1,3 @@
+## 2026-08-20 - Hoist Map Bounds and Avoid Coordinate Array Allocations in VehicleRenderer Loops
+**Learning:** In MapLibre + PixiJS high-frequency rendering loops (e.g. 60 FPS across thousands of entities in `VehicleRenderer.ts`), repeated `map.getBounds().getWest/East/South/North()` calls and allocating temporary coordinate tuples `[lng, lat]` inside per-entity loops create unnecessary CPU overhead and GC pressure. MapLibre's `map.project()` natively accepts `{ lng, lat }` objects.
+**Action:** Always hoist map bounds getters outside per-entity rendering loops and pass coordinate objects directly to `map.project()` without constructing temporary tuple arrays.
