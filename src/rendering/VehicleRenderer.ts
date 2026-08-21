@@ -156,6 +156,8 @@ export class VehicleRenderer {
   private readonly prevVehiclePos: Map<number, { lat: number; lng: number }> = new Map();
   private hiddenGroups: Set<string> = new Set();
 
+  /** Reusable Set to track rendered vehicle IDs per frame, avoiding per-frame GC allocations. */
+  private readonly renderedIds: Set<number> = new Set();
 
   constructor(overlay: PixiOverlay, map: maplibregl.Map, camera: CameraManager) {
     this.overlay = overlay;
@@ -169,8 +171,9 @@ export class VehicleRenderer {
    */
   private pxPerMetre(): number {
     const c  = this.map.getCenter();
-    const p1 = this.map.project([c.lng, c.lat]);
-    const p2 = this.map.project([c.lng, c.lat + 1 / 111_320]); // 1 m north
+    // Pass LngLat directly to avoid temporary array allocation [c.lng, c.lat]
+    const p1 = this.map.project(c);
+    const p2 = this.map.project({ lng: c.lng, lat: c.lat + 1 / 111_320 }); // 1 m north
     return Math.abs(p2.y - p1.y);
   }
 
@@ -239,6 +242,11 @@ export class VehicleRenderer {
   private renderDots(vehicles: Map<number, VehicleState>, radius: number): void {
     const gfx = this.dotGraphics!;
     const bounds = this.map.getBounds();
+    // Hoist map bounds getters outside loop to avoid thousands of function calls per frame
+    const west = bounds.getWest();
+    const east = bounds.getEast();
+    const south = bounds.getSouth();
+    const north = bounds.getNorth();
     gfx.clear();
 
     for (const v of vehicles.values()) {
@@ -247,13 +255,14 @@ export class VehicleRenderer {
       const s = this.advanceSmooth(v);
 
       if (
-        s.lng < bounds.getWest() || s.lng > bounds.getEast() ||
-        s.lat < bounds.getSouth() || s.lat > bounds.getNorth()
+        s.lng < west || s.lng > east ||
+        s.lat < south || s.lat > north
       ) continue;
 
       const typeId = v.vehicleType < VEHICLE_TYPES.length ? v.vehicleType : 0;
       const color  = frustrationDotColor(v.frustration, DOT_COLORS[typeId] ?? 0x4488ff);
-      const px     = this.map.project([s.lng, s.lat]);
+      // Pass s directly to avoid temporary coordinate array allocations [s.lng, s.lat]
+      const px     = this.map.project(s);
 
       // Backend now provides lane-centered geometry directly.
       const cx = px.x;
@@ -272,6 +281,11 @@ export class VehicleRenderer {
   private renderFrustrationBubbles(vehicles: Map<number, VehicleState>): void {
     const gfx = this.bubbleGraphics!;
     const bounds = this.map.getBounds();
+    // Hoist map bounds getters outside loop to avoid thousands of function calls per frame
+    const west = bounds.getWest();
+    const east = bounds.getEast();
+    const south = bounds.getSouth();
+    const north = bounds.getNorth();
     gfx.clear();
 
     const now = performance.now();
@@ -281,8 +295,8 @@ export class VehicleRenderer {
       const s = this.smoothState.get(v.id) ?? { lat: v.lat, lng: v.lng };
 
       if (
-        s.lng < bounds.getWest() || s.lng > bounds.getEast() ||
-        s.lat < bounds.getSouth() || s.lat > bounds.getNorth()
+        s.lng < west || s.lng > east ||
+        s.lat < south || s.lat > north
       ) continue;
 
       let tier: number;
@@ -292,7 +306,8 @@ export class VehicleRenderer {
       else                                           tier = 0;
 
       const color = BUBBLE_COLORS[tier];
-      const px    = this.map.project([s.lng, s.lat]);
+      // Pass s directly to avoid temporary coordinate array allocations [s.lng, s.lat]
+      const px    = this.map.project(s);
       const cx    = px.x;
       const cy    = px.y - BUBBLE_OFFSET_Y;
 
@@ -314,8 +329,16 @@ export class VehicleRenderer {
     _spriteScale: number,
   ): void {
     const bounds    = this.map.getBounds();
+    // Hoist map bounds getters outside loop to avoid thousands of function calls per frame
+    const west      = bounds.getWest();
+    const east      = bounds.getEast();
+    const south     = bounds.getSouth();
+    const north     = bounds.getNorth();
     const pxPerM    = this.pxPerMetre();
-    const renderedIds = new Set<number>();
+
+    // Reuse class-member Set to eliminate per-frame Set allocations at 60 FPS
+    const renderedIds = this.renderedIds;
+    renderedIds.clear();
 
     for (const [id, v] of vehicles) {
       if (this.isVehicleHidden(v)) continue;
@@ -323,8 +346,8 @@ export class VehicleRenderer {
       const s = this.advanceSmooth(v);
 
       if (
-        s.lng < bounds.getWest() || s.lng > bounds.getEast() ||
-        s.lat < bounds.getSouth() || s.lat > bounds.getNorth()
+        s.lng < west || s.lng > east ||
+        s.lat < south || s.lat > north
       ) continue;
 
       const typeId    = v.vehicleType < VEHICLE_TYPES.length ? v.vehicleType : 0;
@@ -349,7 +372,8 @@ export class VehicleRenderer {
         }
       }
 
-      const px = this.map.project([s.lng, s.lat]);
+      // Pass s directly to avoid temporary coordinate array allocations [s.lng, s.lat]
+      const px = this.map.project(s);
 
       rect.x        = px.x;
       rect.y        = px.y;
@@ -399,7 +423,12 @@ export class VehicleRenderer {
     if (moved) {
       const group = this.resolveVehicleGroup(v.lat, v.lng);
       this.vehicleGroupCache.set(v.id, group);
-      this.prevVehiclePos.set(v.id, { lat: v.lat, lng: v.lng });
+      if (prev) {
+        prev.lat = v.lat;
+        prev.lng = v.lng;
+      } else {
+        this.prevVehiclePos.set(v.id, { lat: v.lat, lng: v.lng });
+      }
     }
 
     const group = this.vehicleGroupCache.get(v.id) ?? 'residential';
@@ -458,5 +487,6 @@ export class VehicleRenderer {
     this.activeRectTypes.clear();
     this.smoothState.clear();
     this.prevOnConnector.clear();
+    this.renderedIds.clear();
   }
 }
