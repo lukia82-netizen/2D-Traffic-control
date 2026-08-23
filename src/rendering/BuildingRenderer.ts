@@ -49,8 +49,43 @@ export class BuildingRenderer {
 
     if (!mapData.buildings || mapData.buildings.length === 0) return;
 
+    // Viewport bounding box culling (10% margin padding)
+    // Avoids projecting coordinates and creating PixiJS geometry for off-screen buildings.
+    const bounds = this.map.getBounds();
+    const w = bounds.getWest();
+    const e = bounds.getEast();
+    const s = bounds.getSouth();
+    const n = bounds.getNorth();
+    const padLng = (e - w) * 0.1;
+    const padLat = (n - s) * 0.1;
+    const minLng = w - padLng;
+    const maxLng = e + padLng;
+    const minLat = s - padLat;
+    const maxLat = n + padLat;
+
     for (const building of mapData.buildings) {
       if (building.polygon.length < 3) continue;
+
+      // Quick bounding box check for polygon vertices
+      let bMinLng = Infinity;
+      let bMaxLng = -Infinity;
+      let bMinLat = Infinity;
+      let bMaxLat = -Infinity;
+
+      for (let i = 0; i < building.polygon.length; i++) {
+        const pt = building.polygon[i];
+        const lat = pt[0];
+        const lng = pt[1];
+        if (lng < bMinLng) bMinLng = lng;
+        if (lng > bMaxLng) bMaxLng = lng;
+        if (lat < bMinLat) bMinLat = lat;
+        if (lat > bMaxLat) bMaxLat = lat;
+      }
+
+      // Cull off-screen building footprint
+      if (bMaxLng < minLng || bMinLng > maxLng || bMaxLat < minLat || bMinLat > maxLat) {
+        continue;
+      }
 
       // Project each vertex [lat, lng] → screen {x, y}
       const pts: number[] = [];
