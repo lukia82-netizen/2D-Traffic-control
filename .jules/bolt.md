@@ -1,0 +1,3 @@
+## 2025-05-20 - Early Geographic Viewport Culling in TrafficLightRenderer
+**Learning:** Calling `map.project()` on every traffic light approach during map camera movement adds noticeable CPU projection overhead for off-screen approaches. Hoisting map bounds extraction and performing early AABB culling in geographical space eliminates projection and vector math overhead for off-screen traffic light approaches.
+**Action:** In map/Pixi overlay renderers that process lists of static or approach elements on camera render events, extract map bounds once per frame and cull elements in geographical space before projecting coordinates to screen space.

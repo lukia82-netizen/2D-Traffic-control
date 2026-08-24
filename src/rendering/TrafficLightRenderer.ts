@@ -260,8 +260,34 @@ export class TrafficLightRenderer {
     const staticGfx = new PIXI.Graphics(); // shared batch for stop lines + zebras
     this.overlay.trafficLights.addChild(staticGfx);
 
+    // Performance optimization: Extract map bounds once and cull off-screen approaches in geographical space
+    // before executing expensive map.project() calls and vector math on every camera frame.
+    const bounds = this.map.getBounds();
+    const west   = bounds.getWest();
+    const east   = bounds.getEast();
+    const south  = bounds.getSouth();
+    const north  = bounds.getNorth();
+
+    // 10% padding margin in geographic degrees ensures approach ends / signal heads don't pop abruptly
+    const padLng = Math.max(0.001, (east - west) * 0.1);
+    const padLat = Math.max(0.001, (north - south) * 0.1);
+    const minLng = west - padLng;
+    const maxLng = east + padLng;
+    const minLat = south - padLat;
+    const maxLat = north + padLat;
+
     for (const ap of this.approaches) {
       if (this.hiddenNodeIds.has(ap.nodeId)) continue;
+
+      // Early geographic bounding box culling check
+      const minApLng = ap.fromLng < ap.toLng ? ap.fromLng : ap.toLng;
+      const maxApLng = ap.fromLng > ap.toLng ? ap.fromLng : ap.toLng;
+      const minApLat = ap.fromLat < ap.toLat ? ap.fromLat : ap.toLat;
+      const maxApLat = ap.fromLat > ap.toLat ? ap.fromLat : ap.toLat;
+
+      if (maxApLng < minLng || minApLng > maxLng || maxApLat < minLat || minApLat > maxLat) {
+        continue;
+      }
 
       const arms = this.junctionArmSignals.get(ap.nodeId);
       const phase =
