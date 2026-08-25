@@ -1,0 +1,3 @@
+## 2025-02-21 - Hoist Map bounds getters & avoid temporary array allocations in 60 FPS vehicle rendering loop
+**Learning:** In high-frequency rendering loops (e.g. 60 FPS `VehicleRenderer.ts`), invoking `bounds.getWest()`, `bounds.getEast()`, `bounds.getSouth()`, `bounds.getNorth()` inside per-vehicle loops results in thousands of redundant function calls per frame. Additionally, constructing `[s.lng, s.lat]` arrays for `map.project()` causes thousands of short-lived allocations triggering GC pressure. `map.project()` natively accepts `{ lng, lat }` objects (`LngLatLike`).
+**Action:** Always hoist map boundary coordinate extractions outside per-entity iteration loops and pass `{ lng, lat }` objects directly to `map.project()`.
