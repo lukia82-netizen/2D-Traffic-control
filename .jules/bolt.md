@@ -1,0 +1,3 @@
+## 2026-05-10 - VehicleRenderer Per-Frame Allocations and Map Bounds Getter Calls
+**Learning:** In 60 FPS rendering loops over thousands of entities in `VehicleRenderer.ts`, calling map bounds getters (`bounds.getWest()`, etc.) inside per-vehicle loops generates 12k+ redundant method invocations per frame. Also, constructing `[s.lng, s.lat]` arrays for `map.project()` creates thousands of temporary objects per frame, triggering frequent GC pauses.
+**Action:** Always hoist map bounds getters outside entity loops and pass object positions (`{ lat, lng }`) directly to `map.project()` which natively accepts `LngLatLike` objects.
