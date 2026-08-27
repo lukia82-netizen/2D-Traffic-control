@@ -1,0 +1,3 @@
+## 2025-08-27 - Direct Object Passing for MapLibre `map.project`
+**Learning:** In MapLibre GL JS, passing `[s.lng, s.lat]` constructs temporary 2-element arrays on every iteration of 60 FPS rendering loops (e.g. `renderDots`, `renderFrustrationBubbles`, `renderSprites`), causing garbage collection pressure. Since state/coordinate objects already contain `lng` and `lat` properties matching MapLibre's `LngLatLike` interface, passing the coordinate object directly (`map.project(s)`) eliminates temporary array allocations per vehicle per frame.
+**Action:** Always check if coordinate objects (`{ lng, lat }`) can be passed directly to `map.project` or other spatial functions in rendering loops instead of constructing `[lng, lat]` tuple arrays.
