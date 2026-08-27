@@ -253,7 +253,8 @@ export class VehicleRenderer {
 
       const typeId = v.vehicleType < VEHICLE_TYPES.length ? v.vehicleType : 0;
       const color  = frustrationDotColor(v.frustration, DOT_COLORS[typeId] ?? 0x4488ff);
-      const px     = this.map.project([s.lng, s.lat]);
+      // Bolt: Pass 's' object directly to map.project to avoid temporary coordinate array allocation per vehicle per frame
+      const px     = this.map.project(s);
 
       // Backend now provides lane-centered geometry directly.
       const cx = px.x;
@@ -292,7 +293,8 @@ export class VehicleRenderer {
       else                                           tier = 0;
 
       const color = BUBBLE_COLORS[tier];
-      const px    = this.map.project([s.lng, s.lat]);
+      // Bolt: Pass 's' object directly to map.project to avoid temporary coordinate array allocation per vehicle per frame
+      const px    = this.map.project(s);
       const cx    = px.x;
       const cy    = px.y - BUBBLE_OFFSET_Y;
 
@@ -349,7 +351,8 @@ export class VehicleRenderer {
         }
       }
 
-      const px = this.map.project([s.lng, s.lat]);
+      // Bolt: Pass 's' object directly to map.project to avoid temporary coordinate array allocation per vehicle per frame
+      const px = this.map.project(s);
 
       rect.x        = px.x;
       rect.y        = px.y;
