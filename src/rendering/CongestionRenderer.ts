@@ -23,8 +23,7 @@ export class CongestionRenderer {
   private readonly map: maplibregl.Map;
   private readonly hudContainer: HTMLElement;
 
-  private congestionSprite: PIXI.Sprite | null = null;
-  private congestionTexture: PIXI.RenderTexture | null = null;
+  private gfx: PIXI.Graphics | null = null;
   private readonly edgeIndicators: Map<string, HTMLDivElement> = new Map();
 
   constructor(overlay: PixiOverlay, map: maplibregl.Map, hudContainer: HTMLElement) {
@@ -41,7 +40,16 @@ export class CongestionRenderer {
   ): void {
     const w = this.overlay.width;
     const h = this.overlay.height;
-    const gfx = new PIXI.Graphics();
+
+    // Use a persistent PIXI.Graphics object attached directly to congestionLayer.
+    // This avoids temporary PIXI.RenderTexture, PIXI.Graphics, and PIXI.Sprite allocations,
+    // as well as off-screen render passes and GPU texture churn during congestion updates (~500ms).
+    if (!this.gfx) {
+      this.gfx = new PIXI.Graphics();
+      this.overlay.congestionLayer.addChild(this.gfx);
+    }
+    const gfx = this.gfx;
+    gfx.clear();
 
     // Collect ids of congested edges for indicator cleanup
     const activeEdgeIds = new Set<string>();
@@ -91,20 +99,6 @@ export class CongestionRenderer {
       }
     }
 
-    // Render to texture
-    const rt = PIXI.RenderTexture.create({ width: w, height: h });
-    this.overlay.app.renderer.render({ container: gfx, target: rt });
-    gfx.destroy();
-
-    if (this.congestionTexture) this.congestionTexture.destroy(true);
-    this.congestionTexture = rt;
-
-    if (!this.congestionSprite) {
-      this.congestionSprite = new PIXI.Sprite(rt);
-      this.overlay.congestionLayer.addChild(this.congestionSprite);
-    } else {
-      this.congestionSprite.texture = rt;
-    }
   }
 
   // ─── Helpers ───────────────────────────────────────────────────────────────
@@ -171,7 +165,6 @@ export class CongestionRenderer {
   destroy(): void {
     for (const div of this.edgeIndicators.values()) div.remove();
     this.edgeIndicators.clear();
-    this.congestionSprite?.destroy();
-    this.congestionTexture?.destroy(true);
+    this.gfx?.destroy();
   }
 }
