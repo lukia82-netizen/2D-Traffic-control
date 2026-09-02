@@ -1,0 +1,3 @@
+## 2025-09-02 - Viewport Bounding Box Culling in BuildingRenderer
+**Learning:** In MapLibre + PixiJS overlay applications, projecting coordinates (`map.project`) and drawing graphics primitives for off-screen entities on camera pan/zoom is a major source of unnecessary CPU overhead. Pre-computing bounding boxes for complex structures (such as building footprints) and culling them against expanded map viewport bounds eliminates unnecessary projection calls and PixiJS shape generation.
+**Action:** Always precompute bounding boxes (`minLat`, `maxLat`, `minLng`, `maxLng`) when loading geospatial feature datasets, and perform viewport bounding box culling (with a 5-10% padding buffer) before projection in high-frequency camera change handlers.
