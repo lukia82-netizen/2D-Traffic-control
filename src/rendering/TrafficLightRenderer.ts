@@ -260,8 +260,25 @@ export class TrafficLightRenderer {
     const staticGfx = new PIXI.Graphics(); // shared batch for stop lines + zebras
     this.overlay.trafficLights.addChild(staticGfx);
 
+    // Viewport bounding box culling: skip off-screen traffic light approaches
+    const bounds = this.map.getBounds();
+    const pad = 0.002;
+    const west  = bounds.getWest() - pad;
+    const east  = bounds.getEast() + pad;
+    const south = bounds.getSouth() - pad;
+    const north = bounds.getNorth() + pad;
+
     for (const ap of this.approaches) {
       if (this.hiddenNodeIds.has(ap.nodeId)) continue;
+
+      const minLng = ap.fromLng < ap.toLng ? ap.fromLng : ap.toLng;
+      const maxLng = ap.fromLng > ap.toLng ? ap.fromLng : ap.toLng;
+      const minLat = ap.fromLat < ap.toLat ? ap.fromLat : ap.toLat;
+      const maxLat = ap.fromLat > ap.toLat ? ap.fromLat : ap.toLat;
+
+      if (maxLng < west || minLng > east || maxLat < south || minLat > north) {
+        continue;
+      }
 
       const arms = this.junctionArmSignals.get(ap.nodeId);
       const phase =

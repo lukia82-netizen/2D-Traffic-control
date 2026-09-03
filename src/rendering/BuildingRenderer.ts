@@ -1,6 +1,6 @@
 import * as PIXI from 'pixi.js';
 import maplibregl from 'maplibre-gl';
-import type { MapData } from '../bridge/commands';
+import type { MapData, BuildingData } from '../bridge/commands';
 import type { PixiOverlay } from './PixiOverlay';
 import { projectPoint } from '../map/MapLibreSetup';
 
@@ -8,6 +8,13 @@ import { projectPoint } from '../map/MapLibreSetup';
 const BUILDING_FILL    = 0x2d2d4e; // dark blue-gray fill
 const BUILDING_STROKE  = 0x4a4a70; // slightly lighter outline
 const BUILDING_ALPHA   = 0.92;
+
+interface BuildingBounds {
+  minLng: number;
+  maxLng: number;
+  minLat: number;
+  maxLat: number;
+}
 
 // ─── BuildingRenderer ─────────────────────────────────────────────────────────
 
@@ -20,6 +27,8 @@ export class BuildingRenderer {
   private readonly map: maplibregl.Map;
 
   private gfx: PIXI.Graphics | null = null;
+  // Cache precomputed building bounding boxes to avoid per-frame loop overhead
+  private readonly boundsCache = new WeakMap<BuildingData, BuildingBounds>();
 
   constructor(overlay: PixiOverlay, map: maplibregl.Map) {
     this.overlay = overlay;
@@ -49,8 +58,40 @@ export class BuildingRenderer {
 
     if (!mapData.buildings || mapData.buildings.length === 0) return;
 
+    // Viewport bounding box culling: skip off-screen buildings before expensive vertex projection
+    const bounds = this.map.getBounds();
+    const pad = 0.002; // ~200m margin to account for rotation/tilt and edge overlaps
+    const west  = bounds.getWest() - pad;
+    const east  = bounds.getEast() + pad;
+    const south = bounds.getSouth() - pad;
+    const north = bounds.getNorth() + pad;
+
     for (const building of mapData.buildings) {
       if (building.polygon.length < 3) continue;
+
+      let bBounds = this.boundsCache.get(building);
+      if (!bBounds) {
+        let minLat = Infinity, maxLat = -Infinity;
+        let minLng = Infinity, maxLng = -Infinity;
+        for (let i = 0; i < building.polygon.length; i++) {
+          const [lat, lng] = building.polygon[i];
+          if (lat < minLat) minLat = lat;
+          if (lat > maxLat) maxLat = lat;
+          if (lng < minLng) minLng = lng;
+          if (lng > maxLng) maxLng = lng;
+        }
+        bBounds = { minLat, maxLat, minLng, maxLng };
+        this.boundsCache.set(building, bBounds);
+      }
+
+      if (
+        bBounds.maxLng < west ||
+        bBounds.minLng > east ||
+        bBounds.maxLat < south ||
+        bBounds.minLat > north
+      ) {
+        continue;
+      }
 
       // Project each vertex [lat, lng] → screen {x, y}
       const pts: number[] = [];

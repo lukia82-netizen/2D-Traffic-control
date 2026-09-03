@@ -1,0 +1,3 @@
+## 2025-03-03 - Viewport Bounding Box Culling in PixiJS Map Renderers
+**Learning:** Map renderers (BuildingRenderer, RoadRenderer, TrafficLightRenderer) that project geographic coordinates on camera movement previously projected 100% of map elements (buildings, roads, traffic lights) regardless of camera zoom or visibility. Adding viewport bounding box culling (with ~200-300m coordinate padding) before calling `map.project` or creating PixiJS primitives avoids thousands of unnecessary coordinate transformations and geometry allocations when zoomed in.
+**Action:** Always check active map viewport bounds and perform coordinate bounding box checks prior to invoking MapLibre projection routines or creating canvas/PIXI elements.
