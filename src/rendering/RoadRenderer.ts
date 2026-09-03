@@ -198,6 +198,14 @@ export class RoadRenderer {
     const zoomScale = Math.pow(2, this.camera.zoom - 16);
     const casingColor = this.osmMode ? 0x888888 : 0x111111;
 
+    // Viewport bounding box culling: skip off-screen edges before expensive projection
+    const bounds = this.map.getBounds();
+    const pad = 0.003; // ~300m margin for thick road rendering & camera pitch
+    const west  = bounds.getWest() - pad;
+    const east  = bounds.getEast() + pad;
+    const south = bounds.getSouth() - pad;
+    const north = bounds.getNorth() + pad;
+
     // ── Step 1: project visible edges ─────────────────────────────────────
     const renderables: EdgeRenderable[] = [];
     for (const edge of this.sortedEdges) {
@@ -207,6 +215,15 @@ export class RoadRenderer {
       const fromNode = this.nodeMap.get(edge.from);
       const toNode   = this.nodeMap.get(edge.to);
       if (!fromNode || !toNode) continue;
+
+      const minLng = fromNode.lng < toNode.lng ? fromNode.lng : toNode.lng;
+      const maxLng = fromNode.lng > toNode.lng ? fromNode.lng : toNode.lng;
+      const minLat = fromNode.lat < toNode.lat ? fromNode.lat : toNode.lat;
+      const maxLat = fromNode.lat > toNode.lat ? fromNode.lat : toNode.lat;
+
+      if (maxLng < west || minLng > east || maxLat < south || minLat > north) {
+        continue;
+      }
 
       const from = projectPoint(this.map, fromNode.lng, fromNode.lat);
       const to   = projectPoint(this.map, toNode.lng,   toNode.lat);
