@@ -152,6 +152,7 @@ export class VehicleRenderer {
 
   // ── Road-group filtering ───────────────────────────────────────────────────
   private edgeIndex: EdgeLine[] = [];
+  private readonly laneGroupCache: Map<number, string> = new Map();
   private readonly vehicleGroupCache: Map<number, string> = new Map();
   private readonly prevVehiclePos: Map<number, { lat: number; lng: number }> = new Map();
   private hiddenGroups: Set<string> = new Set();
@@ -179,16 +180,35 @@ export class VehicleRenderer {
   setEdgeIndex(mapData: MapData): void {
     const nodeMap = new Map(mapData.nodes.map(n => [n.id, n]));
     this.edgeIndex = [];
+    this.laneGroupCache.clear();
+
+    // Map node pairs (fromNode, toNode) to road group for O(1) lane matching
+    const nodePairGroupMap = new Map<string, string>();
+
     for (const edge of mapData.edges) {
+      const group = ROAD_TYPE_GROUP[edge.roadType] ?? 'residential';
+      nodePairGroupMap.set(`${edge.from}_${edge.to}`, group);
+
       const a = nodeMap.get(edge.from);
       const b = nodeMap.get(edge.to);
       if (!a || !b) continue;
       this.edgeIndex.push({
         aLat: a.lat, aLng: a.lng,
         bLat: b.lat, bLng: b.lng,
-        group: ROAD_TYPE_GROUP[edge.roadType] ?? 'residential',
+        group,
       });
     }
+
+    // Populate O(1) lane ID to road group lookup cache
+    if (mapData.lanes) {
+      for (const lane of mapData.lanes) {
+        const group = nodePairGroupMap.get(`${lane.fromNodeOsmId}_${lane.toNodeOsmId}`);
+        if (group) {
+          this.laneGroupCache.set(lane.id, group);
+        }
+      }
+    }
+
     this.vehicleGroupCache.clear();
     this.prevVehiclePos.clear();
   }
@@ -389,7 +409,16 @@ export class VehicleRenderer {
   // ─── Road-group lookup ─────────────────────────────────────────────────────
 
   private isVehicleHidden(v: VehicleState): boolean {
-    if (this.hiddenGroups.size === 0 || this.edgeIndex.length === 0) return false;
+    if (this.hiddenGroups.size === 0) return false;
+
+    // Fast O(1) road-group lookup via laneGroupCache when lane-level data is available,
+    // avoiding expensive O(E) spatial searches (resolveVehicleGroup) every frame per vehicle.
+    if (v.currentLaneId != null && this.laneGroupCache.has(v.currentLaneId)) {
+      const group = this.laneGroupCache.get(v.currentLaneId)!;
+      return this.hiddenGroups.has(group);
+    }
+
+    if (this.edgeIndex.length === 0) return false;
 
     const prev  = this.prevVehiclePos.get(v.id);
     const moved = !prev ||
@@ -458,5 +487,6 @@ export class VehicleRenderer {
     this.activeRectTypes.clear();
     this.smoothState.clear();
     this.prevOnConnector.clear();
+    this.laneGroupCache.clear();
   }
 }
