@@ -1,0 +1,3 @@
+## 2025-05-18 - O(1) Lane-to-Road-Group Mapping in VehicleRenderer
+**Learning:** Checking road-group visibility per vehicle via spatial distance searches (`resolveVehicleGroup`) introduces $O(E)$ overhead per moving vehicle at 60 FPS. Leveraging `currentLaneId` in `VehicleState` mapped to pre-calculated `laneGroupCache` during map load converts this check to $O(1)$ time complexity, saving substantial CPU time when rendering thousands of vehicles.
+**Action:** When filtering entities by static map attributes in high-frequency render loops, pre-compute ID-to-attribute lookup maps during data setup rather than using spatial searches at runtime.
