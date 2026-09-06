@@ -198,6 +198,15 @@ export class RoadRenderer {
     const zoomScale = Math.pow(2, this.camera.zoom - 16);
     const casingColor = this.osmMode ? 0x888888 : 0x111111;
 
+    // Viewport bounding box culling: hoist bounds with 5% padding
+    const bounds = this.map.getBounds();
+    const padLng = (bounds.getEast() - bounds.getWest()) * 0.05;
+    const padLat = (bounds.getNorth() - bounds.getSouth()) * 0.05;
+    const west = bounds.getWest() - padLng;
+    const east = bounds.getEast() + padLng;
+    const south = bounds.getSouth() - padLat;
+    const north = bounds.getNorth() + padLat;
+
     // ── Step 1: project visible edges ─────────────────────────────────────
     const renderables: EdgeRenderable[] = [];
     for (const edge of this.sortedEdges) {
@@ -207,6 +216,16 @@ export class RoadRenderer {
       const fromNode = this.nodeMap.get(edge.from);
       const toNode   = this.nodeMap.get(edge.to);
       if (!fromNode || !toNode) continue;
+
+      // Skip edges whose endpoints are completely off-screen on the same side
+      if (
+        (fromNode.lng < west && toNode.lng < west) ||
+        (fromNode.lng > east && toNode.lng > east) ||
+        (fromNode.lat < south && toNode.lat < south) ||
+        (fromNode.lat > north && toNode.lat > north)
+      ) {
+        continue;
+      }
 
       const from = projectPoint(this.map, fromNode.lng, fromNode.lat);
       const to   = projectPoint(this.map, toNode.lng,   toNode.lat);
