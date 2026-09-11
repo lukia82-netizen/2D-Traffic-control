@@ -1,0 +1,3 @@
+## 2026-09-11 - Viewport bounding box culling for building footprint rendering
+**Learning:** In map-centric canvas/WebGL overlay renderers (like PixiJS + MapLibre), projecting geographical polygon coordinates (`[lng, lat]`) to screen space is expensive and dominated by matrix transformations in `map.project()`. Hoisting map bounds and filtering out entities using cached AABB (min/max lat/lng) bounding boxes with a 10% safety margin eliminates unnecessary projections and draw calls for off-screen entities on every camera move.
+**Action:** Always compute/cache AABB bounds for static map polygons and perform viewport culling outside projection loops on camera change events.
