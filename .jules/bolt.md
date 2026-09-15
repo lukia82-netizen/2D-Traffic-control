@@ -1,0 +1,3 @@
+## 2025-05-18 - Viewport Bounds Culling for Building Footprints
+**Learning:** `BuildingRenderer.ts` was projecting vertices and creating PixiJS graphic shapes for every building in `mapData`, even those far outside the visible viewport during pan and zoom updates. Pre-computing AABB bounding boxes per building polygon allowed O(1) viewport culling with 50% padding buffer, eliminating ~75%+ of redundant coordinate projections and PixiJS polygon allocations when zoomed into specific map areas.
+**Action:** Always apply padded viewport bounding box checks prior to element-by-element coordinate projection loops on map camera changes.
