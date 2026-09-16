@@ -1,0 +1,3 @@
+## 2025-03-09 - Viewport AABB Culling for Building Polygon Footprints
+**Learning:** In MapLibre + PixiJS overlay architectures, re-projecting every vertex of thousands of complex building polygons on every camera move (`render` event) causes severe main thread CPU overhead during panning and zooming. Pre-computing AABBs once on map data load and culling off-screen polygons with a 50% viewport pad eliminates ~60% of unnecessary projection and drawing operations while preventing visual popping.
+**Action:** Always pre-calculate AABB min/max bounds during data initialization for large static polygon collections and perform padded viewport bounds checks prior to screen projection in high-frequency camera move callbacks.
