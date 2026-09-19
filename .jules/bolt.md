@@ -1,0 +1,3 @@
+## 2025-05-18 - AABB Viewport Culling for Map Footprints
+**Learning:** Building footprints fetched from OSM require projecting every vertex coordinate via MapLibre's `projectPoint` and creating PixiJS graphics geometry on every camera move (`rebuildOnCameraChange`). In maps with many buildings, re-projecting off-screen building footprints during map panning/zooming adds substantial CPU overhead. Culling buildings using pre-computed AABB bounding boxes against an expanded viewport bounding box skips projection and graphics drawing for off-screen footprints.
+**Action:** Always pre-compute spatial AABBs for static polygon map data and apply viewport bounding-box culling with safety padding (e.g., 50%) during camera move re-renders.
