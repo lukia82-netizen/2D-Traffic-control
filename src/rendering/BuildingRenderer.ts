@@ -1,6 +1,6 @@
 import * as PIXI from 'pixi.js';
 import maplibregl from 'maplibre-gl';
-import type { MapData } from '../bridge/commands';
+import type { MapData, BuildingData } from '../bridge/commands';
 import type { PixiOverlay } from './PixiOverlay';
 import { projectPoint } from '../map/MapLibreSetup';
 
@@ -15,11 +15,33 @@ const BUILDING_ALPHA   = 0.92;
  * Draws building footprints fetched from OSM as filled PixiJS polygons.
  * Rebuilds every camera move so polygons stay aligned with the projection.
  */
+export interface BuildingBounds {
+  minLat: number;
+  maxLat: number;
+  minLng: number;
+  maxLng: number;
+}
+
+/** Computes the axis-aligned bounding box (AABB) in geographical coordinates for a building polygon. */
+export function computeBuildingBounds(polygon: [number, number][]): BuildingBounds {
+  let minLat = Infinity, maxLat = -Infinity;
+  let minLng = Infinity, maxLng = -Infinity;
+  for (const [lat, lng] of polygon) {
+    if (lat < minLat) minLat = lat;
+    if (lat > maxLat) maxLat = lat;
+    if (lng < minLng) minLng = lng;
+    if (lng > maxLng) maxLng = lng;
+  }
+  return { minLat, maxLat, minLng, maxLng };
+}
+
 export class BuildingRenderer {
   private readonly overlay: PixiOverlay;
   private readonly map: maplibregl.Map;
 
   private gfx: PIXI.Graphics | null = null;
+  /** Cached AABB bounds for each building polygon to enable fast viewport culling. */
+  private readonly buildingBounds = new Map<BuildingData, BuildingBounds>();
 
   constructor(overlay: PixiOverlay, map: maplibregl.Map) {
     this.overlay = overlay;
@@ -49,8 +71,42 @@ export class BuildingRenderer {
 
     if (!mapData.buildings || mapData.buildings.length === 0) return;
 
+    // Retrieve viewport bounds with 50% padding to prevent pop-in during fast panning
+    let viewMinLng = -Infinity, viewMaxLng = Infinity;
+    let viewMinLat = -Infinity, viewMaxLat = Infinity;
+    const bounds = this.map.getBounds?.();
+    if (bounds) {
+      const west = bounds.getWest();
+      const east = bounds.getEast();
+      const south = bounds.getSouth();
+      const north = bounds.getNorth();
+      const lngPad = Math.max((east - west) * 0.5, 0.001);
+      const latPad = Math.max((north - south) * 0.5, 0.001);
+      viewMinLng = west - lngPad;
+      viewMaxLng = east + lngPad;
+      viewMinLat = south - latPad;
+      viewMaxLat = north + latPad;
+    }
+
     for (const building of mapData.buildings) {
       if (building.polygon.length < 3) continue;
+
+      // Retrieve or compute cached building bounding box
+      let bbox = this.buildingBounds.get(building);
+      if (!bbox) {
+        bbox = computeBuildingBounds(building.polygon);
+        this.buildingBounds.set(building, bbox);
+      }
+
+      // Viewport culling check: skip buildings strictly outside padded viewport
+      if (
+        bbox.maxLng < viewMinLng ||
+        bbox.minLng > viewMaxLng ||
+        bbox.maxLat < viewMinLat ||
+        bbox.minLat > viewMaxLat
+      ) {
+        continue;
+      }
 
       // Project each vertex [lat, lng] → screen {x, y}
       const pts: number[] = [];
@@ -68,5 +124,6 @@ export class BuildingRenderer {
 
   destroy(): void {
     this.gfx?.destroy();
+    this.buildingBounds.clear();
   }
 }
