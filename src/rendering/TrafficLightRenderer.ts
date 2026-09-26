@@ -254,6 +254,14 @@ export class TrafficLightRenderer {
     const zoom = this.map.getZoom();
     if (zoom < MIN_ZOOM) return;
 
+    // Viewport bounds culling: skip approaches outside the visible map area
+    const bounds = this.map.getBounds();
+    const PAD = 0.0005; // ~50m padding to avoid popping at viewport edges
+    const minLng = bounds.getWest() - PAD;
+    const maxLng = bounds.getEast() + PAD;
+    const minLat = bounds.getSouth() - PAD;
+    const maxLat = bounds.getNorth() + PAD;
+
     const scale   = this.scaleForZoom(zoom);
     const hr      = HOUSING_R_REF * scale;
     const br      = BULB_R_REF * scale;
@@ -262,6 +270,13 @@ export class TrafficLightRenderer {
 
     for (const ap of this.approaches) {
       if (this.hiddenNodeIds.has(ap.nodeId)) continue;
+
+      // Fast line segment culling: if both endpoints are outside on the same side, skip
+      const bothWest  = ap.fromLng < minLng && ap.toLng < minLng;
+      const bothEast  = ap.fromLng > maxLng && ap.toLng > maxLng;
+      const bothSouth = ap.fromLat < minLat && ap.toLat < minLat;
+      const bothNorth = ap.fromLat > maxLat && ap.toLat > maxLat;
+      if (bothWest || bothEast || bothSouth || bothNorth) continue;
 
       const arms = this.junctionArmSignals.get(ap.nodeId);
       const phase =
