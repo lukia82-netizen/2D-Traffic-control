@@ -1,0 +1,3 @@
+## 2025-02-28 - Viewport Bounds Culling & AABB Caching in BuildingRenderer
+**Learning:** `BuildingRenderer.ts` re-projects all building polygon vertices using `projectPoint` on every camera movement (pan/zoom). Pre-calculating AABB bounding boxes (`minLat`, `maxLat`, `minLng`, `maxLng`) for each building polygon and checking them against 50%-padded viewport bounds avoids thousands of redundant MapLibre projections and PixiJS draw operations for off-screen buildings on camera updates.
+**Action:** Always pre-compute spatial bounding boxes for complex polygon geometries and apply viewport bounds culling with ~50% padding before vertex projection in high-frequency camera move handlers.
