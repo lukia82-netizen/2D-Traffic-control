@@ -1,0 +1,3 @@
+## 2025-05-18 - Spatial Viewport Culling in Approach Renderers
+**Learning:** Renderer loops that rebuild map overlays on camera moves (such as `TrafficLightRenderer`) iterate over all static map entities across the whole map. Extracting `map.getBounds()` once before the loop and performing AABB culling with a small padding margin avoids coordinate projection (`projectPoint`) and graphics object instantiation for 80-90%+ of off-screen nodes at typical simulation zoom levels.
+**Action:** When implementing or refactoring rendering layers that process static map elements on camera moves, always add viewport AABB culling with padding before invoking MapLibre projections and PixiJS node allocations.
