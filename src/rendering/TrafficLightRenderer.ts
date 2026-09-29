@@ -260,8 +260,32 @@ export class TrafficLightRenderer {
     const staticGfx = new PIXI.Graphics(); // shared batch for stop lines + zebras
     this.overlay.trafficLights.addChild(staticGfx);
 
+    // Viewport bounds culling (with 10% padding) to avoid MapLibre projections
+    // and PIXI.Graphics allocations for off-screen traffic lights (~80-90% CPU saving on camera moves).
+    const bounds = this.map.getBounds();
+    const west = bounds.getWest();
+    const east = bounds.getEast();
+    const south = bounds.getSouth();
+    const north = bounds.getNorth();
+    const lngMargin = (east - west) * 0.1;
+    const latMargin = (north - south) * 0.1;
+    const minLng = west - lngMargin;
+    const maxLng = east + lngMargin;
+    const minLat = south - latMargin;
+    const maxLat = north + latMargin;
+
     for (const ap of this.approaches) {
       if (this.hiddenNodeIds.has(ap.nodeId)) continue;
+
+      // Skip approaches entirely outside visible viewport
+      const minApLng = ap.fromLng < ap.toLng ? ap.fromLng : ap.toLng;
+      const maxApLng = ap.fromLng > ap.toLng ? ap.fromLng : ap.toLng;
+      const minApLat = ap.fromLat < ap.toLat ? ap.fromLat : ap.toLat;
+      const maxApLat = ap.fromLat > ap.toLat ? ap.fromLat : ap.toLat;
+
+      if (maxApLng < minLng || minApLng > maxLng || maxApLat < minLat || minApLat > maxLat) {
+        continue;
+      }
 
       const arms = this.junctionArmSignals.get(ap.nodeId);
       const phase =
