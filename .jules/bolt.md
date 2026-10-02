@@ -1,0 +1,3 @@
+## 2025-10-02 - Viewport Bounding Box Culling for Buildings
+**Learning:** In MapLibre + PixiJS overlay architectures, projecting geographic polygon coordinates (`projectPoint`) for off-screen elements during camera interaction events consumes significant CPU time. Pre-computing AABB geographic bounding boxes (`minLat`, `maxLat`, `minLng`, `maxLng`) per entity and filtering against viewport bounds (plus a 50% coordinate margin to prevent popping) avoids redundant projections and PixiJS shape operations.
+**Action:** Apply AABB geographic bounds culling with appropriate padding to all static map overlay renderers (e.g. buildings, complex road features) during camera transform events.
