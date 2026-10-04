@@ -198,6 +198,19 @@ export class RoadRenderer {
     const zoomScale = Math.pow(2, this.camera.zoom - 16);
     const casingColor = this.osmMode ? 0x888888 : 0x111111;
 
+    // Viewport bounds for culling off-screen road segments (5% padding margin)
+    const bounds = this.map.getBounds();
+    const west = bounds.getWest();
+    const east = bounds.getEast();
+    const south = bounds.getSouth();
+    const north = bounds.getNorth();
+    const lngPad = (east - west) * 0.05;
+    const latPad = (north - south) * 0.05;
+    const minLng = west - lngPad;
+    const maxLng = east + lngPad;
+    const minLat = south - latPad;
+    const maxLat = north + latPad;
+
     // ── Step 1: project visible edges ─────────────────────────────────────
     const renderables: EdgeRenderable[] = [];
     for (const edge of this.sortedEdges) {
@@ -207,6 +220,13 @@ export class RoadRenderer {
       const fromNode = this.nodeMap.get(edge.from);
       const toNode   = this.nodeMap.get(edge.to);
       if (!fromNode || !toNode) continue;
+
+      // Viewport culling: skip line segments entirely outside viewport bounds
+      const bothWest  = fromNode.lng < minLng && toNode.lng < minLng;
+      const bothEast  = fromNode.lng > maxLng && toNode.lng > maxLng;
+      const bothSouth = fromNode.lat < minLat && toNode.lat < minLat;
+      const bothNorth = fromNode.lat > maxLat && toNode.lat > maxLat;
+      if (bothWest || bothEast || bothSouth || bothNorth) continue;
 
       const from = projectPoint(this.map, fromNode.lng, fromNode.lat);
       const to   = projectPoint(this.map, toNode.lng,   toNode.lat);
@@ -238,14 +258,16 @@ export class RoadRenderer {
     }
 
     // ── Step 2: junction circles (max road width at each node) ────────────
+    // Reuse screen coordinates from step 1 instead of re-projecting nodes
     const junctionMap = new Map<number, JunctionCircle>();
     for (const r of renderables) {
-      for (const nodeId of [r.edge.from, r.edge.to]) {
-        const node = this.nodeMap.get(nodeId);
-        if (!node) continue;
+      const endpoints: [number, { x: number; y: number }][] = [
+        [r.edge.from, r.from],
+        [r.edge.to, r.to],
+      ];
+      for (const [nodeId, px] of endpoints) {
         const prev = junctionMap.get(nodeId);
         if (!prev || r.w > prev.w) {
-          const px = projectPoint(this.map, node.lng, node.lat);
           junctionMap.set(nodeId, {
             x: px.x,
             y: px.y,
