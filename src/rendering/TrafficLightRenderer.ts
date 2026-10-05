@@ -260,8 +260,28 @@ export class TrafficLightRenderer {
     const staticGfx = new PIXI.Graphics(); // shared batch for stop lines + zebras
     this.overlay.trafficLights.addChild(staticGfx);
 
+    // Viewport bounds culling with 10% margin padding to avoid projecting off-screen approaches
+    const bounds = this.map.getBounds();
+    const west  = bounds.getWest();
+    const east  = bounds.getEast();
+    const south = bounds.getSouth();
+    const north = bounds.getNorth();
+    const lngMargin = (east - west) * 0.1;
+    const latMargin = (north - south) * 0.1;
+    const minLng = west - lngMargin;
+    const maxLng = east + lngMargin;
+    const minLat = south - latMargin;
+    const maxLat = north + latMargin;
+
     for (const ap of this.approaches) {
       if (this.hiddenNodeIds.has(ap.nodeId)) continue;
+
+      // Skip approaches that are completely outside the padded viewport bounds
+      const bothWest  = ap.fromLng < minLng && ap.toLng < minLng;
+      const bothEast  = ap.fromLng > maxLng && ap.toLng > maxLng;
+      const bothSouth = ap.fromLat < minLat && ap.toLat < minLat;
+      const bothNorth = ap.fromLat > maxLat && ap.toLat > maxLat;
+      if (bothWest || bothEast || bothSouth || bothNorth) continue;
 
       const arms = this.junctionArmSignals.get(ap.nodeId);
       const phase =
