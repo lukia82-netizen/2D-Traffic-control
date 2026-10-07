@@ -1,0 +1,3 @@
+## 2025-02-23 - Viewport Bounds Culling for Building Polygons
+**Learning:** In map rendering engines with dense map layers (such as building footprints), every camera move triggers a complete redraw. Projecting geographic coordinates (`[lng, lat]`) to screen space using MapLibre's `project()` method and submitting polygon geometry to PixiJS for off-screen entities consumes significant CPU time and GC overhead. Caching AABB bounds in a `WeakMap` allows fast O(1) viewport intersection checks with a 20% margin, bypassing off-screen projections.
+**Action:** Always check high-frequency render passes for off-screen culling opportunities using cached geographic bounding boxes before calling projection or draw commands.
