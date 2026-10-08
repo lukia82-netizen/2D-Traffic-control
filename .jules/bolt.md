@@ -1,0 +1,3 @@
+## 2025-05-18 - BuildingRenderer Viewport Bounds Culling & AABB Caching
+**Learning:** `BuildingRenderer.ts` was projecting all building polygon vertices via `map.project` and generating PixiJS polygon geometry for all buildings on every camera move, even when 90%+ of buildings were off-screen. Caching building polygon AABBs with a `WeakMap` and applying 20% padded viewport bounds culling eliminates redundant vertex projections and geometry generation for off-screen buildings.
+**Action:** Always check if map renderers perform AABB viewport bounds culling with a small padding margin (10-20%) before projecting geographic coordinates.
