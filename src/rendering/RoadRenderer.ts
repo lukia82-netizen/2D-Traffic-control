@@ -238,23 +238,37 @@ export class RoadRenderer {
     }
 
     // ── Step 2: junction circles (max road width at each node) ────────────
+    // Performance optimization: Reuse already-projected screen points (r.from / r.to)
+    // rather than re-projecting nodes via projectPoint. This eliminates hundreds of
+    // redundant MapLibre coordinate projections per frame during pan/zoom.
     const junctionMap = new Map<number, JunctionCircle>();
     for (const r of renderables) {
-      for (const nodeId of [r.edge.from, r.edge.to]) {
-        const node = this.nodeMap.get(nodeId);
-        if (!node) continue;
-        const prev = junctionMap.get(nodeId);
-        if (!prev || r.w > prev.w) {
-          const px = projectPoint(this.map, node.lng, node.lat);
-          junctionMap.set(nodeId, {
-            x: px.x,
-            y: px.y,
-            w: r.w,
-            color: r.style.color,
-            alpha: r.alpha,
-            signalized: false,
-          });
-        }
+      // Process "from" node
+      const fromId = r.edge.from;
+      const prevFrom = junctionMap.get(fromId);
+      if (!prevFrom || r.w > prevFrom.w) {
+        junctionMap.set(fromId, {
+          x: r.from.x,
+          y: r.from.y,
+          w: r.w,
+          color: r.style.color,
+          alpha: r.alpha,
+          signalized: false,
+        });
+      }
+
+      // Process "to" node
+      const toId = r.edge.to;
+      const prevTo = junctionMap.get(toId);
+      if (!prevTo || r.w > prevTo.w) {
+        junctionMap.set(toId, {
+          x: r.to.x,
+          y: r.to.y,
+          w: r.w,
+          color: r.style.color,
+          alpha: r.alpha,
+          signalized: false,
+        });
       }
     }
     for (const [nodeId, j] of junctionMap) {
