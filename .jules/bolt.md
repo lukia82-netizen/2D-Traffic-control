@@ -1,0 +1,3 @@
+## 2025-05-20 - Viewport Bounds Culling & Projected Point Reuse in RoadRenderer
+**Learning:** During map movement (pan/zoom), `RoadRenderer` projected and built renderables for all map edges and re-projected junction nodes regardless of viewport visibility. Adding viewport bounding box culling (with 10% padding) and reusing projected screen points in junction pass eliminates off-screen coordinate projection and redundant PixiJS geometry allocations.
+**Action:** Always cull off-screen elements using map viewport bounds before executing `map.project` or `projectPoint` calls in PixiJS overlay renderers.
