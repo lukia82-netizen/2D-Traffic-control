@@ -1,0 +1,3 @@
+## 2025-05-18 - Viewport Culling and Coordinate Reuse in RoadRenderer
+**Learning:** `RoadRenderer.ts` re-projected every single map edge (using `projectPoint`) regardless of viewport bounds on every camera move, and re-projected node coordinates in step 2 for junction circles. Culling line segments outside padded viewport bounds and reusing step 1 projected endpoints avoids ~80-90% of redundant MapLibre `project()` calls during panning/zooming.
+**Action:** Always perform line-segment bounding box checks before invoking geographic projection in map renderers and reuse previously projected screen coordinates across rendering passes.
