@@ -155,6 +155,7 @@ export class VehicleRenderer {
   private readonly vehicleGroupCache: Map<number, string> = new Map();
   private readonly prevVehiclePos: Map<number, { lat: number; lng: number }> = new Map();
   private hiddenGroups: Set<string> = new Set();
+  private readonly renderedIds: Set<number> = new Set();
 
 
   constructor(overlay: PixiOverlay, map: maplibregl.Map, camera: CameraManager) {
@@ -239,6 +240,11 @@ export class VehicleRenderer {
   private renderDots(vehicles: Map<number, VehicleState>, radius: number): void {
     const gfx = this.dotGraphics!;
     const bounds = this.map.getBounds();
+    // Hoist map bounds getters outside the per-vehicle loop to avoid thousands of redundant calls per frame (~60 FPS hot path)
+    const west = bounds.getWest();
+    const east = bounds.getEast();
+    const south = bounds.getSouth();
+    const north = bounds.getNorth();
     gfx.clear();
 
     for (const v of vehicles.values()) {
@@ -246,10 +252,7 @@ export class VehicleRenderer {
 
       const s = this.advanceSmooth(v);
 
-      if (
-        s.lng < bounds.getWest() || s.lng > bounds.getEast() ||
-        s.lat < bounds.getSouth() || s.lat > bounds.getNorth()
-      ) continue;
+      if (s.lng < west || s.lng > east || s.lat < south || s.lat > north) continue;
 
       const typeId = v.vehicleType < VEHICLE_TYPES.length ? v.vehicleType : 0;
       const color  = frustrationDotColor(v.frustration, DOT_COLORS[typeId] ?? 0x4488ff);
@@ -272,6 +275,11 @@ export class VehicleRenderer {
   private renderFrustrationBubbles(vehicles: Map<number, VehicleState>): void {
     const gfx = this.bubbleGraphics!;
     const bounds = this.map.getBounds();
+    // Hoist map bounds getters outside the per-vehicle loop to avoid thousands of redundant calls per frame (~60 FPS hot path)
+    const west = bounds.getWest();
+    const east = bounds.getEast();
+    const south = bounds.getSouth();
+    const north = bounds.getNorth();
     gfx.clear();
 
     const now = performance.now();
@@ -280,10 +288,7 @@ export class VehicleRenderer {
 
       const s = this.smoothState.get(v.id) ?? { lat: v.lat, lng: v.lng };
 
-      if (
-        s.lng < bounds.getWest() || s.lng > bounds.getEast() ||
-        s.lat < bounds.getSouth() || s.lat > bounds.getNorth()
-      ) continue;
+      if (s.lng < west || s.lng > east || s.lat < south || s.lat > north) continue;
 
       let tier: number;
       if (v.frustration >= FRUSTRATION_RAGE)         tier = 3;
@@ -314,18 +319,22 @@ export class VehicleRenderer {
     _spriteScale: number,
   ): void {
     const bounds    = this.map.getBounds();
+    // Hoist map bounds getters outside the per-vehicle loop to avoid thousands of redundant calls per frame (~60 FPS hot path)
+    const west      = bounds.getWest();
+    const east      = bounds.getEast();
+    const south     = bounds.getSouth();
+    const north     = bounds.getNorth();
     const pxPerM    = this.pxPerMetre();
-    const renderedIds = new Set<number>();
+    // Reuse class-level Set to avoid per-frame allocations and GC pressure
+    const renderedIds = this.renderedIds;
+    renderedIds.clear();
 
     for (const [id, v] of vehicles) {
       if (this.isVehicleHidden(v)) continue;
 
       const s = this.advanceSmooth(v);
 
-      if (
-        s.lng < bounds.getWest() || s.lng > bounds.getEast() ||
-        s.lat < bounds.getSouth() || s.lat > bounds.getNorth()
-      ) continue;
+      if (s.lng < west || s.lng > east || s.lat < south || s.lat > north) continue;
 
       const typeId    = v.vehicleType < VEHICLE_TYPES.length ? v.vehicleType : 0;
       const dims      = VEHICLE_DIMS[typeId]  ?? VEHICLE_DIMS[0];
