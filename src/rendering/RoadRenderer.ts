@@ -198,6 +198,27 @@ export class RoadRenderer {
     const zoomScale = Math.pow(2, this.camera.zoom - 16);
     const casingColor = this.osmMode ? 0x888888 : 0x111111;
 
+    // Extract viewport bounds once to perform line segment culling with 10% padding.
+    // Performance optimization: reduces projection overhead by skipping off-screen edges.
+    const bounds = this.map.getBounds();
+    const west = bounds?.getWest();
+    const east = bounds?.getEast();
+    const south = bounds?.getSouth();
+    const north = bounds?.getNorth();
+    const validBounds =
+      west !== undefined &&
+      east !== undefined &&
+      south !== undefined &&
+      north !== undefined &&
+      west <= east;
+
+    const lngMargin = validBounds ? (east - west) * 0.1 : 0;
+    const latMargin = validBounds ? (north - south) * 0.1 : 0;
+    const minLng = validBounds ? west - lngMargin : 0;
+    const maxLng = validBounds ? east + lngMargin : 0;
+    const minLat = validBounds ? south - latMargin : 0;
+    const maxLat = validBounds ? north + latMargin : 0;
+
     // ── Step 1: project visible edges ─────────────────────────────────────
     const renderables: EdgeRenderable[] = [];
     for (const edge of this.sortedEdges) {
@@ -207,6 +228,19 @@ export class RoadRenderer {
       const fromNode = this.nodeMap.get(edge.from);
       const toNode   = this.nodeMap.get(edge.to);
       if (!fromNode || !toNode) continue;
+
+      // Line segment viewport culling: if both endpoints are outside the padded viewport
+      // on the same side, skip projecting and rendering this edge.
+      if (validBounds) {
+        if (
+          (fromNode.lng < minLng && toNode.lng < minLng) ||
+          (fromNode.lng > maxLng && toNode.lng > maxLng) ||
+          (fromNode.lat < minLat && toNode.lat < minLat) ||
+          (fromNode.lat > maxLat && toNode.lat > maxLat)
+        ) {
+          continue;
+        }
+      }
 
       const from = projectPoint(this.map, fromNode.lng, fromNode.lat);
       const to   = projectPoint(this.map, toNode.lng,   toNode.lat);
@@ -238,17 +272,20 @@ export class RoadRenderer {
     }
 
     // ── Step 2: junction circles (max road width at each node) ────────────
+    // Performance optimization: reuse already-projected `r.from` / `r.to` screen coordinates
+    // instead of redundantly invoking `projectPoint` again for each junction node.
     const junctionMap = new Map<number, JunctionCircle>();
     for (const r of renderables) {
-      for (const nodeId of [r.edge.from, r.edge.to]) {
-        const node = this.nodeMap.get(nodeId);
-        if (!node) continue;
+      for (const endpoint of [
+        { id: r.edge.from, px: r.from },
+        { id: r.edge.to, px: r.to },
+      ]) {
+        const nodeId = endpoint.id;
         const prev = junctionMap.get(nodeId);
         if (!prev || r.w > prev.w) {
-          const px = projectPoint(this.map, node.lng, node.lat);
           junctionMap.set(nodeId, {
-            x: px.x,
-            y: px.y,
+            x: endpoint.px.x,
+            y: endpoint.px.y,
             w: r.w,
             color: r.style.color,
             alpha: r.alpha,
