@@ -1,0 +1,3 @@
+## 2025-05-18 - Building Bounding Box Viewport Culling
+**Learning:** Building footprint polygons in MapData require significant coordinate projection (`projectPoint`) and PixiJS polygon tessellation (`gfx.poly`) on every camera move. Caching geographic AABBs in a WeakMap and culling off-screen building footprints using map viewport bounds with 20% margin eliminates redundant projection and graphics generation.
+**Action:** Always compute AABBs for static polygon/polyline collections and perform geographic bounds culling with padding before invoking MapLibre screen projections (`projectPoint`) and PixiJS rendering operations.
