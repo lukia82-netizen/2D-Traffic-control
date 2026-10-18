@@ -85,6 +85,37 @@ export class InfraRenderer {
     // intentionally empty
   }
 
+  // ─── Viewport Bounding Box Culling Helpers ─────────────────────────────────
+
+  private getBufferedBounds(): { minLng: number; maxLng: number; minLat: number; maxLat: number } | null {
+    const bounds = this.map.getBounds();
+    if (!bounds) return null;
+    const west = bounds.getWest();
+    const east = bounds.getEast();
+    const south = bounds.getSouth();
+    const north = bounds.getNorth();
+    const lngPad = (east - west) * 0.1;
+    const latPad = (north - south) * 0.1;
+    return {
+      minLng: west - lngPad,
+      maxLng: east + lngPad,
+      minLat: south - latPad,
+      maxLat: north + latPad,
+    };
+  }
+
+  private isEdgeInBounds(
+    from: NodeData,
+    to: NodeData,
+    bounds: { minLng: number; maxLng: number; minLat: number; maxLat: number },
+  ): boolean {
+    if (from.lng < bounds.minLng && to.lng < bounds.minLng) return false;
+    if (from.lng > bounds.maxLng && to.lng > bounds.maxLng) return false;
+    if (from.lat < bounds.minLat && to.lat < bounds.minLat) return false;
+    if (from.lat > bounds.maxLat && to.lat > bounds.maxLat) return false;
+    return true;
+  }
+
   // ─── Static markings (bridge shadows + stop lines) ────────────────────────
 
   private rebuildMarkings(mapData: MapData): void {
@@ -92,10 +123,18 @@ export class InfraRenderer {
     const h = this.overlay.height;
     const gfx = new PIXI.Graphics();
 
+    const bounds = this.getBufferedBounds();
+
     for (const edge of mapData.edges) {
       const fromNode = this.nodeMap.get(edge.from);
       const toNode   = this.nodeMap.get(edge.to);
       if (!fromNode || !toNode) continue;
+
+      // Early exit: skip edges that are neither bridges nor end at a STOP-sign intersection
+      if (edge.infraType !== 'bridge' && toNode.intersectionType !== 'stop') continue;
+
+      // Viewport geographic bounding box culling
+      if (bounds && !this.isEdgeInBounds(fromNode, toNode, bounds)) continue;
 
       const fromPx = projectPoint(this.map, fromNode.lng, fromNode.lat);
       const toPx   = projectPoint(this.map, toNode.lng,   toNode.lat);
@@ -179,6 +218,7 @@ export class InfraRenderer {
 
     const spacing = this.camera.getArrowSpacing();
     const sz      = this.camera.getArrowSize();
+    const bounds  = this.getBufferedBounds();
 
     for (const edge of mapData.edges) {
       if (!edge.oneway) continue;
@@ -186,6 +226,8 @@ export class InfraRenderer {
       const fromNode = this.nodeMap.get(edge.from);
       const toNode   = this.nodeMap.get(edge.to);
       if (!fromNode || !toNode) continue;
+
+      if (bounds && !this.isEdgeInBounds(fromNode, toNode, bounds)) continue;
 
       const from = projectPoint(this.map, fromNode.lng, fromNode.lat);
       const to   = projectPoint(this.map, toNode.lng,   toNode.lat);
@@ -229,6 +271,7 @@ export class InfraRenderer {
     const w = this.overlay.width;
     const h = this.overlay.height;
     const gfx = new PIXI.Graphics();
+    const bounds = this.getBufferedBounds();
 
     for (const edge of mapData.edges) {
       if (edge.infraType !== 'tunnel') continue;
@@ -236,6 +279,8 @@ export class InfraRenderer {
       const fromNode = this.nodeMap.get(edge.from);
       const toNode   = this.nodeMap.get(edge.to);
       if (!fromNode || !toNode) continue;
+
+      if (bounds && !this.isEdgeInBounds(fromNode, toNode, bounds)) continue;
 
       const fromPx = projectPoint(this.map, fromNode.lng, fromNode.lat);
       const toPx   = projectPoint(this.map, toNode.lng,   toNode.lat);
@@ -285,6 +330,7 @@ export class InfraRenderer {
     if (zoom < LANE_ARROW_MIN_ZOOM) return;
 
     const sz = Math.max(5, this.camera.getArrowSize() * 0.8);
+    const bounds = this.getBufferedBounds();
 
     for (const edge of mapData.edges) {
       // Only draw arrows on edges that lead into a meaningful intersection
@@ -294,6 +340,8 @@ export class InfraRenderer {
       const fromNode = this.nodeMap.get(edge.from);
       const toNode   = this.nodeMap.get(edge.to);
       if (!fromNode || !toNode) continue;
+
+      if (bounds && !this.isEdgeInBounds(fromNode, toNode, bounds)) continue;
 
       const from = projectPoint(this.map, fromNode.lng, fromNode.lat);
       const to   = projectPoint(this.map, toNode.lng,   toNode.lat);
