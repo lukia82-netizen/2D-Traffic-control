@@ -1,0 +1,3 @@
+## 2025-05-18 - Hoist Map Bounds Getters & Reuse Rendered IDs Set in VehicleRenderer
+**Learning:** Calling `bounds.getWest()`, `bounds.getEast()`, `bounds.getSouth()`, and `bounds.getNorth()` inside a high-frequency vehicle rendering loop causes redundant MapLibre LngLatBounds method invocations for every vehicle every frame (thousands of calls per frame). Furthermore, allocating `new Set<number>()` inside `renderSprites()` every frame creates unnecessary Garbage Collection pressure.
+**Action:** Always extract static viewport geographic bounds (`west`, `east`, `south`, `north`) before starting per-entity rendering loops, and reuse class-level data structures (cleared per frame) instead of instantiating new objects in hot animation loops.
