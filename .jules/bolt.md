@@ -1,0 +1,3 @@
+## 2026-05-11 - Viewport culling and coordinate reuse in RoadRenderer
+**Learning:** In MapLibre / PixiJS canvas renderers, projecting geographic coordinates (`map.project()`) across thousands of off-screen edges on every camera event is a major bottleneck. Pre-culling line segments using geographic bounding boxes with 10% padding skips off-screen projections. Furthermore, reusing projected endpoint screen coordinates (`r.from`, `r.to`) in subsequent rendering steps (such as junction circle drawing) eliminates duplicate projection calls.
+**Action:** Always check if map renderers cull off-screen entities using geographic bounds before invoking `projectPoint()`, and reuse projected screen points across multi-pass rendering loops.
