@@ -9,17 +9,29 @@ const BUILDING_FILL    = 0x2d2d4e; // dark blue-gray fill
 const BUILDING_STROKE  = 0x4a4a70; // slightly lighter outline
 const BUILDING_ALPHA   = 0.92;
 
+interface BuildingWithBounds {
+  polygon: [number, number][];
+  minLat: number;
+  maxLat: number;
+  minLng: number;
+  maxLng: number;
+}
+
 // ─── BuildingRenderer ─────────────────────────────────────────────────────────
 
 /**
  * Draws building footprints fetched from OSM as filled PixiJS polygons.
  * Rebuilds every camera move so polygons stay aligned with the projection.
+ * Uses precomputed geographic bounding boxes and viewport culling to avoid
+ * expensive projection calculations for off-screen buildings.
  */
 export class BuildingRenderer {
   private readonly overlay: PixiOverlay;
   private readonly map: maplibregl.Map;
 
   private gfx: PIXI.Graphics | null = null;
+  private cachedMapData: MapData | null = null;
+  private cachedBuildings: BuildingWithBounds[] = [];
 
   constructor(overlay: PixiOverlay, map: maplibregl.Map) {
     this.overlay = overlay;
@@ -36,6 +48,40 @@ export class BuildingRenderer {
     this.rebuild(mapData);
   }
 
+  // ─── Internal precomputation ──────────────────────────────────────────────
+
+  private prepareBuildings(mapData: MapData): void {
+    if (this.cachedMapData === mapData) return;
+    this.cachedMapData = mapData;
+    this.cachedBuildings = [];
+
+    if (!mapData.buildings || mapData.buildings.length === 0) return;
+
+    for (const building of mapData.buildings) {
+      if (!building.polygon || building.polygon.length < 3) continue;
+
+      let minLat = Infinity;
+      let maxLat = -Infinity;
+      let minLng = Infinity;
+      let maxLng = -Infinity;
+
+      for (const [lat, lng] of building.polygon) {
+        if (lat < minLat) minLat = lat;
+        if (lat > maxLat) maxLat = lat;
+        if (lng < minLng) minLng = lng;
+        if (lng > maxLng) maxLng = lng;
+      }
+
+      this.cachedBuildings.push({
+        polygon: building.polygon,
+        minLat,
+        maxLat,
+        minLng,
+        maxLng,
+      });
+    }
+  }
+
   // ─── Rendering ─────────────────────────────────────────────────────────────
 
   private rebuild(mapData: MapData): void {
@@ -47,10 +93,34 @@ export class BuildingRenderer {
     const gfx = this.gfx;
     gfx.clear();
 
-    if (!mapData.buildings || mapData.buildings.length === 0) return;
+    this.prepareBuildings(mapData);
+    if (this.cachedBuildings.length === 0) return;
 
-    for (const building of mapData.buildings) {
-      if (building.polygon.length < 3) continue;
+    // Viewport bounding box culling (with 10% margin padding)
+    const bounds = this.map.getBounds();
+    const west = bounds.getWest();
+    const east = bounds.getEast();
+    const south = bounds.getSouth();
+    const north = bounds.getNorth();
+
+    const lngMargin = (east - west) * 0.1;
+    const latMargin = (north - south) * 0.1;
+
+    const vMinLng = west - lngMargin;
+    const vMaxLng = east + lngMargin;
+    const vMinLat = south - latMargin;
+    const vMaxLat = north + latMargin;
+
+    for (const building of this.cachedBuildings) {
+      // Skip off-screen buildings outside viewport bounding box
+      if (
+        building.maxLat < vMinLat ||
+        building.minLat > vMaxLat ||
+        building.maxLng < vMinLng ||
+        building.minLng > vMaxLng
+      ) {
+        continue;
+      }
 
       // Project each vertex [lat, lng] → screen {x, y}
       const pts: number[] = [];
@@ -68,5 +138,8 @@ export class BuildingRenderer {
 
   destroy(): void {
     this.gfx?.destroy();
+    this.gfx = null;
+    this.cachedMapData = null;
+    this.cachedBuildings = [];
   }
 }
