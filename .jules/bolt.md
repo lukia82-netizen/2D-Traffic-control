@@ -1,0 +1,3 @@
+## 2025-02-23 - Geographic Bounding Box Culling in Polygon Renderers
+**Learning:** In MapLibre/PixiJS overlay renderers like `BuildingRenderer`, `rebuildOnCameraChange` is invoked on every camera movement (`render` event). Projecting polygon coordinates for off-screen features produces unnecessary CPU overhead and allocation churn. Precomputing `minLat`, `maxLat`, `minLng`, and `maxLng` on dataset updates allows fast AABB viewport culling (with a 10% margin padding) to eliminate unnecessary `projectPoint` calls.
+**Action:** Always precompute geographic bounding boxes for static or infrequently updated map geometries (e.g., buildings, zones, complex shapes) and filter against map viewport bounds before invoking `projectPoint`.
