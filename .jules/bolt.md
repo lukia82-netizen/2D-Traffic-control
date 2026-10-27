@@ -1,0 +1,3 @@
+## 2025-02-23 - Geographic Viewport Bounds Culling in BuildingRenderer
+**Learning:** In map rendering components like `BuildingRenderer.ts`, re-projecting and drawing all polygon footprints on every camera movement creates unnecessary CPU overhead for off-screen entities. Precomputing geographic bounding boxes on map load and skipping off-screen buildings using viewport geographic bounds (with a 10% safety margin) eliminates redundant `projectPoint` coordinate transformations and PixiJS graphics drawing operations.
+**Action:** Always precompute bounding boxes for complex polygon geometries during initialization and perform geographic viewport culling prior to coordinate projections in map rendering loops.
