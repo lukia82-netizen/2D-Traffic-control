@@ -1,0 +1,3 @@
+## 2025-05-18 - Hoist Map Bounds & Eliminate Per-Vehicle Allocations in Render Loops
+**Learning:** Calling `map.getBounds()` getters (`getWest`, `getEast`, `getSouth`, `getNorth`) inside high-frequency entity loops (e.g. 3,000+ vehicles) incurs tens of thousands of function calls per frame. Additionally, creating temporary `[lng, lat]` coordinate arrays or wrapper objects per vehicle generates heavy garbage collector pressure.
+**Action:** Always hoist map viewport bounds checks outside entity loops and pass `VehicleState` directly to `map.project(v)` (which natively supports `{ lng, lat }` objects) to keep rendering zero-allocation.
