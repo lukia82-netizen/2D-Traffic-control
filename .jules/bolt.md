@@ -1,0 +1,3 @@
+## 2025-05-18 - Indexing Traffic Light Approaches for $O(1)$ State Updates
+**Learning:** `TrafficLightRenderer.updateStates()` is invoked on every simulation tick with light phase updates. Iterating over `this.approaches` (all approaches across the entire map network) per update was an $O(U \times A)$ bottleneck. Pre-building `approachesByNode: Map<number, Approach[]>` in `init()` reduces update complexity to $O(U \times A_{\text{node}})$, eliminating thousands of redundant iterations per frame.
+**Action:** Always index multi-entity collections by target ID (e.g., node/intersection ID) when handling high-frequency state updates.
