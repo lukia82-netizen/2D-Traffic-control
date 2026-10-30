@@ -1,0 +1,3 @@
+## 2025-05-18 - Indexing Traffic Light Approaches for O(1) Lookups
+**Learning:** `TrafficLightRenderer.updateStates()` is invoked on light state updates and previously scanned all map approaches linearly for every update item. Indexing approaches by node ID during `init()` converts $O(M \times N)$ scans into $O(M)$ map lookups, while hoisting map zoom/scale calculations outside the update loop avoids repeated `Math.pow()` calculations.
+**Action:** When handling batch state updates for graph nodes or map features, index the feature renderers by target node ID during data load / map init, and hoist camera parameter calculations out of event update loops.
