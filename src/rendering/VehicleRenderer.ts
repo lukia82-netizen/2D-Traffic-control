@@ -152,9 +152,13 @@ export class VehicleRenderer {
 
   // ── Road-group filtering ───────────────────────────────────────────────────
   private edgeIndex: EdgeLine[] = [];
+  // Performance optimization: O(1) road group lookup by lane ID, avoids expensive spatial searches per vehicle
+  private readonly laneGroupCache: Map<number, string> = new Map();
   private readonly vehicleGroupCache: Map<number, string> = new Map();
   private readonly prevVehiclePos: Map<number, { lat: number; lng: number }> = new Map();
   private hiddenGroups: Set<string> = new Set();
+  // Performance optimization: Reusable Set for tracking active vehicle IDs in renderSprites to eliminate per-frame allocations
+  private readonly renderedIds: Set<number> = new Set();
 
 
   constructor(overlay: PixiOverlay, map: maplibregl.Map, camera: CameraManager) {
@@ -179,16 +183,32 @@ export class VehicleRenderer {
   setEdgeIndex(mapData: MapData): void {
     const nodeMap = new Map(mapData.nodes.map(n => [n.id, n]));
     this.edgeIndex = [];
+    // Map OSM node pair (from_to) to road group for O(1) lane-to-group resolution
+    const nodePairGroupMap = new Map<string, string>();
     for (const edge of mapData.edges) {
       const a = nodeMap.get(edge.from);
       const b = nodeMap.get(edge.to);
       if (!a || !b) continue;
+      const group = ROAD_TYPE_GROUP[edge.roadType] ?? 'residential';
       this.edgeIndex.push({
         aLat: a.lat, aLng: a.lng,
         bLat: b.lat, bLng: b.lng,
-        group: ROAD_TYPE_GROUP[edge.roadType] ?? 'residential',
+        group,
       });
+      nodePairGroupMap.set(`${edge.from}_${edge.to}`, group);
     }
+
+    this.laneGroupCache.clear();
+    // Populate O(1) lane-to-road-group lookup cache
+    if (mapData.lanes) {
+      for (const lane of mapData.lanes) {
+        const group = nodePairGroupMap.get(`${lane.fromNodeOsmId}_${lane.toNodeOsmId}`);
+        if (group) {
+          this.laneGroupCache.set(lane.id, group);
+        }
+      }
+    }
+
     this.vehicleGroupCache.clear();
     this.prevVehiclePos.clear();
   }
@@ -239,6 +259,11 @@ export class VehicleRenderer {
   private renderDots(vehicles: Map<number, VehicleState>, radius: number): void {
     const gfx = this.dotGraphics!;
     const bounds = this.map.getBounds();
+    // Performance optimization: hoist viewport bounds outside hot iteration loop
+    const west = bounds.getWest();
+    const east = bounds.getEast();
+    const south = bounds.getSouth();
+    const north = bounds.getNorth();
     gfx.clear();
 
     for (const v of vehicles.values()) {
@@ -247,8 +272,8 @@ export class VehicleRenderer {
       const s = this.advanceSmooth(v);
 
       if (
-        s.lng < bounds.getWest() || s.lng > bounds.getEast() ||
-        s.lat < bounds.getSouth() || s.lat > bounds.getNorth()
+        s.lng < west || s.lng > east ||
+        s.lat < south || s.lat > north
       ) continue;
 
       const typeId = v.vehicleType < VEHICLE_TYPES.length ? v.vehicleType : 0;
@@ -272,6 +297,11 @@ export class VehicleRenderer {
   private renderFrustrationBubbles(vehicles: Map<number, VehicleState>): void {
     const gfx = this.bubbleGraphics!;
     const bounds = this.map.getBounds();
+    // Performance optimization: hoist viewport bounds outside hot iteration loop
+    const west = bounds.getWest();
+    const east = bounds.getEast();
+    const south = bounds.getSouth();
+    const north = bounds.getNorth();
     gfx.clear();
 
     const now = performance.now();
@@ -281,8 +311,8 @@ export class VehicleRenderer {
       const s = this.smoothState.get(v.id) ?? { lat: v.lat, lng: v.lng };
 
       if (
-        s.lng < bounds.getWest() || s.lng > bounds.getEast() ||
-        s.lat < bounds.getSouth() || s.lat > bounds.getNorth()
+        s.lng < west || s.lng > east ||
+        s.lat < south || s.lat > north
       ) continue;
 
       let tier: number;
@@ -314,8 +344,13 @@ export class VehicleRenderer {
     _spriteScale: number,
   ): void {
     const bounds    = this.map.getBounds();
+    // Performance optimization: hoist viewport bounds outside hot iteration loop
+    const west      = bounds.getWest();
+    const east      = bounds.getEast();
+    const south     = bounds.getSouth();
+    const north     = bounds.getNorth();
     const pxPerM    = this.pxPerMetre();
-    const renderedIds = new Set<number>();
+    this.renderedIds.clear();
 
     for (const [id, v] of vehicles) {
       if (this.isVehicleHidden(v)) continue;
@@ -323,8 +358,8 @@ export class VehicleRenderer {
       const s = this.advanceSmooth(v);
 
       if (
-        s.lng < bounds.getWest() || s.lng > bounds.getEast() ||
-        s.lat < bounds.getSouth() || s.lat > bounds.getNorth()
+        s.lng < west || s.lng > east ||
+        s.lat < south || s.lat > north
       ) continue;
 
       const typeId    = v.vehicleType < VEHICLE_TYPES.length ? v.vehicleType : 0;
@@ -362,12 +397,12 @@ export class VehicleRenderer {
       rect.alpha   = isTunnel ? TUNNEL_ALPHA : 1;
       rect.visible = true;
 
-      renderedIds.add(id);
+      this.renderedIds.add(id);
     }
 
     // Return sprites for vehicles that left the viewport or were despawned
     for (const [id, rect] of this.activeRects) {
-      if (!renderedIds.has(id)) {
+      if (!this.renderedIds.has(id)) {
         rect.visible = false;
         this.releaseRect(id, rect);
         this.activeRects.delete(id);
@@ -389,7 +424,16 @@ export class VehicleRenderer {
   // ─── Road-group lookup ─────────────────────────────────────────────────────
 
   private isVehicleHidden(v: VehicleState): boolean {
-    if (this.hiddenGroups.size === 0 || this.edgeIndex.length === 0) return false;
+    if (this.hiddenGroups.size === 0) return false;
+
+    // Fast O(1) road-group lookup via laneGroupCache when lane-level data is available,
+    // avoiding expensive O(E) spatial searches (resolveVehicleGroup) every frame per vehicle.
+    if (v.currentLaneId != null && this.laneGroupCache.has(v.currentLaneId)) {
+      const group = this.laneGroupCache.get(v.currentLaneId)!;
+      return this.hiddenGroups.has(group);
+    }
+
+    if (this.edgeIndex.length === 0) return false;
 
     const prev  = this.prevVehiclePos.get(v.id);
     const moved = !prev ||
@@ -458,5 +502,7 @@ export class VehicleRenderer {
     this.activeRectTypes.clear();
     this.smoothState.clear();
     this.prevOnConnector.clear();
+    this.laneGroupCache.clear();
+    this.renderedIds.clear();
   }
 }
