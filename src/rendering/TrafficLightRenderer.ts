@@ -73,6 +73,8 @@ export class TrafficLightRenderer {
 
   /** Precomputed approach list, rebuilt on init. */
   private approaches: Approach[] = [];
+  /** O(1) approach lookup grouped by intersection node ID. */
+  private approachesByNode: Map<number, Approach[]> = new Map();
 
   /** Latest known coarse phase (0=Red, 1=Yellow, 2=Green) per intersection id. */
   private lightPhases: Map<number, number> = new Map();
@@ -188,11 +190,30 @@ export class TrafficLightRenderer {
     // Deterministic traversal for graphics list index ↔ approach order.
     this.approaches.sort((a, b) => a.nodeId - b.nodeId || a.armIndex - b.armIndex);
 
+    // Build O(1) node-indexed map to avoid full linear scans in updateStates()
+    this.approachesByNode.clear();
+    for (const ap of this.approaches) {
+      const list = this.approachesByNode.get(ap.nodeId);
+      if (list) {
+        list.push(ap);
+      } else {
+        this.approachesByNode.set(ap.nodeId, [ap]);
+      }
+    }
+
     this.rebuild();
   }
 
   /** Sync phase states; only re-colours affected approach sprites. */
   updateStates(updates: LightStateUpdate[]): void {
+    if (updates.length === 0) return;
+
+    // Hoist zoom & dimension calculations outside the update loop
+    const zoom = this.map.getZoom();
+    const scale = this.scaleForZoom(zoom);
+    const hr = HOUSING_R_REF * scale;
+    const br = BULB_R_REF * scale;
+
     for (const upd of updates) {
       this.lightPhases.set(upd.intersectionId, upd.phase);
       this.junctionArmSignals.set(
@@ -203,16 +224,12 @@ export class TrafficLightRenderer {
       const gfxList = this.spritesByNode.get(upd.intersectionId);
       if (!gfxList) continue;
 
-      const zoom = this.map.getZoom();
-      const scale = this.scaleForZoom(zoom);
-      const hr = HOUSING_R_REF * scale;
-      const br = BULB_R_REF * scale;
+      const nodeApproaches = this.approachesByNode.get(upd.intersectionId);
+      if (!nodeApproaches) continue;
 
       const armSignals = this.junctionArmSignals.get(upd.intersectionId);
       let gfxPos = 0;
-      for (const ap of this.approaches) {
-        if (ap.nodeId !== upd.intersectionId) continue;
-
+      for (const ap of nodeApproaches) {
         if (ap.isPedestrian) {
           if (gfxPos + 1 >= gfxList.length) break;
           const carPhase = upd.phase;
@@ -242,6 +259,7 @@ export class TrafficLightRenderer {
 
   destroy(): void {
     this.spritesByNode.clear();
+    this.approachesByNode.clear();
     this.overlay.trafficLights.removeChildren();
   }
 
